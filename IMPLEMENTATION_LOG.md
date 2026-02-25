@@ -139,3 +139,46 @@ Quick benchmark sample (short run config):
 - `msg_ring_runtime_io_uring`: ~0.60-0.72 ms
 - `tokio_unbounded_channel`: ~1.49-1.58 ms
 - `glommio_simple`: ~4.05-4.85 ms
+
+## Update: Stricter Benchmark Suite
+
+Implemented to improve comparability and isolate what is being measured:
+
+- Switched to persistent harnesses for steady-state measurements.
+- Added matched two-worker topology for baselines:
+  - Tokio: dedicated runtime thread, two-worker message loop.
+  - Glommio (`glommio-bench`): two executor threads with message channels.
+- Added explicit benchmark groups:
+  - `steady_ping_pong_rtt`
+  - `steady_one_way_send_drain`
+  - `cold_start_ping_pong`
+
+### Metric definitions
+
+- `steady_ping_pong_rtt`:
+  - per-round request/ack round-trip latency over persistent workers.
+- `steady_one_way_send_drain`:
+  - repeated one-way sends followed by a flush barrier ack.
+  - for `msg_ring_runtime`, this now uses a bounded send-ticket window (`SEND_WINDOW=64`) to avoid fully serial per-send awaiting while preserving backpressure.
+  - for Tokio/Glommio channel sends, send completion is synchronous enqueue.
+- `cold_start_ping_pong`:
+  - includes harness/runtime construction and teardown each iteration.
+
+### Safety constraints observed
+
+- No machine-level or persistent system tuning performed.
+- No CPU governor/turbo/IRQ/process-affinity changes applied.
+- Benchmarks are runnable on standard developer machines.
+
+### Validation
+
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.
+- Sample full run completed for non-Glommio path.
+- Sample targeted run completed for Glommio path.
+
+### Notes from latest tuning pass
+
+- Updated runtime one-way harness from strict per-send await to windowed in-flight tickets.
+- Targeted one-way io_uring sample improved from roughly `~1.44 ms` to `~1.17 ms` under short Criterion settings.

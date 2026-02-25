@@ -330,6 +330,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "nanorand",
+ "spin",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,7 +478,7 @@ dependencies = [
  "concurrent-queue",
  "crossbeam",
  "enclose",
- "flume",
+ "flume 0.10.14",
  "futures-lite",
  "intrusive-collections",
  "lazy_static",
@@ -634,6 +646,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
+ "flume 0.11.1",
  "futures",
  "glommio",
  "io-uring",
