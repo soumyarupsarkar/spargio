@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 glommio = { version = "0.9", optional = true }
+io-uring = "0.7.11"
 
 [features]
 default = []

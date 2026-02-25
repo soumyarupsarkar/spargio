@@ -1,9 +1,13 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use futures::executor::block_on;
-use msg_ring_runtime::{Event, Runtime, ShardCtx};
+use msg_ring_runtime::{BackendKind, Event, Runtime, ShardCtx};
 
-fn run_msg_ring_runtime(rounds: usize) {
-    let rt = Runtime::builder().shards(2).build().expect("runtime");
+fn run_msg_ring_runtime(rounds: usize, backend: BackendKind) {
+    let rt = Runtime::builder()
+        .backend(backend)
+        .shards(2)
+        .build()
+        .expect("runtime");
 
     let responder = rt
         .spawn_on(1, async move {
@@ -126,9 +130,21 @@ fn bench_ping_pong(c: &mut Criterion) {
     let rounds = black_box(256usize);
     let mut group = c.benchmark_group("ping_pong");
 
-    group.bench_function("msg_ring_runtime", |b| {
-        b.iter(|| run_msg_ring_runtime(rounds))
+    group.bench_function("msg_ring_runtime_queue", |b| {
+        b.iter(|| run_msg_ring_runtime(rounds, BackendKind::Queue))
     });
+
+    #[cfg(target_os = "linux")]
+    if Runtime::builder()
+        .backend(BackendKind::IoUring)
+        .shards(1)
+        .build()
+        .is_ok()
+    {
+        group.bench_function("msg_ring_runtime_io_uring", |b| {
+            b.iter(|| run_msg_ring_runtime(rounds, BackendKind::IoUring))
+        });
+    }
 
     group.bench_function("tokio_unbounded_channel", |b| {
         b.iter(|| run_tokio_ping_pong(rounds))
