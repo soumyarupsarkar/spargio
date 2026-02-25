@@ -18,7 +18,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use slab::Slab;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -33,7 +33,7 @@ const MSG_RING_CQE_FLAG: u32 = 1 << 8;
 #[cfg(target_os = "linux")]
 const IOURING_SUBMIT_BATCH: usize = 64;
 #[cfg(target_os = "linux")]
-const IOURING_MSG_RING_CQE_SKIP: u32 = 1;
+const DOORBELL_TAG: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -51,6 +51,27 @@ pub enum BackendKind {
     IoUring,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct IoUringBuildConfig {
+    sqpoll_idle_ms: Option<u32>,
+    sqpoll_cpu: Option<u32>,
+    single_issuer: bool,
+    coop_taskrun: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for IoUringBuildConfig {
+    fn default() -> Self {
+        Self {
+            sqpoll_idle_ms: None,
+            sqpoll_cpu: None,
+            single_issuer: false,
+            coop_taskrun: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeBuilder {
     shards: usize,
@@ -58,6 +79,8 @@ pub struct RuntimeBuilder {
     idle_wait: Duration,
     backend: BackendKind,
     ring_entries: u32,
+    #[cfg(target_os = "linux")]
+    io_uring: IoUringBuildConfig,
 }
 
 impl Default for RuntimeBuilder {
@@ -68,6 +91,8 @@ impl Default for RuntimeBuilder {
             idle_wait: Duration::from_millis(1),
             backend: BackendKind::Queue,
             ring_entries: 256,
+            #[cfg(target_os = "linux")]
+            io_uring: IoUringBuildConfig::default(),
         }
     }
 }
@@ -99,6 +124,36 @@ impl RuntimeBuilder {
 
     pub fn ring_entries(mut self, entries: u32) -> Self {
         self.ring_entries = entries.max(1);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn io_uring_sqpoll(mut self, idle_ms: Option<u32>) -> Self {
+        self.io_uring.sqpoll_idle_ms = idle_ms;
+        if idle_ms.is_none() {
+            self.io_uring.sqpoll_cpu = None;
+        }
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn io_uring_sqpoll_cpu(mut self, cpu: Option<u32>) -> Self {
+        self.io_uring.sqpoll_cpu = cpu;
+        if cpu.is_some() && self.io_uring.sqpoll_idle_ms.is_none() {
+            self.io_uring.sqpoll_idle_ms = Some(2_000);
+        }
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn io_uring_single_issuer(mut self, enable: bool) -> Self {
+        self.io_uring.single_issuer = enable;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn io_uring_coop_taskrun(mut self, enable: bool) -> Self {
+        self.io_uring.coop_taskrun = enable;
         self
     }
 
@@ -168,9 +223,25 @@ impl RuntimeBuilder {
                 {
                     let mut rings = Vec::with_capacity(self.shards);
                     let mut ring_fds = Vec::with_capacity(self.shards);
+                    let payload_queues = build_payload_queues(self.shards);
                     for _ in 0..self.shards {
-                        let ring =
-                            IoUring::new(self.ring_entries).map_err(RuntimeError::IoUringInit)?;
+                        let mut ring_builder = IoUring::builder();
+                        if let Some(idle_ms) = self.io_uring.sqpoll_idle_ms {
+                            ring_builder.setup_sqpoll(idle_ms);
+                            if let Some(cpu) = self.io_uring.sqpoll_cpu {
+                                ring_builder.setup_sqpoll_cpu(cpu);
+                            }
+                        }
+                        if self.io_uring.single_issuer {
+                            ring_builder.setup_single_issuer();
+                        }
+                        if self.io_uring.coop_taskrun {
+                            ring_builder.setup_coop_taskrun();
+                        }
+
+                        let ring = ring_builder
+                            .build(self.ring_entries)
+                            .map_err(RuntimeError::IoUringInit)?;
                         ring_fds.push(ring.as_raw_fd());
                         rings.push(ring);
                     }
@@ -187,6 +258,7 @@ impl RuntimeBuilder {
                             idx as ShardId,
                             ring,
                             ring_fds.clone(),
+                            payload_queues.clone(),
                         ));
 
                         let join = match thread::Builder::new().name(thread_name).spawn(move || {
@@ -338,6 +410,31 @@ impl RemoteShard {
         self.send_raw_inner(tag, val, None)
     }
 
+    pub fn send_many_raw_nowait<I>(&self, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
+        if let Some(ctx) = current {
+            return ctx.enqueue_local_send_many(self.id, msgs);
+        }
+
+        for (tag, val) in msgs {
+            self.shared
+                .send_to(
+                    self.id,
+                    Command::InjectRawMessage {
+                        from: EXTERNAL_SENDER,
+                        tag,
+                        val,
+                        ack: None,
+                    },
+                )
+                .map_err(|_| SendError::Closed)?;
+        }
+        Ok(())
+    }
+
     fn send_raw_inner(
         &self,
         tag: u16,
@@ -370,6 +467,25 @@ impl RemoteShard {
     pub fn send_nowait<M: RingMsg>(&self, msg: M) -> Result<(), SendError> {
         let (tag, val) = msg.encode();
         self.send_raw_nowait(tag, val)
+    }
+
+    pub fn send_many_nowait<M, I>(&self, msgs: I) -> Result<(), SendError>
+    where
+        M: RingMsg,
+        I: IntoIterator<Item = M>,
+    {
+        self.send_many_raw_nowait(msgs.into_iter().map(|msg| msg.encode()))
+    }
+
+    pub fn flush(&self) -> Result<SendTicket, SendError> {
+        let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
+        if let Some(ctx) = current {
+            return ctx.flush();
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        Ok(SendTicket { rx: Some(rx) })
     }
 }
 
@@ -412,6 +528,21 @@ impl ShardCtx {
         self.enqueue_local_send(target, tag, val, None)
     }
 
+    pub fn send_many_raw_nowait<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        self.enqueue_local_send_many(target, msgs)
+    }
+
+    pub fn send_many_nowait<M, I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
+    where
+        M: RingMsg,
+        I: IntoIterator<Item = M>,
+    {
+        self.enqueue_local_send_many(target, msgs.into_iter().map(|msg| msg.encode()))
+    }
+
     pub fn send_raw(&self, target: ShardId, tag: u16, val: u32) -> Result<SendTicket, SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.enqueue_local_send(target, tag, val, Some(ack_tx))?;
@@ -442,6 +573,35 @@ impl ShardCtx {
                 ack,
             });
         Ok(())
+    }
+
+    fn enqueue_local_send_many<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        if usize::from(target) >= self.inner.remotes.len() {
+            return Err(SendError::Closed);
+        }
+
+        let messages = msgs.into_iter().collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitRingMsgBatch { target, messages });
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<SendTicket, SendError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::Flush { ack: ack_tx });
+        Ok(SendTicket { rx: Some(ack_rx) })
     }
 
     pub fn spawn_local<F, T>(&self, fut: F) -> LocalJoinHandle<T>
@@ -590,6 +750,13 @@ enum LocalCommand {
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
     },
+    SubmitRingMsgBatch {
+        target: ShardId,
+        messages: Vec<(u16, u32)>,
+    },
+    Flush {
+        ack: oneshot::Sender<Result<(), SendError>>,
+    },
 }
 
 enum Command {
@@ -696,6 +863,20 @@ impl ShardBackend {
         }
     }
 
+    fn flush(&mut self, ack: oneshot::Sender<Result<(), SendError>>) {
+        match self {
+            Self::Queue => {
+                let _ = ack.send(Ok(()));
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(driver) => {
+                if driver.submit_flush(ack).is_err() {
+                    // submit_flush already completed ack with an error
+                }
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         if let Self::IoUring(driver) = self {
@@ -705,25 +886,40 @@ impl ShardBackend {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct DoorbellPayload {
+    tag: u16,
+    val: u32,
+}
+
+#[cfg(target_os = "linux")]
+type PayloadQueues = Arc<Vec<Vec<Mutex<VecDeque<DoorbellPayload>>>>>;
+
+#[cfg(target_os = "linux")]
 struct IoUringDriver {
     shard_id: ShardId,
     ring: IoUring,
     ring_fds: Arc<Vec<RawFd>>,
-    next_ticket: u64,
-    send_waiters: HashMap<u64, oneshot::Sender<Result<(), SendError>>>,
+    payload_queues: PayloadQueues,
+    send_waiters: Slab<oneshot::Sender<Result<(), SendError>>>,
     pending_submit: usize,
     submit_batch_limit: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl IoUringDriver {
-    fn new(shard_id: ShardId, ring: IoUring, ring_fds: Arc<Vec<RawFd>>) -> Self {
+    fn new(
+        shard_id: ShardId,
+        ring: IoUring,
+        ring_fds: Arc<Vec<RawFd>>,
+        payload_queues: PayloadQueues,
+    ) -> Self {
         Self {
             shard_id,
             ring,
             ring_fds,
-            next_ticket: 1,
-            send_waiters: HashMap::new(),
+            payload_queues,
+            send_waiters: Slab::new(),
             pending_submit: 0,
             submit_batch_limit: IOURING_SUBMIT_BATCH,
         }
@@ -736,48 +932,142 @@ impl IoUringDriver {
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
     ) -> Result<(), SendError> {
-        let Some(&target_fd) = self.ring_fds.get(usize::from(target)) else {
-            if let Some(ack) = ack {
-                let _ = ack.send(Err(SendError::Closed));
-            }
-            return Err(SendError::Closed);
-        };
+        if let Some(ack) = ack {
+            return self.submit_ring_msg_ticketed(target, tag, val, ack);
+        }
+        self.submit_ring_msg_nowait(target, tag, val)
+    }
 
-        let ticket = ack.as_ref().map(|_| {
-            let t = self.next_ticket;
-            self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
-            t
-        });
+    fn submit_ring_msg_ticketed(
+        &mut self,
+        target: ShardId,
+        tag: u16,
+        val: u32,
+        ack: oneshot::Sender<Result<(), SendError>>,
+    ) -> Result<(), SendError> {
+        let target_fd = self.target_fd(target)?;
+        let waiter_idx = self.send_waiters.insert(ack);
         let payload = pack_msg_userdata(self.shard_id, tag);
         let val_i32 = i32::from_ne_bytes(val.to_ne_bytes());
+        let user_data = waiter_to_userdata(waiter_idx);
 
-        let mut op = opcode::MsgRingData::new(
+        let entry = opcode::MsgRingData::new(
             types::Fd(target_fd),
             val_i32,
             payload,
             Some(MSG_RING_CQE_FLAG),
-        );
-        if ticket.is_none() {
-            op = op.opcode_flags(IOURING_MSG_RING_CQE_SKIP);
-        }
-        let entry = op.build().user_data(ticket.unwrap_or(0));
+        )
+        .build()
+        .user_data(user_data);
 
         if self.push_entry(entry).is_err() {
-            if let Some(ack) = ack {
-                let _ = ack.send(Err(SendError::Closed));
-            }
+            self.fail_waiter(waiter_idx);
             return Err(SendError::Closed);
         }
+        self.mark_submission_pending()
+    }
 
-        if let (Some(ticket), Some(ack)) = (ticket, ack) {
-            self.send_waiters.insert(ticket, ack);
+    fn submit_ring_msg_nowait(
+        &mut self,
+        target: ShardId,
+        tag: u16,
+        val: u32,
+    ) -> Result<(), SendError> {
+        let should_ring = self.enqueue_payload(target, tag, val)?;
+        if !should_ring {
+            return Ok(());
         }
+
+        if self.submit_doorbell(target).is_err() {
+            self.rollback_last_payload(target);
+            return Err(SendError::Closed);
+        }
+        Ok(())
+    }
+
+    fn enqueue_payload(&self, target: ShardId, tag: u16, val: u32) -> Result<bool, SendError> {
+        let Some(per_source) = self.payload_queues.get(usize::from(target)) else {
+            return Err(SendError::Closed);
+        };
+        let Some(queue) = per_source.get(usize::from(self.shard_id)) else {
+            return Err(SendError::Closed);
+        };
+
+        let mut queue = queue.lock().expect("payload queue lock poisoned");
+        let was_empty = queue.is_empty();
+        queue.push_back(DoorbellPayload { tag, val });
+        Ok(was_empty)
+    }
+
+    fn rollback_last_payload(&self, target: ShardId) {
+        let Some(per_source) = self.payload_queues.get(usize::from(target)) else {
+            return;
+        };
+        let Some(queue) = per_source.get(usize::from(self.shard_id)) else {
+            return;
+        };
+
+        let mut queue = queue.lock().expect("payload queue lock poisoned");
+        let _ = queue.pop_back();
+    }
+
+    fn submit_doorbell(&mut self, target: ShardId) -> Result<(), SendError> {
+        let target_fd = self.target_fd(target)?;
+        let payload = pack_msg_userdata(self.shard_id, DOORBELL_TAG);
+        let entry =
+            opcode::MsgRingData::new(types::Fd(target_fd), 0, payload, Some(MSG_RING_CQE_FLAG))
+                .build()
+                .user_data(0)
+                .flags(io_uring::squeue::Flags::SKIP_SUCCESS);
+        self.push_entry(entry)?;
+        self.mark_submission_pending()
+    }
+
+    fn submit_flush(
+        &mut self,
+        ack: oneshot::Sender<Result<(), SendError>>,
+    ) -> Result<(), SendError> {
+        self.flush_submissions()?;
+
+        let waiter_idx = self.send_waiters.insert(ack);
+        let entry = opcode::Nop::new()
+            .build()
+            .user_data(waiter_to_userdata(waiter_idx));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_waiter(waiter_idx);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    fn mark_submission_pending(&mut self) -> Result<(), SendError> {
         self.pending_submit += 1;
         if self.pending_submit >= self.submit_batch_limit {
             self.flush_submissions()?;
         }
-
         Ok(())
+    }
+
+    fn target_fd(&self, target: ShardId) -> Result<RawFd, SendError> {
+        self.ring_fds
+            .get(usize::from(target))
+            .copied()
+            .ok_or(SendError::Closed)
+    }
+
+    fn fail_waiter(&mut self, index: usize) {
+        if self.send_waiters.contains(index) {
+            let waiter = self.send_waiters.remove(index);
+            let _ = waiter.send(Err(SendError::Closed));
+        }
+    }
+
+    fn fail_all_waiters(&mut self) {
+        let waiters = std::mem::take(&mut self.send_waiters);
+        for (_, waiter) in waiters {
+            let _ = waiter.send(Err(SendError::Closed));
+        }
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), SendError> {
@@ -801,9 +1091,7 @@ impl IoUringDriver {
         self.pending_submit = 0;
 
         if self.ring.submit().is_err() {
-            for (_, waiter) in self.send_waiters.drain() {
-                let _ = waiter.send(Err(SendError::Closed));
-            }
+            self.fail_all_waiters();
             return Err(SendError::Closed);
         }
 
@@ -815,30 +1103,95 @@ impl IoUringDriver {
             return;
         }
 
-        let mut cq = self.ring.completion();
-        for cqe in &mut cq {
-            if cqe.flags() & MSG_RING_CQE_FLAG != 0 {
-                let (from, tag) = unpack_msg_userdata(cqe.user_data());
-                let val = u32::from_ne_bytes(cqe.result().to_ne_bytes());
-                event_state.push(Event::RingMsg { from, tag, val });
-                continue;
-            }
+        let mut doorbells = Vec::new();
+        let mut msg_events = Vec::new();
+        let mut waiter_completions = Vec::new();
+        {
+            let mut cq = self.ring.completion();
+            for cqe in &mut cq {
+                if cqe.flags() & MSG_RING_CQE_FLAG != 0 {
+                    let (from, tag) = unpack_msg_userdata(cqe.user_data());
+                    if tag == DOORBELL_TAG {
+                        doorbells.push(from);
+                    } else {
+                        let val = u32::from_ne_bytes(cqe.result().to_ne_bytes());
+                        msg_events.push((from, tag, val));
+                    }
+                    continue;
+                }
 
-            if let Some(waiter) = self.send_waiters.remove(&cqe.user_data()) {
-                let _ = if cqe.result() >= 0 {
-                    waiter.send(Ok(()))
-                } else {
-                    waiter.send(Err(SendError::Closed))
-                };
+                waiter_completions.push((cqe.user_data(), cqe.result()));
             }
+        }
+
+        for from in doorbells {
+            self.drain_payload_queue(from, event_state);
+        }
+        for (from, tag, val) in msg_events {
+            event_state.push(Event::RingMsg { from, tag, val });
+        }
+        for (user_data, result) in waiter_completions {
+            if let Some(waiter_index) = waiter_from_userdata(user_data) {
+                if self.send_waiters.contains(waiter_index) {
+                    let waiter = self.send_waiters.remove(waiter_index);
+                    let _ = if result >= 0 {
+                        waiter.send(Ok(()))
+                    } else {
+                        waiter.send(Err(SendError::Closed))
+                    };
+                }
+            }
+        }
+    }
+
+    fn drain_payload_queue(&self, from: ShardId, event_state: &EventState) {
+        let Some(per_source) = self.payload_queues.get(usize::from(self.shard_id)) else {
+            return;
+        };
+        let Some(queue) = per_source.get(usize::from(from)) else {
+            return;
+        };
+
+        let drained = {
+            let mut queue = queue.lock().expect("payload queue lock poisoned");
+            queue.drain(..).collect::<Vec<_>>()
+        };
+
+        for payload in drained {
+            event_state.push(Event::RingMsg {
+                from,
+                tag: payload.tag,
+                val: payload.val,
+            });
         }
     }
 
     fn shutdown(&mut self) {
-        for (_, waiter) in self.send_waiters.drain() {
-            let _ = waiter.send(Err(SendError::Closed));
-        }
+        self.fail_all_waiters();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn build_payload_queues(shards: usize) -> PayloadQueues {
+    let mut by_target = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let mut by_source = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            by_source.push(Mutex::new(VecDeque::new()));
+        }
+        by_target.push(by_source);
+    }
+    Arc::new(by_target)
+}
+
+#[cfg(target_os = "linux")]
+fn waiter_to_userdata(waiter_index: usize) -> u64 {
+    waiter_index as u64 + 1
+}
+
+#[cfg(target_os = "linux")]
+fn waiter_from_userdata(user_data: u64) -> Option<usize> {
+    usize::try_from(user_data.checked_sub(1)?).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -993,6 +1346,12 @@ fn drain_local_commands(
                 val,
                 ack,
             } => backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs),
+            LocalCommand::SubmitRingMsgBatch { target, messages } => {
+                for (tag, val) in messages {
+                    backend.submit_ring_msg(shard_id, target, tag, val, None, command_txs);
+                }
+            }
+            LocalCommand::Flush { ack } => backend.flush(ack),
         }
     }
 }

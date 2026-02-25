@@ -650,6 +650,7 @@ dependencies = [
  "futures",
  "glommio",
  "io-uring",
+ "slab",
  "tokio",
 ]
 

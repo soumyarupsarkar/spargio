@@ -218,3 +218,65 @@ Implemented next optimization wave:
 - `steady_one_way_send_drain/msg_ring_runtime_queue`: ~`1.25-1.27 ms`
 - `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`232-234 us`
 - `steady_one_way_send_drain/tokio_two_worker`: ~`69-71 us`
+
+## Update: Fast-Path Checklist Pass (Current)
+
+Requested optimization checklist from the prior analysis and status:
+
+- Doorbell + payload queue batching for io_uring no-ticket sends:
+  - Implemented.
+  - No-ticket sends now enqueue payloads into per `(target, source)` shared queues and only emit a `msg_ring` doorbell when transitioning empty -> non-empty.
+- `send_many_nowait` API:
+  - Implemented.
+  - Added:
+    - `RemoteShard::send_many_raw_nowait`
+    - `RemoteShard::send_many_nowait`
+    - `ShardCtx::send_many_raw_nowait`
+    - `ShardCtx::send_many_nowait`
+- Explicit flush API:
+  - Implemented.
+  - Added:
+    - `ShardCtx::flush() -> SendTicket`
+    - `RemoteShard::flush() -> SendTicket` (no-op success outside shard context)
+  - io_uring implementation flushes pending submissions and uses a `NOP` completion barrier.
+- Send waiter structure (`HashMap -> slab`):
+  - Implemented.
+  - Waiters are now stored in `Slab`, with completion `user_data` carrying slab index.
+- Optional io_uring setup knobs (SQPOLL path):
+  - Implemented on Linux builder:
+    - `io_uring_sqpoll(Option<u32>)`
+    - `io_uring_sqpoll_cpu(Option<u32>)`
+    - `io_uring_single_issuer(bool)`
+    - `io_uring_coop_taskrun(bool)`
+- EventState lock removal (`Mutex -> RefCell`):
+  - Not applied.
+  - Reason: current `spawn_on` API requires `Send` futures; making event state shard-local `Rc<RefCell<...>>` makes `NextEvent` non-`Send`, which breaks valid `spawn_on` usage.
+
+### Correctness note on CQE suppression
+
+- Previous pass used `IORING_MSG_RING_CQE_SKIP` under the assumption it only removed sender-side completions.
+- This pass corrected no-ticket suppression to use SQE `SKIP_SUCCESS` for source CQE suppression while preserving receiver delivery.
+
+### Additional tests added
+
+- `send_many_raw_nowait_delivers_in_order`
+- `flush_completes_without_messages`
+- `io_uring_send_many_nowait_delivers_messages`
+
+### Validation
+
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.
+
+### Latest quick benchmark sample (50ms warmup/50ms measure)
+
+- `steady_ping_pong_rtt/msg_ring_runtime_queue`: ~`1.36-1.39 ms`
+- `steady_ping_pong_rtt/msg_ring_runtime_io_uring`: ~`365-370 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.23-1.31 ms`
+- `steady_one_way_send_drain/msg_ring_runtime_queue`: ~`1.23-1.25 ms`
+- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`62.8-64.5 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`69.0-72.7 us`
+- `cold_start_ping_pong/msg_ring_runtime_queue`: ~`2.39-2.40 ms`
+- `cold_start_ping_pong/msg_ring_runtime_io_uring`: ~`255-276 us`
+- `cold_start_ping_pong/tokio_two_worker`: ~`453-484 us`

@@ -49,6 +49,7 @@ impl MsgRingHarness {
             builder = builder.ring_entries(entries);
         }
         let runtime = builder.build().ok()?;
+        let backend_kind = backend;
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<MsgRingCmd>();
 
         let responder_join = runtime
@@ -124,8 +125,19 @@ impl MsgRingHarness {
                             let _ = reply.send(checksum);
                         }
                         MsgRingCmd::OneWay { rounds, reply } => {
-                            for i in 0..(rounds as u32) {
-                                peer.send_raw_nowait(ONE_WAY_TAG, i).expect("send one-way");
+                            if backend_kind == BackendKind::IoUring {
+                                peer.send_many_raw_nowait(
+                                    (0..(rounds as u32)).map(|i| (ONE_WAY_TAG, i)),
+                                )
+                                .expect("send one-way batch");
+                                peer.flush()
+                                    .expect("flush nowait sends")
+                                    .await
+                                    .expect("flush");
+                            } else {
+                                for i in 0..(rounds as u32) {
+                                    peer.send_raw_nowait(ONE_WAY_TAG, i).expect("send one-way");
+                                }
                             }
                             peer.send_raw(FLUSH_TAG, rounds as u32)
                                 .expect("send flush")
