@@ -182,3 +182,39 @@ Implemented to improve comparability and isolate what is being measured:
 
 - Updated runtime one-way harness from strict per-send await to windowed in-flight tickets.
 - Targeted one-way io_uring sample improved from roughly `~1.44 ms` to `~1.17 ms` under short Criterion settings.
+
+## Update: Send Path Optimizations (Proceed Phase)
+
+Implemented next optimization wave:
+
+- Added no-ticket send APIs:
+  - `RemoteShard::send_raw_nowait(tag, val)`
+  - `RemoteShard::send_nowait(msg)`
+  - `ShardCtx::send_raw_nowait(target, tag, val)`
+- Added shard-local fast path:
+  - local sends now enqueue into a local per-shard queue (`LocalCommand`) and no longer bounce through the shard command channel.
+- Added io_uring batching:
+  - deferred `ring.submit()` with batched flush (`IOURING_SUBMIT_BATCH=64`)
+  - flush on poll/reap and on SQ pressure.
+- Added io_uring no-ticket CQE suppression:
+  - uses `IORING_MSG_RING_CQE_SKIP` flag value for no-ticket `msg_ring` sends to avoid sender-CQ flooding.
+
+### Benchmark harness alignment updates
+
+- Runtime one-way benchmark now uses `send_raw_nowait` for fire-and-drain semantics.
+- io_uring steady one-way harness uses larger ring entries (`4096`) to avoid CQ overflow in high-burst synthetic load.
+- Cold-start io_uring path kept at default ring sizing to keep init broadly reliable on dev machines.
+
+### Additional test coverage
+
+- Added test:
+  - `send_raw_nowait_delivers_event`
+
+### Current quick sample numbers (50ms warmup/50ms measure)
+
+- `steady_ping_pong_rtt/msg_ring_runtime_queue`: ~`1.47-1.51 ms`
+- `steady_ping_pong_rtt/msg_ring_runtime_io_uring`: ~`336-348 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.21-1.34 ms`
+- `steady_one_way_send_drain/msg_ring_runtime_queue`: ~`1.25-1.27 ms`
+- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`232-234 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`69-71 us`

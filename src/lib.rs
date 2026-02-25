@@ -30,6 +30,10 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "linux")]
 const MSG_RING_CQE_FLAG: u32 = 1 << 8;
+#[cfg(target_os = "linux")]
+const IOURING_SUBMIT_BATCH: usize = 64;
+#[cfg(target_os = "linux")]
+const IOURING_MSG_RING_CQE_SKIP: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -325,43 +329,47 @@ impl RemoteShard {
     }
 
     pub fn send_raw(&self, tag: u16, val: u32) -> Result<SendTicket, SendError> {
-        let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
         let (ack_tx, ack_rx) = oneshot::channel();
+        self.send_raw_inner(tag, val, Some(ack_tx))?;
+        Ok(SendTicket { rx: Some(ack_rx) })
+    }
 
-        let send_result = match (self.shared.backend, current) {
-            (BackendKind::IoUring, Some(ctx)) => self.shared.send_to(
-                ctx.shard_id(),
-                Command::SubmitRingMsg {
-                    target: self.id,
-                    tag,
-                    val,
-                    ack: ack_tx,
-                },
-            ),
-            (_, maybe_ctx) => {
-                let from = maybe_ctx.map_or(EXTERNAL_SENDER, |ctx| ctx.shard_id());
-                self.shared.send_to(
-                    self.id,
-                    Command::InjectRawMessage {
-                        from,
-                        tag,
-                        val,
-                        ack: ack_tx,
-                    },
-                )
-            }
-        };
+    pub fn send_raw_nowait(&self, tag: u16, val: u32) -> Result<(), SendError> {
+        self.send_raw_inner(tag, val, None)
+    }
 
-        if send_result.is_err() {
-            return Err(SendError::Closed);
+    fn send_raw_inner(
+        &self,
+        tag: u16,
+        val: u32,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
+    ) -> Result<(), SendError> {
+        let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
+        if let Some(ctx) = current {
+            return ctx.enqueue_local_send(self.id, tag, val, ack);
         }
 
-        Ok(SendTicket { rx: Some(ack_rx) })
+        self.shared
+            .send_to(
+                self.id,
+                Command::InjectRawMessage {
+                    from: EXTERNAL_SENDER,
+                    tag,
+                    val,
+                    ack,
+                },
+            )
+            .map_err(|_| SendError::Closed)
     }
 
     pub fn send<M: RingMsg>(&self, msg: M) -> Result<SendTicket, SendError> {
         let (tag, val) = msg.encode();
         self.send_raw(tag, val)
+    }
+
+    pub fn send_nowait<M: RingMsg>(&self, msg: M) -> Result<(), SendError> {
+        let (tag, val) = msg.encode();
+        self.send_raw_nowait(tag, val)
     }
 }
 
@@ -376,6 +384,7 @@ struct ShardCtxInner {
     event_state: Arc<EventState>,
     spawner: LocalSpawner,
     remotes: Vec<RemoteShard>,
+    local_commands: Rc<RefCell<VecDeque<LocalCommand>>>,
 }
 
 thread_local! {
@@ -397,6 +406,42 @@ impl ShardCtx {
 
     pub fn remote(&self, target: ShardId) -> Option<RemoteShard> {
         self.inner.remotes.get(usize::from(target)).cloned()
+    }
+
+    pub fn send_raw_nowait(&self, target: ShardId, tag: u16, val: u32) -> Result<(), SendError> {
+        self.enqueue_local_send(target, tag, val, None)
+    }
+
+    pub fn send_raw(&self, target: ShardId, tag: u16, val: u32) -> Result<SendTicket, SendError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.enqueue_local_send(target, tag, val, Some(ack_tx))?;
+        Ok(SendTicket { rx: Some(ack_rx) })
+    }
+
+    fn enqueue_local_send(
+        &self,
+        target: ShardId,
+        tag: u16,
+        val: u32,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
+    ) -> Result<(), SendError> {
+        if usize::from(target) >= self.inner.remotes.len() {
+            if let Some(ack) = ack {
+                let _ = ack.send(Err(SendError::Closed));
+            }
+            return Err(SendError::Closed);
+        }
+
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitRingMsg {
+                target,
+                tag,
+                val,
+                ack,
+            });
+        Ok(())
     }
 
     pub fn spawn_local<F, T>(&self, fut: F) -> LocalJoinHandle<T>
@@ -538,19 +583,22 @@ impl Future for NextEvent {
     }
 }
 
+enum LocalCommand {
+    SubmitRingMsg {
+        target: ShardId,
+        tag: u16,
+        val: u32,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
+    },
+}
+
 enum Command {
     Spawn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
     InjectRawMessage {
         from: ShardId,
         tag: u16,
         val: u32,
-        ack: oneshot::Sender<Result<(), SendError>>,
-    },
-    SubmitRingMsg {
-        target: ShardId,
-        tag: u16,
-        val: u32,
-        ack: oneshot::Sender<Result<(), SendError>>,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
     },
     Shutdown,
 }
@@ -621,13 +669,15 @@ impl ShardBackend {
         target: ShardId,
         tag: u16,
         val: u32,
-        ack: oneshot::Sender<Result<(), SendError>>,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
         command_txs: &[Sender<Command>],
     ) {
         match self {
             Self::Queue => {
                 let Some(tx) = command_txs.get(usize::from(target)) else {
-                    let _ = ack.send(Err(SendError::Closed));
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Err(SendError::Closed));
+                    }
                     return;
                 };
                 let _ = tx.send(Command::InjectRawMessage {
@@ -661,6 +711,8 @@ struct IoUringDriver {
     ring_fds: Arc<Vec<RawFd>>,
     next_ticket: u64,
     send_waiters: HashMap<u64, oneshot::Sender<Result<(), SendError>>>,
+    pending_submit: usize,
+    submit_batch_limit: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -672,6 +724,8 @@ impl IoUringDriver {
             ring_fds,
             next_ticket: 1,
             send_waiters: HashMap::new(),
+            pending_submit: 0,
+            submit_batch_limit: IOURING_SUBMIT_BATCH,
         }
     }
 
@@ -680,38 +734,47 @@ impl IoUringDriver {
         target: ShardId,
         tag: u16,
         val: u32,
-        ack: oneshot::Sender<Result<(), SendError>>,
+        ack: Option<oneshot::Sender<Result<(), SendError>>>,
     ) -> Result<(), SendError> {
         let Some(&target_fd) = self.ring_fds.get(usize::from(target)) else {
-            let _ = ack.send(Err(SendError::Closed));
+            if let Some(ack) = ack {
+                let _ = ack.send(Err(SendError::Closed));
+            }
             return Err(SendError::Closed);
         };
 
-        let ticket = self.next_ticket;
-        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        let ticket = ack.as_ref().map(|_| {
+            let t = self.next_ticket;
+            self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+            t
+        });
         let payload = pack_msg_userdata(self.shard_id, tag);
         let val_i32 = i32::from_ne_bytes(val.to_ne_bytes());
 
-        let entry = opcode::MsgRingData::new(
+        let mut op = opcode::MsgRingData::new(
             types::Fd(target_fd),
             val_i32,
             payload,
             Some(MSG_RING_CQE_FLAG),
-        )
-        .build()
-        .user_data(ticket);
+        );
+        if ticket.is_none() {
+            op = op.opcode_flags(IOURING_MSG_RING_CQE_SKIP);
+        }
+        let entry = op.build().user_data(ticket.unwrap_or(0));
 
         if self.push_entry(entry).is_err() {
-            let _ = ack.send(Err(SendError::Closed));
+            if let Some(ack) = ack {
+                let _ = ack.send(Err(SendError::Closed));
+            }
             return Err(SendError::Closed);
         }
 
-        self.send_waiters.insert(ticket, ack);
-        if self.ring.submit().is_err() {
-            if let Some(waiter) = self.send_waiters.remove(&ticket) {
-                let _ = waiter.send(Err(SendError::Closed));
-            }
-            return Err(SendError::Closed);
+        if let (Some(ticket), Some(ack)) = (ticket, ack) {
+            self.send_waiters.insert(ticket, ack);
+        }
+        self.pending_submit += 1;
+        if self.pending_submit >= self.submit_batch_limit {
+            self.flush_submissions()?;
         }
 
         Ok(())
@@ -725,15 +788,33 @@ impl IoUringDriver {
             }
             drop(sq);
 
-            if self.ring.submit().is_err() {
-                return Err(SendError::Closed);
-            }
+            self.flush_submissions()?;
         }
 
         Err(SendError::Closed)
     }
 
+    fn flush_submissions(&mut self) -> Result<(), SendError> {
+        if self.pending_submit == 0 {
+            return Ok(());
+        }
+        self.pending_submit = 0;
+
+        if self.ring.submit().is_err() {
+            for (_, waiter) in self.send_waiters.drain() {
+                let _ = waiter.send(Err(SendError::Closed));
+            }
+            return Err(SendError::Closed);
+        }
+
+        Ok(())
+    }
+
     fn reap(&mut self, event_state: &EventState) {
+        if self.flush_submissions().is_err() {
+            return;
+        }
+
         let mut cq = self.ring.completion();
         for cqe in &mut cq {
             if cqe.flags() & MSG_RING_CQE_FLAG != 0 {
@@ -784,6 +865,7 @@ fn run_shard(
     let mut pool = LocalPool::new();
     let spawner = pool.spawner();
     let event_state = Arc::new(EventState::default());
+    let local_commands = Rc::new(RefCell::new(VecDeque::new()));
     let ctx = ShardCtx {
         inner: Rc::new(ShardCtxInner {
             runtime_id,
@@ -791,6 +873,7 @@ fn run_shard(
             event_state: event_state.clone(),
             spawner: spawner.clone(),
             remotes,
+            local_commands: local_commands.clone(),
         }),
     };
 
@@ -808,6 +891,7 @@ fn run_shard(
     let mut stop = false;
     while !stop {
         pool.run_until_stalled();
+        drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
         backend.poll(&event_state);
 
         let mut drained = false;
@@ -815,14 +899,7 @@ fn run_shard(
             match rx.try_recv() {
                 Ok(cmd) => {
                     drained = true;
-                    stop = handle_command(
-                        cmd,
-                        shard_id,
-                        &spawner,
-                        &event_state,
-                        &mut backend,
-                        &command_txs,
-                    );
+                    stop = handle_command(cmd, &spawner, &event_state);
                     if stop {
                         break;
                     }
@@ -840,19 +917,13 @@ fn run_shard(
         }
 
         if !drained {
+            drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
             if backend.prefers_busy_poll() {
                 thread::yield_now();
             } else {
                 match rx.recv_timeout(idle_wait) {
                     Ok(cmd) => {
-                        stop = handle_command(
-                            cmd,
-                            shard_id,
-                            &spawner,
-                            &event_state,
-                            &mut backend,
-                            &command_txs,
-                        );
+                        stop = handle_command(cmd, &spawner, &event_state);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => stop = true,
@@ -860,13 +931,16 @@ fn run_shard(
             }
         }
 
+        drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
         backend.poll(&event_state);
     }
 
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
-            Command::InjectRawMessage { ack, .. } | Command::SubmitRingMsg { ack, .. } => {
-                let _ = ack.send(Err(SendError::Closed));
+            Command::InjectRawMessage { ack, .. } => {
+                if let Some(ack) = ack {
+                    let _ = ack.send(Err(SendError::Closed));
+                }
             }
             Command::Spawn(_) | Command::Shutdown => {}
         }
@@ -878,14 +952,7 @@ fn run_shard(
     });
 }
 
-fn handle_command(
-    cmd: Command,
-    shard_id: ShardId,
-    spawner: &LocalSpawner,
-    event_state: &EventState,
-    backend: &mut ShardBackend,
-    command_txs: &[Sender<Command>],
-) -> bool {
+fn handle_command(cmd: Command, spawner: &LocalSpawner, event_state: &EventState) -> bool {
     match cmd {
         Command::Spawn(fut) => {
             let _ = spawner.spawn_local(fut);
@@ -898,18 +965,34 @@ fn handle_command(
             ack,
         } => {
             event_state.push(Event::RingMsg { from, tag, val });
-            let _ = ack.send(Ok(()));
-            false
-        }
-        Command::SubmitRingMsg {
-            target,
-            tag,
-            val,
-            ack,
-        } => {
-            backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs);
+            if let Some(ack) = ack {
+                let _ = ack.send(Ok(()));
+            }
             false
         }
         Command::Shutdown => true,
+    }
+}
+
+fn drain_local_commands(
+    shard_id: ShardId,
+    local_commands: &RefCell<VecDeque<LocalCommand>>,
+    backend: &mut ShardBackend,
+    command_txs: &[Sender<Command>],
+) {
+    loop {
+        let cmd = local_commands.borrow_mut().pop_front();
+        let Some(cmd) = cmd else {
+            break;
+        };
+
+        match cmd {
+            LocalCommand::SubmitRingMsg {
+                target,
+                tag,
+                val,
+                ack,
+            } => backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs),
+        }
     }
 }

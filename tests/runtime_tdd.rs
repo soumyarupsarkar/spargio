@@ -115,6 +115,42 @@ fn typed_send_round_trips() {
     assert_eq!(got, Control::Ack);
 }
 
+#[test]
+fn send_raw_nowait_delivers_event() {
+    let rt = Runtime::builder().shards(2).build().expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_event()
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote.send_raw_nowait(77, 5).expect("send nowait");
+        })
+        .expect("spawn sender");
+
+    block_on(send).expect("sender join");
+    let event = block_on(recv).expect("receiver join");
+    assert_eq!(
+        event,
+        Event::RingMsg {
+            from: 0,
+            tag: 77,
+            val: 5
+        }
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn io_uring_backend_delivers_message() {

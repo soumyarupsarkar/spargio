@@ -3,7 +3,6 @@ use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use futures::executor::block_on;
 use msg_ring_runtime::{BackendKind, Event, Runtime, ShardCtx};
-use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -13,7 +12,6 @@ const ONE_WAY_TAG: u16 = 3;
 const FLUSH_TAG: u16 = 4;
 const FLUSH_ACK_TAG: u16 = 5;
 const SHUTDOWN_TAG: u16 = 9;
-const SEND_WINDOW: usize = 64;
 
 const RTT_ROUNDS: usize = 256;
 const ONE_WAY_ROUNDS: usize = 2048;
@@ -42,7 +40,15 @@ struct MsgRingHarness {
 
 impl MsgRingHarness {
     fn new(backend: BackendKind) -> Option<Self> {
-        let runtime = Runtime::builder().backend(backend).shards(2).build().ok()?;
+        Self::new_with_ring_entries(backend, None)
+    }
+
+    fn new_with_ring_entries(backend: BackendKind, ring_entries: Option<u32>) -> Option<Self> {
+        let mut builder = Runtime::builder().backend(backend).shards(2);
+        if let Some(entries) = ring_entries {
+            builder = builder.ring_entries(entries);
+        }
+        let runtime = builder.build().ok()?;
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<MsgRingCmd>();
 
         let responder_join = runtime
@@ -118,20 +124,8 @@ impl MsgRingHarness {
                             let _ = reply.send(checksum);
                         }
                         MsgRingCmd::OneWay { rounds, reply } => {
-                            let mut inflight = VecDeque::with_capacity(SEND_WINDOW);
                             for i in 0..(rounds as u32) {
-                                let ticket = peer.send_raw(ONE_WAY_TAG, i).expect("send one-way");
-                                inflight.push_back(ticket);
-                                if inflight.len() >= SEND_WINDOW {
-                                    inflight
-                                        .pop_front()
-                                        .expect("window ticket")
-                                        .await
-                                        .expect("one-way");
-                                }
-                            }
-                            while let Some(ticket) = inflight.pop_front() {
-                                ticket.await.expect("one-way");
+                                peer.send_raw_nowait(ONE_WAY_TAG, i).expect("send one-way");
                             }
                             peer.send_raw(FLUSH_TAG, rounds as u32)
                                 .expect("send flush")
@@ -623,7 +617,8 @@ fn bench_steady_one_way(c: &mut Criterion) {
     });
 
     #[cfg(target_os = "linux")]
-    if let Some(mut uring) = MsgRingHarness::new(BackendKind::IoUring) {
+    if let Some(mut uring) = MsgRingHarness::new_with_ring_entries(BackendKind::IoUring, Some(4096))
+    {
         black_box(uring.one_way(64));
         group.bench_function("msg_ring_runtime_io_uring", |b| {
             b.iter(|| black_box(uring.one_way(ONE_WAY_ROUNDS)))
