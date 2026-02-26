@@ -13,10 +13,10 @@ Built with Codex.
 | `cold_start_ping_pong` | `561-610 us` | `249-267 us` | `n/a` | `spargio io_uring ~2.3x faster than tokio` |
 | `fanout_fanin_balanced` | `1.473-1.621 ms` | `1.387-1.404 ms` | `n/a` | `spargio io_uring ~1.1x faster than tokio` |
 | `fanout_fanin_skewed` | `2.366-2.437 ms` | `1.993-2.003 ms` | `n/a` | `spargio io_uring ~1.2x faster than tokio` |
-| `fs_read_rtt_4k` (`qd=1`) | `1.554-1.680 ms` | `1.031-1.074 ms` | `1.010-1.029 ms` | `unbound slightly faster than bound; both faster than tokio` |
-| `fs_read_throughput_4k_qd32` | `8.550-8.703 ms` | `5.932-6.677 ms` | `6.567-7.383 ms` | `bound leads; unbound still faster than tokio` |
-| `net_echo_rtt_256b` (`qd=1`) | `7.738-7.967 ms` | `5.480-5.754 ms` | `7.644-8.035 ms` | `bound leads strongly; unbound near tokio` |
-| `net_stream_throughput_4k_window32` | `10.689-11.171 ms` | `11.089-11.332 ms` | `10.834-10.990 ms` | `unbound near tokio and better than current bound` |
+| `fs_read_rtt_4k` (`qd=1`) | `1.754-1.867 ms` | `1.013-1.062 ms` | `1.003-1.028 ms` | `unbound slightly faster than bound; both faster than tokio` |
+| `fs_read_throughput_4k_qd32` | `8.732-9.015 ms` | `5.967-6.988 ms` | `6.085-6.866 ms` | `both Spargio paths faster than tokio` |
+| `net_echo_rtt_256b` (`qd=1`) | `7.918-8.187 ms` | `6.840-8.632 ms` | `5.539-5.812 ms` | `unbound now leads clearly` |
+| `net_stream_throughput_4k_window32` | `10.544-10.656 ms` | `11.073-11.449 ms` | `10.996-11.408 ms` | `tokio leads; unbound narrows the gap` |
 
 Spargio leads most clearly in coordination-heavy and latency-sensitive paths, while some pure throughput cases (for example `steady_one_way_send_drain` and `net_stream_throughput_4k_window32`) are currently near parity.
 
@@ -62,6 +62,7 @@ These mechanisms are where Spargio’s measured wins come from in the benchmark 
   - `RuntimeHandle::uring_native_unbound() -> UringNativeAny`
   - submission-time shard selection via `NativeLaneSelector` (pending-native depth + round-robin tie-break)
   - FD affinity lease table (`weak` file, `strong` stream, `hard` multishot) and active `op_id -> shard` route tracking
+  - direct native command-envelope submission path (`SubmitNativeAny`) with same-shard local fast path
 - Persistent file session API:
   - `UringBoundFd::start_file_session()`
   - `UringFileSession::{read_at, read_at_into, shutdown}`
@@ -77,8 +78,6 @@ These mechanisms are where Spargio’s measured wins come from in the benchmark 
 
 ## Not Done Yet
 
-- Unbound-path optimization:
-  - optional direct command-envelope path (`SubmitNativeAny`) to reduce per-op spawn overhead in the unbound lane
 - Full production-grade work-stealing policy:
   - richer fairness and starvation controls
   - stronger adaptive victim-selection heuristics

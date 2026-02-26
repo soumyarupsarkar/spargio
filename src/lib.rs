@@ -461,6 +461,8 @@ pub enum TaskPlacement {
 pub struct RuntimeStats {
     pub shard_command_depths: Vec<usize>,
     pub pending_native_ops_by_shard: Vec<usize>,
+    pub native_any_envelope_submitted: u64,
+    pub native_any_local_fastpath_submitted: u64,
     pub spawn_pinned_submitted: u64,
     pub spawn_stealable_submitted: u64,
     pub stealable_executed: u64,
@@ -1230,11 +1232,17 @@ impl UringNativeAny {
     }
 
     pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Weak,
             false,
-            move |lane| async move { lane.read_at(fd, offset, len).await },
+            |reply| NativeAnyCommand::Read {
+                fd,
+                offset,
+                len,
+                reply,
+            },
+            "native unbound read response channel closed",
         )
         .await
     }
@@ -1245,52 +1253,61 @@ impl UringNativeAny {
         offset: u64,
         buf: Vec<u8>,
     ) -> std::io::Result<(usize, Vec<u8>)> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Weak,
             false,
-            move |lane| async move { lane.read_at_into(fd, offset, buf).await },
+            |reply| NativeAnyCommand::ReadOwned {
+                fd,
+                offset,
+                buf,
+                reply,
+            },
+            "native unbound read response channel closed",
         )
         .await
     }
 
     pub async fn write_at(&self, fd: RawFd, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let payload = buf.to_vec();
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Weak,
             false,
-            move |lane| async move { lane.write_at(fd, offset, &payload).await },
+            |reply| NativeAnyCommand::Write {
+                fd,
+                offset,
+                buf: buf.to_vec(),
+                reply,
+            },
+            "native unbound write response channel closed",
         )
         .await
     }
 
     pub async fn fsync(&self, fd: RawFd) -> std::io::Result<()> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Weak,
             false,
-            move |lane| async move { lane.fsync(fd).await },
+            |reply| NativeAnyCommand::Fsync { fd, reply },
+            "native unbound fsync response channel closed",
         )
         .await
     }
 
     pub async fn recv(&self, fd: RawFd, len: usize) -> std::io::Result<Vec<u8>> {
-        self.run_tracked(
-            fd,
-            NativeAffinityStrength::Strong,
-            false,
-            move |lane| async move { lane.recv(fd, len).await },
-        )
-        .await
+        let (got, mut buf) = self.recv_owned(fd, vec![0; len]).await?;
+        buf.truncate(got.min(buf.len()));
+        Ok(buf)
     }
 
     pub async fn recv_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Strong,
             false,
-            move |lane| async move { lane.recv_owned(fd, buf).await },
+            |reply| NativeAnyCommand::RecvOwned { fd, buf, reply },
+            "native unbound recv response channel closed",
         )
         .await
     }
@@ -1306,11 +1323,12 @@ impl UringNativeAny {
     }
 
     pub async fn send_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Strong,
             false,
-            move |lane| async move { lane.send_owned(fd, buf).await },
+            |reply| NativeAnyCommand::SendOwned { fd, buf, reply },
+            "native unbound send response channel closed",
         )
         .await
     }
@@ -1330,11 +1348,17 @@ impl UringNativeAny {
         bufs: Vec<Vec<u8>>,
         window: usize,
     ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Strong,
             false,
-            move |lane| async move { lane.send_all_batch(fd, bufs, window).await },
+            |reply| NativeAnyCommand::SendBatchOwned {
+                fd,
+                bufs,
+                window,
+                reply,
+            },
+            "native unbound send batch response channel closed",
         )
         .await
     }
@@ -1376,14 +1400,18 @@ impl UringNativeAny {
         buffer_count: u16,
         bytes_target: usize,
     ) -> std::io::Result<UringRecvMultishotSegments> {
-        self.run_tracked(
+        self.submit_tracked(
             fd,
             NativeAffinityStrength::Hard,
             true,
-            move |lane| async move {
-                lane.recv_multishot_segments(fd, buffer_len, buffer_count, bytes_target)
-                    .await
+            |reply| NativeAnyCommand::RecvMultishot {
+                fd,
+                buffer_len,
+                buffer_count,
+                bytes_target,
+                reply,
             },
+            "native unbound recv multishot response channel closed",
         )
         .await
     }
@@ -1488,26 +1516,86 @@ impl UringNativeAny {
         }
     }
 
-    async fn run_tracked<T, F, Fut>(
+    fn dispatch_native_any(&self, shard: ShardId, op: NativeAnyCommand) -> std::io::Result<()> {
+        if let Some(ctx) = ShardCtx::current()
+            .filter(|ctx| ctx.runtime_id() == self.handle.inner.shared.runtime_id)
+            .filter(|ctx| ctx.shard_id() == shard)
+        {
+            self.handle
+                .inner
+                .shared
+                .stats
+                .native_any_local_fastpath_submitted
+                .fetch_add(1, Ordering::Relaxed);
+            ctx.inner
+                .local_commands
+                .borrow_mut()
+                .push_back(op.into_local(shard));
+            return Ok(());
+        }
+
+        self.handle
+            .inner
+            .shared
+            .stats
+            .native_any_envelope_submitted
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(tx) = self.handle.inner.shared.command_txs.get(usize::from(shard)) else {
+            op.fail_closed();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native unbound submit command channel closed",
+            ));
+        };
+        self.handle
+            .inner
+            .shared
+            .stats
+            .increment_command_depth(shard);
+        match tx.send(Command::SubmitNativeAny { op }) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.handle
+                    .inner
+                    .shared
+                    .stats
+                    .decrement_command_depth(shard);
+                match err.0 {
+                    Command::SubmitNativeAny { op } => op.fail_closed(),
+                    _ => unreachable!("native unbound command type mismatch"),
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound submit command channel closed",
+                ))
+            }
+        }
+    }
+
+    async fn submit_tracked<T, B>(
         &self,
         fd: RawFd,
         strength: NativeAffinityStrength,
         release_affinity: bool,
-        op: F,
+        build: B,
+        closed_msg: &'static str,
     ) -> std::io::Result<T>
     where
-        F: FnOnce(UringNativeLane) -> Fut,
-        Fut: Future<Output = std::io::Result<T>>,
+        B: FnOnce(oneshot::Sender<std::io::Result<T>>) -> NativeAnyCommand,
     {
         let (op_id, shard) = self.begin_op(fd, strength);
-        let lane = match self.handle.uring_native_lane(shard) {
-            Ok(lane) => lane,
-            Err(err) => {
-                self.finish_op(op_id, fd, shard, release_affinity);
-                return Err(runtime_error_to_io(err));
-            }
-        };
-        let out = op(lane).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = build(reply_tx);
+        if let Err(err) = self.dispatch_native_any(shard, cmd) {
+            self.finish_op(op_id, fd, shard, release_affinity);
+            return Err(err);
+        }
+        let out = reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                closed_msg,
+            ))
+        });
         self.finish_op(op_id, fd, shard, release_affinity);
         out
     }
@@ -2389,6 +2477,8 @@ type StealableInboxes = Arc<Vec<Arc<Mutex<VecDeque<StealableTask>>>>>;
 struct RuntimeStatsInner {
     shard_command_depths: Vec<AtomicUsize>,
     pending_native_ops_by_shard: Vec<AtomicUsize>,
+    native_any_envelope_submitted: AtomicU64,
+    native_any_local_fastpath_submitted: AtomicU64,
     spawn_pinned_submitted: AtomicU64,
     spawn_stealable_submitted: AtomicU64,
     stealable_executed: AtomicU64,
@@ -2416,6 +2506,8 @@ impl RuntimeStatsInner {
         Self {
             shard_command_depths,
             pending_native_ops_by_shard,
+            native_any_envelope_submitted: AtomicU64::new(0),
+            native_any_local_fastpath_submitted: AtomicU64::new(0),
             spawn_pinned_submitted: AtomicU64::new(0),
             spawn_stealable_submitted: AtomicU64::new(0),
             stealable_executed: AtomicU64::new(0),
@@ -2444,6 +2536,12 @@ impl RuntimeStatsInner {
                 .iter()
                 .map(|depth| depth.load(Ordering::Relaxed))
                 .collect(),
+            native_any_envelope_submitted: self
+                .native_any_envelope_submitted
+                .load(Ordering::Relaxed),
+            native_any_local_fastpath_submitted: self
+                .native_any_local_fastpath_submitted
+                .load(Ordering::Relaxed),
             spawn_pinned_submitted: self.spawn_pinned_submitted.load(Ordering::Relaxed),
             spawn_stealable_submitted: self.spawn_stealable_submitted.load(Ordering::Relaxed),
             stealable_executed: self.stealable_executed.load(Ordering::Relaxed),
@@ -3041,6 +3139,195 @@ enum LocalCommand {
     },
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+enum NativeAnyCommand {
+    Read {
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+        reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    },
+    ReadOwned {
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    Write {
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<usize>>,
+    },
+    RecvOwned {
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    SendOwned {
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    SendBatchOwned {
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<Vec<u8>>)>>,
+    },
+    RecvMultishot {
+        fd: RawFd,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+        reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
+    },
+    Fsync {
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl NativeAnyCommand {
+    fn into_local(self, origin_shard: ShardId) -> LocalCommand {
+        match self {
+            Self::Read {
+                fd,
+                offset,
+                len,
+                reply,
+            } => LocalCommand::SubmitNativeRead {
+                origin_shard,
+                fd,
+                offset,
+                len,
+                reply,
+            },
+            Self::ReadOwned {
+                fd,
+                offset,
+                buf,
+                reply,
+            } => LocalCommand::SubmitNativeReadOwned {
+                origin_shard,
+                fd,
+                offset,
+                buf,
+                reply,
+            },
+            Self::Write {
+                fd,
+                offset,
+                buf,
+                reply,
+            } => LocalCommand::SubmitNativeWrite {
+                origin_shard,
+                fd,
+                offset,
+                buf,
+                reply,
+            },
+            Self::RecvOwned { fd, buf, reply } => LocalCommand::SubmitNativeRecvOwned {
+                origin_shard,
+                fd,
+                buf,
+                reply,
+            },
+            Self::SendOwned { fd, buf, reply } => LocalCommand::SubmitNativeSendOwned {
+                origin_shard,
+                fd,
+                buf,
+                reply,
+            },
+            Self::SendBatchOwned {
+                fd,
+                bufs,
+                window,
+                reply,
+            } => LocalCommand::SubmitNativeSendBatchOwned {
+                origin_shard,
+                fd,
+                bufs,
+                window,
+                reply,
+            },
+            Self::RecvMultishot {
+                fd,
+                buffer_len,
+                buffer_count,
+                bytes_target,
+                reply,
+            } => LocalCommand::SubmitNativeRecvMultishot {
+                origin_shard,
+                fd,
+                buffer_len,
+                buffer_count,
+                bytes_target,
+                reply,
+            },
+            Self::Fsync { fd, reply } => LocalCommand::SubmitNativeFsync {
+                origin_shard,
+                fd,
+                reply,
+            },
+        }
+    }
+
+    fn fail_closed(self) {
+        match self {
+            Self::Read { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound read command channel closed",
+                )));
+            }
+            Self::ReadOwned { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound read command channel closed",
+                )));
+            }
+            Self::Write { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound write command channel closed",
+                )));
+            }
+            Self::RecvOwned { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound recv command channel closed",
+                )));
+            }
+            Self::SendOwned { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound send command channel closed",
+                )));
+            }
+            Self::SendBatchOwned { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound send batch command channel closed",
+                )));
+            }
+            Self::RecvMultishot { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound recv multishot command channel closed",
+                )));
+            }
+            Self::Fsync { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound fsync command channel closed",
+                )));
+            }
+        }
+    }
+}
+
 enum Command {
     Spawn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
     InjectRawMessage {
@@ -3048,6 +3335,10 @@ enum Command {
         tag: u16,
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeAny {
+        op: NativeAnyCommand,
     },
     StealableWake,
     Shutdown,
@@ -5101,7 +5392,14 @@ fn run_shard(
                 Ok(cmd) => {
                     stats.decrement_command_depth(shard_id);
                     drained = true;
-                    stop = handle_command(cmd, &spawner, &event_state, &stats);
+                    stop = handle_command(
+                        cmd,
+                        shard_id,
+                        &spawner,
+                        &event_state,
+                        &stats,
+                        &local_commands,
+                    );
                     if stop {
                         break;
                     }
@@ -5140,7 +5438,14 @@ fn run_shard(
                 match rx.recv_timeout(idle_wait) {
                     Ok(cmd) => {
                         stats.decrement_command_depth(shard_id);
-                        stop = handle_command(cmd, &spawner, &event_state, &stats);
+                        stop = handle_command(
+                            cmd,
+                            shard_id,
+                            &spawner,
+                            &event_state,
+                            &stats,
+                            &local_commands,
+                        );
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => stop = true,
@@ -5174,6 +5479,8 @@ fn run_shard(
                     let _ = ack.send(Err(SendError::Closed));
                 }
             }
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            Command::SubmitNativeAny { op } => op.fail_closed(),
             Command::Spawn(_) | Command::StealableWake | Command::Shutdown => {}
         }
     }
@@ -5186,9 +5493,11 @@ fn run_shard(
 
 fn handle_command(
     cmd: Command,
+    _shard_id: ShardId,
     spawner: &LocalSpawner,
     event_state: &EventState,
     stats: &RuntimeStatsInner,
+    _local_commands: &RefCell<VecDeque<LocalCommand>>,
 ) -> bool {
     match cmd {
         Command::Spawn(fut) => {
@@ -5206,6 +5515,13 @@ fn handle_command(
             if let Some(ack) = ack {
                 let _ = ack.send(Ok(()));
             }
+            false
+        }
+        #[cfg(all(feature = "uring-native", target_os = "linux"))]
+        Command::SubmitNativeAny { op } => {
+            _local_commands
+                .borrow_mut()
+                .push_back(op.into_local(_shard_id));
             false
         }
         Command::StealableWake => false,

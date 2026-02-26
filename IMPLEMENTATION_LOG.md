@@ -2123,3 +2123,70 @@ Net:
 - `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.69-11.17 ms`
 - `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`11.09-11.33 ms`
 - `net_stream_throughput_4k_window32/spargio_uring_unbound_tcp_window32`: ~`10.83-10.99 ms`
+
+## Implementation: direct unbound command-envelope optimization (`SubmitNativeAny`)
+
+Implemented the previously planned unbound-path optimization to remove per-op pinned-spawn overhead.
+
+### What changed
+
+`src/lib.rs`:
+
+- added direct native command envelope:
+  - `Command::SubmitNativeAny { op: NativeAnyCommand }`
+  - `NativeAnyCommand` variants for read/write/fsync, send/recv, batch, multishot.
+- `UringNativeAny` now dispatches native ops via:
+  - same-shard local fast path: enqueue `LocalCommand` directly.
+  - cross-shard envelope path: send `SubmitNativeAny` command to selected shard.
+- preserved existing affinity/route semantics:
+  - `NativeLaneSelector` selection.
+  - FD lease table (`weak`/`strong`/`hard`).
+  - `op_id -> shard` tracking and cleanup.
+
+### New observability
+
+`RuntimeStats` now includes:
+
+- `native_any_envelope_submitted`
+- `native_any_local_fastpath_submitted`
+
+### Red/Green TDD
+
+Added failing tests first, then implemented to green:
+
+- `uring_native_unbound_records_command_envelope_submission`
+- `uring_native_unbound_records_local_fast_path_submission`
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest short-run snapshot after optimization
+
+FS:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.754-1.867 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`1.013-1.062 ms`
+- `fs_read_rtt_4k/spargio_uring_unbound_file_qd1`: ~`1.003-1.028 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`8.732-9.015 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`5.967-6.988 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_unbound_file_qd32`: ~`6.085-6.866 ms`
+
+Net:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.918-8.187 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`6.840-8.632 ms`
+- `net_echo_rtt_256b/spargio_uring_unbound_tcp_qd1`: ~`5.539-5.812 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.544-10.656 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`11.073-11.449 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_unbound_tcp_window32`: ~`10.996-11.408 ms`
+
+Interpretation:
+
+- unbound `net_echo_rtt_256b` improved materially after removing per-op spawn overhead.
+- unbound fs remains competitive and generally close to bound.

@@ -687,4 +687,62 @@ mod linux_uring_native_tests {
         }
         panic!("expected active op routes to drain to zero");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_records_command_envelope_submission() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let path = unique_temp_path("uring-native-any-envelope");
+        let mut file = File::create(&path).expect("create");
+        file.write_all(b"abcdef").expect("seed");
+        drop(file);
+
+        let file = OpenOptions::new().read(true).open(&path).expect("open");
+        let fd = file.as_raw_fd();
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let got = any.read_at(fd, 0, 3).await.expect("read");
+        assert_eq!(&got, b"abc");
+
+        let stats = rt.handle().stats_snapshot();
+        assert!(
+            stats.native_any_envelope_submitted > 0,
+            "expected command-envelope submissions to be recorded"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_records_local_fast_path_submission() {
+        let Some(rt) = try_build_io_uring_runtime_shards(1) else {
+            return;
+        };
+        let path = unique_temp_path("uring-native-any-local-fastpath");
+        let mut file = File::create(&path).expect("create");
+        file.write_all(b"xyz123").expect("seed");
+        drop(file);
+
+        let file = OpenOptions::new().read(true).open(&path).expect("open");
+        let fd = file.as_raw_fd();
+        let handle_for_task = rt.handle();
+        let join = rt
+            .spawn_on(0, async move {
+                let any = handle_for_task
+                    .uring_native_unbound()
+                    .expect("native any")
+                    .with_preferred_shard(0)
+                    .expect("preferred shard");
+                any.read_at(fd, 0, 3).await.expect("read")
+            })
+            .expect("spawn");
+        let got = join.await.expect("join");
+        assert_eq!(&got, b"xyz");
+
+        let stats = rt.handle().stats_snapshot();
+        assert!(
+            stats.native_any_local_fastpath_submitted > 0,
+            "expected local fast-path submissions to be recorded"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
