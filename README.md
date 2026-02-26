@@ -14,10 +14,10 @@ Built with Codex.
 | `cold_start_ping_pong` | `462.8-510.6 us` | `2.44-2.46 ms` | `260-297 us` | `spargio io_uring ~1.75x faster than tokio` |
 | `fanout_fanin_balanced` | `1.42-1.50 ms` | `6.91-12.57 ms` | `1.33-1.35 ms` | `spargio io_uring ~1.1x faster than tokio` |
 | `fanout_fanin_skewed` | `2.42-2.53 ms` | `28.66-32.67 ms` | `2.03-2.04 ms` | `spargio io_uring ~1.2x faster than tokio` |
-| `fs_read_rtt_4k` (`qd=1`) | `1.64-1.71 ms` | n/a | `1.98-2.28 ms` | `spargio io_uring ~1.3x slower than tokio` |
-| `fs_read_throughput_4k_qd32` | `8.57-8.97 ms` | n/a | `6.73-7.42 ms` | `spargio io_uring ~1.3x faster than tokio` |
-| `net_echo_rtt_256b` (`qd=1`) | `7.92-8.35 ms` | n/a | `5.57-5.88 ms` | `spargio io_uring ~1.4x faster than tokio` |
-| `net_stream_throughput_4k_window32` | `10.93-11.85 ms` | n/a | `11.92-12.28 ms` | `spargio io_uring ~1.1x slower than tokio` |
+| `fs_read_rtt_4k` (`qd=1`) | `1.63-1.72 ms` | n/a | `1.89-2.06 ms` | `spargio io_uring ~1.2x slower than tokio` |
+| `fs_read_throughput_4k_qd32` | `7.49-7.62 ms` | n/a | `6.16-6.61 ms` | `spargio io_uring ~1.2x faster than tokio` |
+| `net_echo_rtt_256b` (`qd=1`) | `7.58-7.90 ms` | n/a | `5.25-5.35 ms` | `spargio io_uring ~1.5x faster than tokio` |
+| `net_stream_throughput_4k_window32` | `10.51-10.85 ms` | n/a | `10.84-10.95 ms` | `near parity; spargio io_uring slightly slower` |
 
 Bench suites in this repo:
 
@@ -52,7 +52,7 @@ This combination is strongest on coordination-heavy workloads (fan-out/fan-in, f
   - `TaskGroup` cooperative cancellation
 - Native lane (`uring-native`) APIs:
   - file-style ops: `read_at`, `write_at`, `fsync`
-  - stream/socket ops: `recv`, `send`, `recv_into`, `send_batch`, `recv_batch_into`, `recv_multishot`
+  - stream/socket ops: `recv`, `send`, `recv_into`, `send_batch`, `send_all_batch`, `recv_batch_into`, `recv_multishot`, `recv_multishot_segments`
   - bound-FD wrapper: `UringBoundFd` with `bind_file`, `bind_tcp_stream`, `bind_udp_socket`, `bind_owned_fd`
 - io_uring tuning preset:
   - `RuntimeBuilder::io_uring_throughput_mode(...)` (coop-taskrun + optional sqpoll) for throughput-oriented configurations.

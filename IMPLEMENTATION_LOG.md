@@ -1722,3 +1722,183 @@ Interpretation:
 
 - proposal batch is functionally implemented end-to-end (APIs + runtime + tests + benches).
 - stream throughput gap versus Tokio narrowed further while preserving RTT advantage.
+
+## Next optimization batch: close net throughput gap vs Tokio
+
+Goal:
+
+- improve `net_stream_throughput_4k_window32` by reducing per-frame control-path overhead in Spargio’s native TCP path.
+
+Planned items (to implement with red/green TDD):
+
+1. True native send batching:
+   - add a single-command native submit path for multiple sends (`send_batch_native`) instead of `join_all(send_owned(...))` fanout.
+   - aggregate completions in-driver and reply once per batch.
+2. Persistent multishot provided-buffer groups:
+   - keep a reusable provided-buffer pool per fd/lane for throughput loops.
+   - avoid `ProvideBuffers`/`RemoveBuffers` on every throughput batch.
+3. Zero-copy-ish multishot completion path cleanup:
+   - remove `chunks.clone()` completion duplication.
+   - finish by moving accumulated chunks once.
+4. Capability caching in benchmark/harness:
+   - probe multishot support once and stop retrying unsupported ops each batch.
+5. Stronger throughput semantics:
+   - add `send_all_batch` behavior (or equivalent) so batch send handles partial writes without leaking throughput accounting.
+
+## Implementation: net throughput optimization batch completed
+
+Implemented all five planned items.
+
+### 1) True native send batching
+
+Runtime changes (`src/lib.rs`):
+
+- new API:
+  - `UringNativeLane::send_all_batch(fd, bufs, window)`
+  - `UringBoundFd::send_all_batch(bufs, window)`
+- `send_batch(...)` now delegates to `send_all_batch(...)`.
+- new local command:
+  - `SubmitNativeSendBatchOwned`
+- new backend + driver path:
+  - `ShardBackend::submit_native_send_batch(...)`
+  - `IoUringDriver::submit_native_send_batch(...)`
+- batch state and CQE handling:
+  - `NativeSendBatch`
+  - `NativeSendBatchPart`
+  - `native_send_batches` + `native_send_parts`
+  - `complete_native_send_batch_part(...)`
+  - single batch reply channel per batch (not per send op).
+
+### 2) Persistent multishot provided-buffer groups
+
+Runtime changes (`src/lib.rs`):
+
+- `NativeIoOp::RecvMulti` now references a pool key rather than owning temporary storage.
+- new pool model:
+  - `NativeRecvPoolKey`
+  - `NativeRecvPool`
+  - `native_recv_pools: HashMap<...>`
+- multishot flow now:
+  - registers provided buffers once per pool (`registered`).
+  - reuses pool storage/group across calls.
+  - reprovides consumed bids via `reprovide_multishot_buffers(...)`.
+  - marks pool free via `mark_recv_pool_free(...)`.
+  - removes all registered groups on driver shutdown.
+
+### 3) Multishot completion path copy cleanup
+
+- removed `chunks.clone()` completion duplication in `complete_native_op(...)`.
+- completion now moves collected chunks with `std::mem::take(...)` when finishing multishot ops.
+
+### 4) Capability caching in benchmark path
+
+Benchmark changes (`benches/net_api.rs`):
+
+- `spargio_echo_windowed(...)` now caches multishot support in-loop:
+  - if `recv_multishot` returns `EINVAL` / `ENOSYS` / `EOPNOTSUPP`, disable further multishot attempts for the rest of the run.
+
+### 5) Stronger send semantics (`send_all_batch`)
+
+- `send_all_batch` tracks per-buffer progress and retries partial writes until each buffer is fully sent or an error occurs.
+- benchmark throughput sender now uses `send_all_batch(...)` (full-send semantics).
+
+### Red/Green TDD additions
+
+Added tests first in `tests/uring_native_tdd.rs`, then implemented runtime until green:
+
+- `uring_bound_tcp_stream_supports_send_all_batch`
+- `uring_bound_tcp_stream_reuses_recv_multishot_path_across_calls`
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest benchmark readout after this batch
+
+From `net_api`:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.62-8.07 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`5.26-5.70 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.42-10.73 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`11.02-11.16 ms`
+
+From `fs_api`:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.60-1.75 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`1.85-1.92 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`7.51-7.62 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`6.40-6.96 ms`
+
+Interpretation:
+
+- net throughput gap vs Tokio narrowed again (roughly from ~1.1x slower to ~1.05x slower in this short-run harness).
+- net RTT lead remains.
+- fs throughput lead remains.
+
+## Implementation: follow-up net throughput optimizations (session + segment path + reprovide coalescing)
+
+Applied the next optimization set aimed at reducing remaining `net_stream_throughput_4k_window32` overhead.
+
+### 1) Persistent session in benchmark worker
+
+`benches/net_api.rs`:
+
+- added `SpargioWindowedSession` that persists across `EchoWindowed` benchmark commands.
+- session retains:
+  - reusable tx buffer pool,
+  - reusable recv scratch buffer,
+  - cached multishot capability state.
+- worker now reuses this session for matching `(payload, window)` rather than rebuilding per invocation.
+
+### 2) Segment-based multishot API (avoid `Vec<Vec<u8>>` materialization in hot path)
+
+`src/lib.rs`:
+
+- new public types:
+  - `UringRecvSegment { offset, len }`
+  - `UringRecvMultishotSegments { buffer, segments }`
+- new APIs:
+  - `UringNativeLane::recv_multishot_segments(...)`
+  - `UringBoundFd::recv_multishot_segments(...)`
+- `recv_multishot(...)` remains for compatibility and now adapts from segment output.
+- `NativeIoOp::RecvMulti` now accumulates into one flat output buffer + segment metadata rather than `Vec<Vec<u8>>`.
+
+### 3) Reprovide coalescing (reduce housekeeping SQEs)
+
+`src/lib.rs`:
+
+- `reprovide_multishot_buffers(...)` now:
+  - sorts + deduplicates consumed bids,
+  - coalesces contiguous bids into runs,
+  - submits one `ProvideBuffers` SQE per contiguous run (instead of one per bid).
+
+### TDD updates
+
+- added test:
+  - `uring_bound_tcp_stream_supports_recv_multishot_segments`
+- preserved existing multishot compatibility tests; full `--features uring-native` test suite remains green.
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest net benchmark snapshot after this follow-up
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.58-7.90 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`5.25-5.35 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.51-10.85 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`10.84-10.95 ms`
+
+Interpretation:
+
+- stream-throughput gap narrowed further and is now close to parity in this short-run harness.
+- RTT lead for Spargio remains.

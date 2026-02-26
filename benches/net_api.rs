@@ -264,6 +264,102 @@ struct SpargioNetHarness {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct SpargioWindowedSession {
+    payload_len: usize,
+    window: usize,
+    recv: Vec<u8>,
+    tx_pool: Vec<Vec<u8>>,
+    multishot_supported: bool,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl SpargioWindowedSession {
+    fn new(payload_len: usize, window: usize) -> Self {
+        let window = window.max(1);
+        Self {
+            payload_len: payload_len.max(1),
+            window,
+            recv: vec![0u8; THROUGHPUT_RECV_SCRATCH],
+            tx_pool: (0..window).map(|_| vec![0u8; payload_len.max(1)]).collect(),
+            multishot_supported: true,
+        }
+    }
+
+    fn matches(&self, payload_len: usize, window: usize) -> bool {
+        self.payload_len == payload_len.max(1) && self.window == window.max(1)
+    }
+
+    async fn run_windowed(&mut self, bound: &spargio::UringBoundFd, frames: usize) -> u64 {
+        let mut checksum = 0u64;
+        let mut next = 0usize;
+        while next < frames {
+            let batch = (frames - next).min(self.window);
+            let mut send_batch = Vec::with_capacity(batch);
+            for idx in 0..batch {
+                let mut buf = self
+                    .tx_pool
+                    .pop()
+                    .unwrap_or_else(|| vec![0u8; self.payload_len]);
+                buf[0] = (next + idx) as u8;
+                send_batch.push(buf);
+            }
+            let (_sent, mut returned) = bound
+                .send_all_batch(send_batch, batch)
+                .await
+                .expect("send_all_batch");
+            self.tx_pool.append(&mut returned);
+
+            let mut remaining = batch * self.payload_len;
+            if self.multishot_supported {
+                let buffer_count = ((batch * 2).max(4)).min(u16::MAX as usize) as u16;
+                match bound
+                    .recv_multishot_segments(self.payload_len, buffer_count, remaining)
+                    .await
+                {
+                    Ok(multishot) => {
+                        for seg in multishot.segments {
+                            let end = seg
+                                .offset
+                                .saturating_add(seg.len)
+                                .min(multishot.buffer.len());
+                            if seg.offset < end {
+                                checksum =
+                                    checksum.wrapping_add(u64::from(multishot.buffer[seg.offset]));
+                                remaining = remaining.saturating_sub(end - seg.offset);
+                                if remaining == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let raw = err.raw_os_error().unwrap_or_default();
+                        if raw == libc::EINVAL || raw == libc::ENOSYS || raw == libc::EOPNOTSUPP {
+                            self.multishot_supported = false;
+                        } else {
+                            panic!("recv_multishot_segments failed unexpectedly: {err}");
+                        }
+                    }
+                }
+            }
+
+            while remaining > 0 {
+                let recv_buf = std::mem::take(&mut self.recv);
+                let (got, returned) = bound.recv_owned(recv_buf).await.expect("recv");
+                self.recv = returned;
+                if got == 0 {
+                    panic!("spargio stream closed during throughput receive");
+                }
+                checksum = checksum.wrapping_add(u64::from(self.recv[0]));
+                remaining = remaining.saturating_sub(got);
+            }
+            next += batch;
+        }
+        checksum
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 enum SpargioNetCmd {
     EchoRtt {
         rounds: usize,
@@ -304,11 +400,12 @@ impl SpargioNetHarness {
         };
 
         let lane = runtime.handle().uring_native_lane(1).ok()?;
-        let (client, echo_thread) = spawn_echo_peer(false, "bench-net-echo-spargio");
+        let (client, echo_thread) = spawn_echo_peer(true, "bench-net-echo-spargio");
         let bound = lane.bind_tcp_stream(client);
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioNetCmd>();
         let worker_join = runtime
             .spawn_on(1, async move {
+                let mut windowed_session: Option<SpargioWindowedSession> = None;
                 while let Some(cmd) = cmd_rx.next().await {
                     match cmd {
                         SpargioNetCmd::EchoRtt {
@@ -325,8 +422,18 @@ impl SpargioNetHarness {
                             window,
                             reply,
                         } => {
-                            let value =
-                                spargio_echo_windowed(&bound, frames, payload, window).await;
+                            if !windowed_session
+                                .as_ref()
+                                .is_some_and(|session| session.matches(payload, window))
+                            {
+                                windowed_session =
+                                    Some(SpargioWindowedSession::new(payload, window));
+                            }
+                            let value = windowed_session
+                                .as_mut()
+                                .expect("windowed session")
+                                .run_windowed(&bound, frames)
+                                .await;
                             let _ = reply.send(value);
                         }
                         SpargioNetCmd::Shutdown { reply } => {
@@ -405,77 +512,6 @@ async fn spargio_echo_rtt(bound: &spargio::UringBoundFd, rounds: usize, payload_
         payload = uring_send_all_owned(bound, payload).await.expect("send");
         recv = uring_recv_exact_owned(bound, recv).await.expect("recv");
         checksum = checksum.wrapping_add(u64::from(recv[0]));
-    }
-
-    checksum
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-async fn spargio_echo_windowed(
-    bound: &spargio::UringBoundFd,
-    frames: usize,
-    payload_len: usize,
-    window: usize,
-) -> u64 {
-    let mut recv = vec![0u8; THROUGHPUT_RECV_SCRATCH];
-    let mut tx_pool = (0..window.max(1))
-        .map(|_| vec![0u8; payload_len.max(1)])
-        .collect::<Vec<_>>();
-    let mut checksum = 0u64;
-    let mut next = 0usize;
-    let window = window.max(1);
-
-    while next < frames {
-        let batch = (frames - next).min(window);
-        let mut send_batch = Vec::with_capacity(batch);
-        for idx in 0..batch {
-            let mut buf = tx_pool
-                .pop()
-                .unwrap_or_else(|| vec![0u8; payload_len.max(1)]);
-            buf[0] = (next + idx) as u8;
-            send_batch.push(buf);
-        }
-        let (_sent, mut returned) = bound
-            .send_batch(send_batch, batch)
-            .await
-            .expect("send_batch");
-        tx_pool.append(&mut returned);
-
-        let mut remaining = batch * payload_len;
-        let buffer_count = ((batch * 2).max(4)).min(u16::MAX as usize) as u16;
-        let multishot = bound
-            .recv_multishot(payload_len.max(1), buffer_count, remaining)
-            .await;
-        match multishot {
-            Ok(chunks) => {
-                for chunk in chunks {
-                    if !chunk.is_empty() {
-                        checksum = checksum.wrapping_add(u64::from(chunk[0]));
-                    }
-                    remaining = remaining.saturating_sub(chunk.len());
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                let raw = err.raw_os_error().unwrap_or_default();
-                if raw != libc::EINVAL && raw != libc::ENOSYS && raw != libc::EOPNOTSUPP {
-                    panic!("recv_multishot failed unexpectedly: {err}");
-                }
-            }
-        }
-
-        while remaining > 0 {
-            let (got, returned) = bound.recv_owned(recv).await.expect("recv");
-            recv = returned;
-            if got == 0 {
-                panic!("spargio stream closed during throughput receive");
-            }
-            checksum = checksum.wrapping_add(u64::from(recv[0]));
-            remaining = remaining.saturating_sub(got);
-        }
-        next += batch;
     }
 
     checksum

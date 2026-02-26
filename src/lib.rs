@@ -11,6 +11,8 @@ use futures::future::join_all;
 use futures::future::{Either, select};
 use futures::task::LocalSpawnExt;
 use std::cell::RefCell;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -47,6 +49,8 @@ const DOORBELL_TAG: u16 = u16::MAX;
 const NATIVE_OP_USER_BIT: u64 = 1 << 63;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_HOUSEKEEPING_USER_BIT: u64 = 1 << 62;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const NATIVE_BATCH_PART_USER_BIT: u64 = 1 << 61;
 
 pub mod boundary {
     use core::future::Future;
@@ -958,6 +962,20 @@ pub struct UringNativeLane {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UringRecvSegment {
+    pub offset: usize,
+    pub len: usize,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub struct UringRecvMultishotSegments {
+    pub buffer: Vec<u8>,
+    pub segments: Vec<UringRecvSegment>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 impl UringNativeLane {
     pub fn shard(&self) -> ShardId {
         self.shard
@@ -1191,29 +1209,86 @@ impl UringNativeLane {
         bufs: Vec<Vec<u8>>,
         window: usize,
     ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        let mut pending = VecDeque::from(bufs);
-        let mut returned = Vec::new();
-        let mut total_sent = 0usize;
+        self.send_all_batch(fd, bufs, window).await
+    }
+
+    pub async fn send_all_batch(
+        &self,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        let mut pending_bufs = Some(bufs);
+        if pending_bufs.as_ref().is_some_and(|v| v.is_empty()) {
+            return Ok((0, pending_bufs.take().unwrap_or_default()));
+        }
         let window = window.max(1);
 
-        while !pending.is_empty() {
-            let mut sends = Vec::with_capacity(window);
-            for _ in 0..window {
-                if let Some(buf) = pending.pop_front() {
-                    sends.push(self.send_owned(fd, buf));
-                } else {
-                    break;
-                }
-            }
-
-            for out in join_all(sends).await {
-                let (sent, buf) = out?;
-                total_sent = total_sent.saturating_add(sent);
-                returned.push(buf);
-            }
+        if let Some(reply_rx) = {
+            let maybe_ctx = ShardCtx::current().filter(|ctx| {
+                ctx.runtime_id() == self.handle.inner.shared.runtime_id
+                    && ctx.shard_id() == self.shard
+            });
+            maybe_ctx.map(|ctx| {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeSendBatchOwned {
+                        origin_shard: ctx.shard_id(),
+                        fd,
+                        bufs: pending_bufs
+                            .take()
+                            .expect("native send batch buffers must exist"),
+                        window,
+                        reply: reply_tx,
+                    },
+                );
+                reply_rx
+            })
+        } {
+            return reply_rx.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native send batch response channel closed",
+                ))
+            });
         }
 
-        Ok((total_sent, returned))
+        let bufs = pending_bufs
+            .take()
+            .expect("native send batch buffers must exist");
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeSendBatchOwned {
+                            origin_shard: ctx.shard_id(),
+                            fd,
+                            bufs,
+                            window,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native send batch response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
     }
 
     pub async fn recv_batch_into(
@@ -1247,13 +1322,13 @@ impl UringNativeLane {
         Ok((total_received, returned))
     }
 
-    pub async fn recv_multishot(
+    pub async fn recv_multishot_segments(
         &self,
         fd: RawFd,
         buffer_len: usize,
         buffer_count: u16,
         bytes_target: usize,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
+    ) -> std::io::Result<UringRecvMultishotSegments> {
         if let Some(reply_rx) = {
             let maybe_ctx = ShardCtx::current().filter(|ctx| {
                 ctx.runtime_id() == self.handle.inner.shared.runtime_id
@@ -1316,6 +1391,28 @@ impl UringNativeLane {
             .map_err(runtime_error_to_io)?;
 
         join.await.map_err(join_error_to_io)?
+    }
+
+    pub async fn recv_multishot(
+        &self,
+        fd: RawFd,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let out = self
+            .recv_multishot_segments(fd, buffer_len, buffer_count, bytes_target)
+            .await?;
+        let mut chunks = Vec::with_capacity(out.segments.len());
+        for seg in out.segments {
+            let end = seg.offset.saturating_add(seg.len).min(out.buffer.len());
+            if seg.offset >= end {
+                chunks.push(Vec::new());
+                continue;
+            }
+            chunks.push(out.buffer[seg.offset..end].to_vec());
+        }
+        Ok(chunks)
     }
 
     pub async fn fsync(&self, fd: RawFd) -> std::io::Result<()> {
@@ -1425,6 +1522,14 @@ impl UringBoundFd {
         self.lane.send_batch(self.raw_fd(), bufs, window).await
     }
 
+    pub async fn send_all_batch(
+        &self,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        self.lane.send_all_batch(self.raw_fd(), bufs, window).await
+    }
+
     pub async fn recv_batch_into(
         &self,
         bufs: Vec<Vec<u8>>,
@@ -1441,6 +1546,17 @@ impl UringBoundFd {
     ) -> std::io::Result<Vec<Vec<u8>>> {
         self.lane
             .recv_multishot(self.raw_fd(), buffer_len, buffer_count, bytes_target)
+            .await
+    }
+
+    pub async fn recv_multishot_segments(
+        &self,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+    ) -> std::io::Result<UringRecvMultishotSegments> {
+        self.lane
+            .recv_multishot_segments(self.raw_fd(), buffer_len, buffer_count, bytes_target)
             .await
     }
 
@@ -2149,13 +2265,21 @@ enum LocalCommand {
         reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeSendBatchOwned {
+        origin_shard: ShardId,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<Vec<u8>>)>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeRecvMultishot {
         origin_shard: ShardId,
         fd: RawFd,
         buffer_len: usize,
         buffer_count: u16,
         bytes_target: usize,
-        reply: oneshot::Sender<std::io::Result<Vec<Vec<u8>>>>,
+        reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeFsync {
@@ -2460,6 +2584,41 @@ impl ShardBackend {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_send_batch(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<Vec<u8>>)>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring send batch violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring send batch requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_send_batch(fd, bufs, window, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_native_recv_multishot(
         &mut self,
         current_shard: ShardId,
@@ -2468,7 +2627,7 @@ impl ShardBackend {
         buffer_len: usize,
         buffer_count: u16,
         bytes_target: usize,
-        reply: oneshot::Sender<std::io::Result<Vec<Vec<u8>>>>,
+        reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
         stats: &RuntimeStatsInner,
     ) {
         if current_shard != origin_shard {
@@ -2571,19 +2730,56 @@ enum NativeIoOp {
         reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
     },
     RecvMulti {
-        buf_group: u16,
-        buffer_count: u16,
+        pool_key: NativeRecvPoolKey,
         buffer_len: usize,
         bytes_target: usize,
         bytes_collected: usize,
         cancel_issued: bool,
-        storage: Vec<u8>,
-        chunks: Vec<Vec<u8>>,
-        reply: oneshot::Sender<std::io::Result<Vec<Vec<u8>>>>,
+        consumed_bids: Vec<u16>,
+        out: Vec<u8>,
+        segments: Vec<UringRecvSegment>,
+        reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
     },
     Fsync {
         reply: oneshot::Sender<std::io::Result<()>>,
     },
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NativeRecvPoolKey {
+    fd: RawFd,
+    buffer_len: usize,
+    buffer_count: u16,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeRecvPool {
+    buf_group: u16,
+    storage: Box<[u8]>,
+    registered: bool,
+    in_use: bool,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeSendBatch {
+    fd: RawFd,
+    bufs: Vec<Vec<u8>>,
+    positions: Vec<usize>,
+    pending: VecDeque<usize>,
+    in_flight: usize,
+    window: usize,
+    total_sent: usize,
+    failure: Option<std::io::Error>,
+    reply: Option<oneshot::Sender<std::io::Result<(usize, Vec<Vec<u8>>)>>>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct NativeSendBatchPart {
+    batch_index: usize,
+    buf_index: usize,
+    offset: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -2595,6 +2791,12 @@ struct IoUringDriver {
     send_waiters: Slab<oneshot::Sender<Result<(), SendError>>>,
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     native_ops: Slab<NativeIoOp>,
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    native_send_batches: Slab<NativeSendBatch>,
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    native_send_parts: Slab<NativeSendBatchPart>,
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    native_recv_pools: HashMap<NativeRecvPoolKey, NativeRecvPool>,
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     next_buf_group: u16,
     pending_submit: usize,
@@ -2621,6 +2823,12 @@ impl IoUringDriver {
             send_waiters: Slab::new(),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             native_ops: Slab::new(),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            native_send_batches: Slab::new(),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            native_send_parts: Slab::new(),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            native_recv_pools: HashMap::new(),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             next_buf_group: 1,
             pending_submit: 0,
@@ -2908,13 +3116,58 @@ impl IoUringDriver {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_send_batch(
+        &mut self,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<Vec<u8>>)>>,
+    ) -> Result<(), SendError> {
+        if bufs.is_empty() {
+            let _ = reply.send(Ok((0, bufs)));
+            return Ok(());
+        }
+
+        let mut pending = VecDeque::with_capacity(bufs.len());
+        pending.extend(0..bufs.len());
+        let positions = vec![0usize; bufs.len()];
+        let batch_index = self.native_send_batches.insert(NativeSendBatch {
+            fd,
+            bufs,
+            positions,
+            pending,
+            in_flight: 0,
+            window: window.max(1),
+            total_sent: 0,
+            failure: None,
+            reply: Some(reply),
+        });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+
+        if self.submit_more_send_batch_parts(batch_index).is_err() {
+            self.mark_send_batch_failed(
+                batch_index,
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native io_uring send batch submit failed",
+                ),
+            );
+            self.maybe_finish_send_batch(batch_index);
+            return Err(SendError::Closed);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_native_recv_multishot(
         &mut self,
         fd: RawFd,
         buffer_len: usize,
         buffer_count: u16,
         bytes_target: usize,
-        reply: oneshot::Sender<std::io::Result<Vec<Vec<u8>>>>,
+        reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
     ) -> Result<(), SendError> {
         if buffer_len == 0 || buffer_count == 0 || bytes_target == 0 {
             let _ = reply.send(Err(std::io::Error::new(
@@ -2939,45 +3192,85 @@ impl IoUringDriver {
             return Ok(());
         }
 
-        let buf_group = self.next_buffer_group();
-        let native_index = self.native_ops.insert(NativeIoOp::RecvMulti {
-            buf_group,
+        let pool_key = NativeRecvPoolKey {
+            fd,
+            buffer_len,
             buffer_count,
+        };
+        if !self.native_recv_pools.contains_key(&pool_key) {
+            let bgid = self.next_buffer_group();
+            self.native_recv_pools.insert(
+                pool_key,
+                NativeRecvPool {
+                    buf_group: bgid,
+                    storage: vec![0; total_len].into_boxed_slice(),
+                    registered: false,
+                    in_use: false,
+                },
+            );
+        }
+
+        let (buf_group, storage_ptr, needs_register) = {
+            let pool = self
+                .native_recv_pools
+                .get_mut(&pool_key)
+                .expect("native recv pool must exist");
+            if pool.in_use {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "multishot recv pool already in use for fd",
+                )));
+                return Ok(());
+            }
+            pool.in_use = true;
+            (pool.buf_group, pool.storage.as_mut_ptr(), !pool.registered)
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::RecvMulti {
+            pool_key,
             buffer_len,
             bytes_target,
             bytes_collected: 0,
             cancel_issued: false,
-            storage: vec![0; total_len],
-            chunks: Vec::new(),
+            consumed_bids: Vec::new(),
+            out: Vec::with_capacity(bytes_target),
+            segments: Vec::new(),
             reply,
         });
         self.stats
             .pending_native_ops
             .fetch_add(1, Ordering::Relaxed);
 
-        let storage_ptr = match self.native_ops.get_mut(native_index) {
-            Some(NativeIoOp::RecvMulti { storage, .. }) => storage.as_mut_ptr(),
-            _ => unreachable!("native recv multishot op kind mismatch"),
-        };
-
-        let provide_entry =
-            opcode::ProvideBuffers::new(storage_ptr, buffer_len_i32, buffer_count, buf_group, 0)
-                .build()
-                .user_data(native_housekeeping_to_userdata(native_index));
-        if self.push_entry(provide_entry).is_err() {
-            self.fail_native_op(native_index);
-            return Err(SendError::Closed);
-        }
-        if self.mark_submission_pending().is_err() {
-            self.fail_native_op(native_index);
-            return Err(SendError::Closed);
+        if needs_register {
+            let provide_entry = opcode::ProvideBuffers::new(
+                storage_ptr,
+                buffer_len_i32,
+                buffer_count,
+                buf_group,
+                0,
+            )
+            .build()
+            .user_data(native_housekeeping_to_userdata(native_index));
+            if self.push_entry(provide_entry).is_err() {
+                self.mark_recv_pool_free(pool_key);
+                self.fail_native_op(native_index);
+                return Err(SendError::Closed);
+            }
+            if self.mark_submission_pending().is_err() {
+                self.mark_recv_pool_free(pool_key);
+                self.fail_native_op(native_index);
+                return Err(SendError::Closed);
+            }
+            if let Some(pool) = self.native_recv_pools.get_mut(&pool_key) {
+                pool.registered = true;
+            }
         }
 
         let recv_entry = opcode::RecvMulti::new(types::Fd(fd), buf_group)
             .build()
             .user_data(native_to_userdata(native_index));
         if self.push_entry(recv_entry).is_err() {
-            let _ = self.submit_remove_buffers(buffer_count, buf_group);
+            self.mark_recv_pool_free(pool_key);
             self.fail_native_op(native_index);
             return Err(SendError::Closed);
         }
@@ -3010,6 +3303,80 @@ impl IoUringDriver {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn reprovide_multishot_buffers(&mut self, key: NativeRecvPoolKey, bids: &[u16]) {
+        if bids.is_empty() {
+            return;
+        }
+        let (buffer_len_i32, storage_ptr, buf_group) = {
+            let Some(pool) = self.native_recv_pools.get(&key) else {
+                return;
+            };
+            let Ok(buffer_len_i32) = i32::try_from(key.buffer_len) else {
+                if let Some(pool) = self.native_recv_pools.get_mut(&key) {
+                    pool.registered = false;
+                }
+                return;
+            };
+            (
+                buffer_len_i32,
+                pool.storage.as_ptr() as *mut u8,
+                pool.buf_group,
+            )
+        };
+        let mut valid_bids = bids
+            .iter()
+            .copied()
+            .filter(|bid| usize::from(*bid) < usize::from(key.buffer_count))
+            .collect::<Vec<_>>();
+        if valid_bids.is_empty() {
+            return;
+        }
+        valid_bids.sort_unstable();
+        valid_bids.dedup();
+
+        let mut runs = Vec::new();
+        let mut run_start = valid_bids[0];
+        let mut run_len: u16 = 1;
+        for &bid in valid_bids.iter().skip(1) {
+            let expected = run_start.saturating_add(run_len);
+            if bid == expected && run_len < u16::MAX {
+                run_len = run_len.saturating_add(1);
+            } else {
+                runs.push((run_start, run_len));
+                run_start = bid;
+                run_len = 1;
+            }
+        }
+        runs.push((run_start, run_len));
+
+        let mut had_error = false;
+        for (start_bid, nbufs) in runs {
+            let offset = usize::from(start_bid).saturating_mul(key.buffer_len);
+            let ptr = storage_ptr.wrapping_add(offset);
+            let entry =
+                opcode::ProvideBuffers::new(ptr, buffer_len_i32, nbufs, buf_group, start_bid)
+                    .build()
+                    .user_data(native_housekeeping_to_userdata(0));
+            if self.push_entry(entry).is_err() || self.mark_submission_pending().is_err() {
+                had_error = true;
+                break;
+            }
+        }
+        if had_error {
+            if let Some(pool) = self.native_recv_pools.get_mut(&key) {
+                pool.registered = false;
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn mark_recv_pool_free(&mut self, key: NativeRecvPoolKey) {
+        if let Some(pool) = self.native_recv_pools.get_mut(&key) {
+            pool.in_use = false;
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_async_cancel(&mut self, user_data: u64, index: usize) -> Result<(), SendError> {
         let entry = opcode::AsyncCancel::new(user_data)
             .build()
@@ -3038,6 +3405,161 @@ impl IoUringDriver {
             return Err(SendError::Closed);
         }
         self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_more_send_batch_parts(&mut self, batch_index: usize) -> Result<(), SendError> {
+        loop {
+            let submit = {
+                let Some(batch) = self.native_send_batches.get_mut(batch_index) else {
+                    return Ok(());
+                };
+                if batch.failure.is_some() || batch.in_flight >= batch.window {
+                    return Ok(());
+                }
+                let Some(buf_index) = batch.pending.pop_front() else {
+                    return Ok(());
+                };
+                let offset = batch.positions[buf_index];
+                let len = batch.bufs[buf_index].len().saturating_sub(offset);
+                if len == 0 {
+                    continue;
+                }
+                (batch.fd, buf_index, offset, len)
+            };
+
+            let (fd, buf_index, offset, len) = submit;
+            let len_u32 = match u32::try_from(len) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.mark_send_batch_failed(
+                        batch_index,
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "native send batch chunk exceeds u32::MAX",
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            let part_index = self.native_send_parts.insert(NativeSendBatchPart {
+                batch_index,
+                buf_index,
+                offset,
+            });
+            let buf_ptr = match self.native_send_batches.get(batch_index) {
+                Some(batch) => batch.bufs[buf_index].as_ptr().wrapping_add(offset),
+                None => {
+                    self.native_send_parts.remove(part_index);
+                    return Ok(());
+                }
+            };
+            let entry = opcode::Send::new(types::Fd(fd), buf_ptr, len_u32)
+                .build()
+                .user_data(native_batch_part_to_userdata(part_index));
+            if self.push_entry(entry).is_err() {
+                self.native_send_parts.remove(part_index);
+                return Err(SendError::Closed);
+            }
+            if let Some(batch) = self.native_send_batches.get_mut(batch_index) {
+                batch.in_flight = batch.in_flight.saturating_add(1);
+            }
+            self.mark_submission_pending()?;
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn mark_send_batch_failed(&mut self, batch_index: usize, err: std::io::Error) {
+        if let Some(batch) = self.native_send_batches.get_mut(batch_index) {
+            if batch.failure.is_none() {
+                batch.failure = Some(err);
+            }
+            batch.pending.clear();
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn maybe_finish_send_batch(&mut self, batch_index: usize) {
+        let should_finish = match self.native_send_batches.get(batch_index) {
+            Some(batch) => {
+                if batch.failure.is_some() {
+                    batch.in_flight == 0
+                } else {
+                    batch.in_flight == 0 && batch.pending.is_empty()
+                }
+            }
+            None => false,
+        };
+        if !should_finish {
+            return;
+        }
+
+        self.stats
+            .pending_native_ops
+            .fetch_sub(1, Ordering::Relaxed);
+        let batch = self.native_send_batches.remove(batch_index);
+        if let Some(reply) = batch.reply {
+            let outcome = if let Some(err) = batch.failure {
+                Err(err)
+            } else {
+                Ok((batch.total_sent, batch.bufs))
+            };
+            let _ = reply.send(outcome);
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn complete_native_send_batch_part(&mut self, part_index: usize, result: i32) {
+        let Some(part) = self.native_send_parts.try_remove(part_index) else {
+            return;
+        };
+        let Some(batch) = self.native_send_batches.get_mut(part.batch_index) else {
+            return;
+        };
+        if batch.in_flight > 0 {
+            batch.in_flight -= 1;
+        }
+        if batch.failure.is_some() {
+            self.maybe_finish_send_batch(part.batch_index);
+            return;
+        }
+
+        let total_len = batch.bufs[part.buf_index].len();
+        let remaining = total_len.saturating_sub(part.offset);
+        if result < 0 {
+            batch.failure = Some(std::io::Error::from_raw_os_error(-result));
+            batch.pending.clear();
+            self.maybe_finish_send_batch(part.batch_index);
+            return;
+        }
+
+        let wrote = (result as usize).min(remaining);
+        if wrote == 0 && remaining > 0 {
+            batch.failure = Some(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "native io_uring send batch wrote zero bytes",
+            ));
+            batch.pending.clear();
+            self.maybe_finish_send_batch(part.batch_index);
+            return;
+        }
+
+        batch.positions[part.buf_index] = part.offset.saturating_add(wrote);
+        batch.total_sent = batch.total_sent.saturating_add(wrote);
+        if batch.positions[part.buf_index] < total_len {
+            // Keep making forward progress on a partially sent frame.
+            batch.pending.push_front(part.buf_index);
+        }
+        if self.submit_more_send_batch_parts(part.batch_index).is_err() {
+            self.mark_send_batch_failed(
+                part.batch_index,
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native io_uring send batch submit failed",
+                ),
+            );
+        }
+        self.maybe_finish_send_batch(part.batch_index);
     }
 
     fn mark_submission_pending(&mut self) -> Result<(), SendError> {
@@ -3096,11 +3618,12 @@ impl IoUringDriver {
                 }
                 NativeIoOp::RecvMulti {
                     reply,
-                    buffer_count,
-                    buf_group,
+                    pool_key,
+                    consumed_bids,
                     ..
                 } => {
-                    let _ = self.submit_remove_buffers(buffer_count, buf_group);
+                    self.reprovide_multishot_buffers(pool_key, &consumed_bids);
+                    self.mark_recv_pool_free(pool_key);
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring recv multishot failed",
@@ -3157,11 +3680,12 @@ impl IoUringDriver {
                 }
                 NativeIoOp::RecvMulti {
                     reply,
-                    buffer_count,
-                    buf_group,
+                    pool_key,
+                    consumed_bids,
                     ..
                 } => {
-                    let _ = self.submit_remove_buffers(buffer_count, buf_group);
+                    self.reprovide_multishot_buffers(pool_key, &consumed_bids);
+                    self.mark_recv_pool_free(pool_key);
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring recv multishot canceled",
@@ -3175,6 +3699,19 @@ impl IoUringDriver {
                 }
             }
         }
+        let batches = std::mem::take(&mut self.native_send_batches);
+        self.stats
+            .pending_native_ops
+            .fetch_sub(batches.len() as u64, Ordering::Relaxed);
+        for (_, mut batch) in batches {
+            if let Some(reply) = batch.reply.take() {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native io_uring send batch canceled",
+                )));
+            }
+        }
+        self.native_send_parts.clear();
     }
 
     fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), SendError> {
@@ -3284,6 +3821,12 @@ impl IoUringDriver {
             }
 
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            if let Some(part_index) = native_batch_part_from_userdata(user_data) {
+                self.complete_native_send_batch_part(part_index, result);
+                continue;
+            }
+
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
             if let Some(native_index) = native_from_userdata(user_data) {
                 self.complete_native_op(native_index, result, _flags);
                 continue;
@@ -3336,62 +3879,93 @@ impl IoUringDriver {
         enum MultiOutcome {
             Continue,
             IssueCancel,
-            Finish(Result<Vec<Vec<u8>>, std::io::Error>, u16, u16),
+            Finish(
+                Result<UringRecvMultishotSegments, std::io::Error>,
+                NativeRecvPoolKey,
+                Vec<u16>,
+            ),
         }
 
         let mut multi_outcome = None::<MultiOutcome>;
         if let Some(NativeIoOp::RecvMulti {
-            buf_group,
-            buffer_count,
+            pool_key,
             buffer_len,
             bytes_target,
             bytes_collected,
             cancel_issued,
-            storage,
-            chunks,
+            consumed_bids,
+            out,
+            segments,
             ..
         }) = self.native_ops.get_mut(index)
         {
             if result < 0 {
                 let err = std::io::Error::from_raw_os_error(-result);
                 if *cancel_issued && err.raw_os_error() == Some(libc::ECANCELED) {
+                    let out_buf = std::mem::take(out);
+                    let out_segments = std::mem::take(segments);
+                    let bids = std::mem::take(consumed_bids);
                     multi_outcome = Some(MultiOutcome::Finish(
-                        Ok(chunks.clone()),
-                        *buffer_count,
-                        *buf_group,
+                        Ok(UringRecvMultishotSegments {
+                            buffer: out_buf,
+                            segments: out_segments,
+                        }),
+                        *pool_key,
+                        bids,
                     ));
                 } else {
-                    multi_outcome = Some(MultiOutcome::Finish(Err(err), *buffer_count, *buf_group));
+                    let bids = std::mem::take(consumed_bids);
+                    multi_outcome = Some(MultiOutcome::Finish(Err(err), *pool_key, bids));
                 }
             } else {
                 let read_len = result as usize;
                 if read_len > 0 {
                     match io_uring::cqueue::buffer_select(flags) {
-                        Some(bid) if usize::from(bid) < usize::from(*buffer_count) => {
+                        Some(bid) if usize::from(bid) < usize::from(pool_key.buffer_count) => {
                             let start = usize::from(bid) * *buffer_len;
                             let capped = read_len.min(*buffer_len);
                             let end = start + capped;
-                            chunks.push(storage[start..end].to_vec());
-                            *bytes_collected = bytes_collected.saturating_add(capped);
+                            if let Some(pool) = self.native_recv_pools.get(pool_key) {
+                                let offset = out.len();
+                                out.extend_from_slice(&pool.storage[start..end]);
+                                segments.push(UringRecvSegment {
+                                    offset,
+                                    len: end.saturating_sub(start),
+                                });
+                                consumed_bids.push(bid);
+                                *bytes_collected = bytes_collected.saturating_add(capped);
+                            } else {
+                                let bids = std::mem::take(consumed_bids);
+                                multi_outcome = Some(MultiOutcome::Finish(
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "multishot recv buffer pool missing",
+                                    )),
+                                    *pool_key,
+                                    bids,
+                                ));
+                            }
                         }
                         Some(_) => {
+                            let bids = std::mem::take(consumed_bids);
                             multi_outcome = Some(MultiOutcome::Finish(
                                 Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     "multishot recv completion buffer id out of range",
                                 )),
-                                *buffer_count,
-                                *buf_group,
+                                *pool_key,
+                                bids,
                             ));
                         }
                         None => {
+                            let bids = std::mem::take(consumed_bids);
                             multi_outcome = Some(MultiOutcome::Finish(
                                 Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     "multishot recv completion missing buffer id",
                                 )),
-                                *buffer_count,
-                                *buf_group,
+                                *pool_key,
+                                bids,
                             ));
                         }
                     }
@@ -3403,10 +3977,16 @@ impl IoUringDriver {
                         *cancel_issued = true;
                         multi_outcome = Some(MultiOutcome::IssueCancel);
                     } else if result == 0 || !has_more {
+                        let out_buf = std::mem::take(out);
+                        let out_segments = std::mem::take(segments);
+                        let bids = std::mem::take(consumed_bids);
                         multi_outcome = Some(MultiOutcome::Finish(
-                            Ok(chunks.clone()),
-                            *buffer_count,
-                            *buf_group,
+                            Ok(UringRecvMultishotSegments {
+                                buffer: out_buf,
+                                segments: out_segments,
+                            }),
+                            *pool_key,
+                            bids,
                         ));
                     } else {
                         multi_outcome = Some(MultiOutcome::Continue);
@@ -3425,21 +4005,10 @@ impl IoUringDriver {
                     {
                         return;
                     }
-                    let cleanup = match self.native_ops.get(index) {
-                        Some(NativeIoOp::RecvMulti {
-                            buffer_count,
-                            buf_group,
-                            ..
-                        }) => Some((*buffer_count, *buf_group)),
-                        _ => None,
-                    };
-                    if let Some((count, group)) = cleanup {
-                        let _ = self.submit_remove_buffers(count, group);
-                    }
                     self.fail_native_op(index);
                     return;
                 }
-                MultiOutcome::Finish(outcome, count, group) => {
+                MultiOutcome::Finish(outcome, pool_key, consumed_bids) => {
                     self.stats
                         .pending_native_ops
                         .fetch_sub(1, Ordering::Relaxed);
@@ -3447,7 +4016,8 @@ impl IoUringDriver {
                     if let NativeIoOp::RecvMulti { reply, .. } = op {
                         let _ = reply.send(outcome);
                     }
-                    let _ = self.submit_remove_buffers(count, group);
+                    self.reprovide_multishot_buffers(pool_key, &consumed_bids);
+                    self.mark_recv_pool_free(pool_key);
                     return;
                 }
             }
@@ -3503,6 +4073,22 @@ impl IoUringDriver {
         self.fail_all_waiters();
         #[cfg(all(feature = "uring-native", target_os = "linux"))]
         self.fail_all_native_ops();
+        #[cfg(all(feature = "uring-native", target_os = "linux"))]
+        {
+            let remove = self
+                .native_recv_pools
+                .iter()
+                .filter_map(|(key, pool)| {
+                    pool.registered
+                        .then_some((key.buffer_count, pool.buf_group))
+                })
+                .collect::<Vec<_>>();
+            for (count, group) in remove {
+                let _ = self.submit_remove_buffers(count, group);
+            }
+            self.native_recv_pools.clear();
+            let _ = self.flush_submissions();
+        }
     }
 }
 
@@ -3548,7 +4134,10 @@ fn native_to_userdata(index: usize) -> u64 {
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 fn native_from_userdata(user_data: u64) -> Option<usize> {
-    if (user_data & NATIVE_OP_USER_BIT) == 0 || (user_data & NATIVE_HOUSEKEEPING_USER_BIT) != 0 {
+    if (user_data & NATIVE_OP_USER_BIT) == 0
+        || (user_data & NATIVE_HOUSEKEEPING_USER_BIT) != 0
+        || (user_data & NATIVE_BATCH_PART_USER_BIT) != 0
+    {
         return None;
     }
     usize::try_from((user_data & !NATIVE_OP_USER_BIT).checked_sub(1)?).ok()
@@ -3566,6 +4155,25 @@ fn native_housekeeping_from_userdata(user_data: u64) -> Option<usize> {
     }
     usize::try_from(
         (user_data & !(NATIVE_OP_USER_BIT | NATIVE_HOUSEKEEPING_USER_BIT)).checked_sub(1)?,
+    )
+    .ok()
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn native_batch_part_to_userdata(index: usize) -> u64 {
+    NATIVE_OP_USER_BIT | NATIVE_BATCH_PART_USER_BIT | (index as u64 + 1)
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn native_batch_part_from_userdata(user_data: u64) -> Option<usize> {
+    if (user_data & NATIVE_OP_USER_BIT) == 0
+        || (user_data & NATIVE_BATCH_PART_USER_BIT) == 0
+        || (user_data & NATIVE_HOUSEKEEPING_USER_BIT) != 0
+    {
+        return None;
+    }
+    usize::try_from(
+        (user_data & !(NATIVE_OP_USER_BIT | NATIVE_BATCH_PART_USER_BIT)).checked_sub(1)?,
     )
     .ok()
 }
@@ -3897,6 +4505,22 @@ fn drain_local_commands(
                 buf,
                 reply,
             } => backend.submit_native_send(shard_id, origin_shard, fd, buf, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeSendBatchOwned {
+                origin_shard,
+                fd,
+                bufs,
+                window,
+                reply,
+            } => backend.submit_native_send_batch(
+                shard_id,
+                origin_shard,
+                fd,
+                bufs,
+                window,
+                reply,
+                stats,
+            ),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeRecvMultishot {
                 origin_shard,
