@@ -8,19 +8,23 @@ Built with Codex.
 
 | Benchmark | Tokio | spargio queue | spargio io_uring | Readout |
 | --- | --- | --- | --- | --- |
-| `steady_ping_pong_rtt` | `1.30-1.42 ms` | `1.50-1.53 ms` | `352-370 us` | `spargio io_uring ~3.8x faster than tokio` |
-| `steady_one_way_send_drain` (unbatched) | `84.0-90.6 us` | `1.33-1.38 ms` | `66.6-68.3 us` | `spargio io_uring ~1.3x faster than tokio` |
-| `steady_one_way_send_drain` (Tokio batched) | `14.4-26.1 us` | n/a | n/a | Tokio batched wins |
-| `cold_start_ping_pong` | `500-555 us` | `2.42-2.45 ms` | `248-305 us` | `spargio io_uring ~1.9x faster than tokio` |
-| `fanout_fanin_balanced` | `1.43-1.51 ms` | `30.3-45.4 ms` | `982-989 us` | `spargio io_uring ~1.5x faster than tokio` |
-| `fanout_fanin_skewed` | `2.35-2.42 ms` | `54.0-54.9 ms` | `1.92-1.93 ms` | `spargio io_uring ~1.24x faster than tokio` |
-| `disk_read_rtt_4k` | `1.82-2.00 ms` | n/a | `2.52-2.74 ms` | `spargio io_uring ~1.38x slower than tokio` |
+| `steady_ping_pong_rtt` | `1.37-1.48 ms` | `1.36-1.39 ms` | `363-380 us` | `spargio io_uring ~3.8x faster than tokio` |
+| `steady_one_way_send_drain` (unbatched) | `104.6-115.8 us` | `1.31-1.36 ms` | `73.0-75.3 us` | `spargio io_uring ~1.5x faster than tokio` |
+| `steady_one_way_send_drain` (Tokio batched) | `13.9-25.6 us` | n/a | n/a | Tokio batched wins |
+| `cold_start_ping_pong` | `462.8-510.6 us` | `2.44-2.46 ms` | `260-297 us` | `spargio io_uring ~1.75x faster than tokio` |
+| `fanout_fanin_balanced` | `1.42-1.50 ms` | `6.91-12.57 ms` | `1.33-1.35 ms` | `spargio io_uring ~1.1x faster than tokio` |
+| `fanout_fanin_skewed` | `2.42-2.53 ms` | `28.66-32.67 ms` | `2.03-2.04 ms` | `spargio io_uring ~1.2x faster than tokio` |
+| `fs_read_rtt_4k` (`qd=1`) | `1.59-1.68 ms` | n/a | `1.98-2.11 ms` | `spargio io_uring ~1.25x slower than tokio` |
+| `fs_read_throughput_4k_qd32` | `7.66-7.76 ms` | n/a | `7.51-8.23 ms` | near parity |
+| `net_echo_rtt_256b` (`qd=1`) | `7.62-8.10 ms` | n/a | `5.46-5.70 ms` | `spargio io_uring ~1.4x faster than tokio` |
+| `net_stream_throughput_4k_window32` | `10.47-11.01 ms` | n/a | `12.96-13.16 ms` | `spargio io_uring ~1.2x slower than tokio` |
 
 Bench suites in this repo:
 
 - `benches/ping_pong.rs`
 - `benches/fanout_fanin.rs`
-- `benches/disk_io.rs`
+- `benches/fs_api.rs`
+- `benches/net_api.rs`
 
 ## Why It's Faster Than Tokio (In These Benchmarks)
 
@@ -31,23 +35,48 @@ Bench suites in this repo:
 
 This combination is strongest on coordination-heavy workloads (fan-out/fan-in, frequent cross-shard wakeups, many short tasks).
 
-## Current Runtime Surface
+## Done
 
 - Sharded runtime with `Queue` and Linux `IoUring` backends.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
-- Per-shard stealable inboxes with `msg_ring` wake path.
-- Native lane MVP (`uring-native`): `read_at`, `write_at`.
+- Scheduler v2 MVP:
+  - per-shard stealable deques
+  - bounded steal budget (`steal_budget`)
+  - stealable queue backpressure (`stealable_queue_capacity`, `RuntimeError::Overloaded`)
+  - steal/backpressure stats (`steal_attempts`, `steal_success`, `stealable_backpressure`)
+- Runtime primitives:
+  - `sleep(Duration)`
+  - `timeout(Duration, fut) -> Result<_, TimeoutError>`
+  - `CancellationToken`
+  - `TaskGroup` cooperative cancellation
+- Native lane (`uring-native`) APIs:
+  - file-style ops: `read_at`, `write_at`, `fsync`
+  - stream/socket ops: `recv`, `send`
+  - bound-FD wrapper: `UringBoundFd` with `bind_file`, `bind_tcp_stream`, `bind_udp_socket`, `bind_owned_fd`
 - Bounded mixed-runtime boundary API: `spargio::boundary`.
 - Runtime stats snapshots via `RuntimeHandle::stats_snapshot()`.
+- KPI/perf automation:
+  - fanout guardrail
+  - ping guardrail
+  - combined KPI guardrail script
 - Reference mixed-mode service example.
 
-## Next Steps
+## Not Done Yet
 
-- Move from inbox-based stealing to fuller deque-style stealing policy with fairness/victim heuristics.
-- Strengthen regression gates around fan-out/fan-in and add p95/p99 tracking.
-- Expand native I/O coverage (disk and network paths).
-- Keep tuning placement and wake strategies for coordination-heavy workloads.
+- Full production-grade work-stealing policy:
+  - richer fairness and starvation controls
+  - stronger adaptive victim-selection heuristics
+- Tail-latency-focused perf program:
+  - longer benchmark windows
+  - p95/p99 regression gates
+- Broader native I/O surface:
+  - fuller filesystem API
+  - fuller network API (beyond current send/recv MVP)
+- Production hardening:
+  - deeper stress/soak and failure-injection coverage
+  - more operational observability and tracing
+- Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a full ecosystem lane.
 
 ## Quick Start
 
@@ -61,7 +90,9 @@ Benchmark helpers:
 
 ```bash
 ./scripts/bench_fanout_smoke.sh
+./scripts/bench_ping_guardrail.sh
 ./scripts/bench_fanout_guardrail.sh
+./scripts/bench_kpi_guardrail.sh
 ```
 
 Reference app:

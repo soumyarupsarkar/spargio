@@ -1343,3 +1343,269 @@ Interpretation:
 - compared with earlier same-day snapshot, `fanout_fanin_balanced` flipped from loss to win after the stealable dispatch changes.
 - batched Tokio one-way throughput remains a known gap.
 - disk RTT benchmark remains a known gap.
+
+## Roadmap: Toward Full Runtime Scope
+
+Objective:
+
+- evolve `spargio` into a fuller async runtime in the class of `glommio` / `monoio` / `compio`, while preserving the current differentiator (`msg_ring`-coordinated cross-shard scheduling + stealing).
+
+Priority roadmap:
+
+1. Lock the differentiator with stable KPI gates.
+2. Build scheduler v2 (true per-worker deque stealing + fairness controls).
+3. Complete core runtime primitives (timers, cancellation, task groups, backpressure semantics).
+4. Deliver native network I/O MVP (TCP/UDP) on io_uring.
+5. Deliver native filesystem I/O MVP with clear FD/buffer ownership and affinity rules.
+6. Harden reliability and observability (stress/soak, failure injection, per-shard metrics and tracing).
+7. Keep sidecar interop first-class; treat broad Tokio-compat readiness emulation as an optional long-term lane.
+
+Immediate milestone sequence:
+
+1. Deque-based stealing + fairness/budgeting.
+2. Timer + timeout + cancellation primitives.
+3. TCP MVP + dedicated latency/throughput/tail benchmarks.
+
+## Update: Roadmap Tasks 1-5 MVP Implementation (TDD) (2026-02-26)
+
+Implemented the first pass for roadmap tasks 1-5 with red/green TDD, then validated with tests and benchmark guardrails.
+
+### 1) KPI gates for value proposition
+
+Added benchmark guardrails/scripts:
+
+- `scripts/bench_ping_guardrail.sh`
+  - checks `steady_ping_pong_rtt`, unbatched `steady_one_way_send_drain`, and `cold_start_ping_pong` against Tokio ratio thresholds.
+- `scripts/bench_kpi_guardrail.sh`
+  - runs ping + fanout guardrails together.
+- existing `scripts/bench_fanout_guardrail.sh` retained.
+
+CI update:
+
+- `.github/workflows/ci.yml` now runs:
+  - fanout smoke
+  - ping perf guardrail
+  - fanout perf guardrail
+
+### 2) Scheduler v2 (per-worker deque stealing + fairness controls)
+
+Runtime changes:
+
+- added `RuntimeBuilder::stealable_queue_capacity(...)`.
+- added `RuntimeBuilder::steal_budget(...)`.
+- changed stealable submission path:
+  - submit to preferred shard deque (`StealablePreferred`) with bounded capacity.
+  - return `RuntimeError::Overloaded` on enqueue backpressure.
+- worker execution loop now:
+  - drains local deque first up to budget.
+  - attempts bounded victim steals via rotating cursor when local queue has room.
+
+New stats signals:
+
+- `stealable_backpressure`
+- `steal_attempts`
+- `steal_success`
+
+### 3) Core runtime primitives (timer/cancellation/task groups/backpressure semantics)
+
+Added:
+
+- `sleep(Duration) -> impl Future<Output = ()>`
+- `timeout(Duration, fut) -> Result<T, TimeoutError>`
+- `CancellationToken` with:
+  - `new()`
+  - `cancel()`
+  - `is_canceled()`
+  - `cancelled() -> Future`
+- `TaskGroup` with cooperative cancellation:
+  - `TaskGroup::new(handle)`
+  - `spawn_with_placement(...) -> TaskGroupJoinHandle<T>`
+  - `cancel()`
+  - `token()`
+
+Backpressure semantics now include stealable task-queue overload via `RuntimeError::Overloaded`.
+
+### 4) Native network I/O MVP (io_uring lane)
+
+Extended `UringNativeLane` with:
+
+- `recv(fd, len)`
+- `send(fd, buf)`
+
+Implemented via native io_uring ops:
+
+- `IORING_OP_RECV`
+- `IORING_OP_SEND`
+
+### 5) Native filesystem I/O MVP (ownership + affinity surface)
+
+Added:
+
+- `UringNativeLane::fsync(fd)` (`IORING_OP_FSYNC`)
+- `UringBoundFd` ownership wrapper bound to a lane/shard with methods:
+  - `read_at`, `write_at`, `recv`, `send`, `fsync`
+- binding helpers:
+  - `bind_owned_fd`
+  - `bind_file`
+  - `bind_tcp_stream`
+  - `bind_udp_socket`
+
+This gives an explicit ownership + shard-affinity API surface for FD-driven native ops.
+
+### Red/green tests added
+
+- `tests/primitives_tdd.rs`
+  - sleep timing
+  - timeout success/failure
+  - cancellation token notification
+  - task-group cancellation and completion semantics
+- `tests/slices_tdd.rs` additions
+  - stealable queue backpressure -> `RuntimeError::Overloaded`
+  - steal attempts/success stats under blocked-owner load
+- `tests/uring_native_tdd.rs` additions
+  - bound file write/read/fsync
+  - bound TCP send/recv
+  - bound UDP send/recv
+
+### Validation
+
+- `cargo fmt`
+- `cargo test`
+- `cargo test --features uring-native`
+- `./scripts/bench_ping_guardrail.sh`
+- `./scripts/bench_fanout_guardrail.sh`
+- `cargo bench --bench disk_io -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Benchmark readout (latest local run profile)
+
+From ping guardrail run:
+
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`363-380 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.37-1.48 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`73.0-75.3 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`104.6-115.8 us`
+- `cold_start_ping_pong/spargio_io_uring`: ~`260-297 us`
+- `cold_start_ping_pong/tokio_two_worker`: ~`463-511 us`
+
+From fanout guardrail run:
+
+- `fanout_fanin_balanced/tokio_mt_4`: ~`1.42-1.50 ms`
+- `fanout_fanin_balanced/spargio_io_uring`: ~`1.33-1.35 ms`
+- `fanout_fanin_skewed/tokio_mt_4`: ~`2.42-2.53 ms`
+- `fanout_fanin_skewed/spargio_io_uring`: ~`2.03-2.04 ms`
+
+From disk benchmark run:
+
+- `disk_read_rtt_4k/tokio_two_worker_pread`: ~`1.79-1.93 ms`
+- `disk_read_rtt_4k/io_uring_msg_ring_two_ring_pread`: ~`2.65-2.80 ms`
+
+## Benchmark suite update: FS/Net API coverage and legacy disk bench removal
+
+Implemented benchmark suite changes to align with current runtime API surface:
+
+- removed legacy disk RTT benchmark harness:
+  - deleted `benches/disk_io.rs`
+  - removed `[[bench]] name = "disk_io"` from `Cargo.toml`
+- added filesystem API benchmark suite:
+  - `benches/fs_api.rs`
+  - `fs_read_rtt_4k`:
+    - `tokio_spawn_blocking_pread_qd1`
+    - `spargio_uring_bound_file_qd1`
+  - `fs_read_throughput_4k_qd32`:
+    - `tokio_spawn_blocking_pread_qd32`
+    - `spargio_uring_bound_file_qd32`
+- added network API benchmark suite:
+  - `benches/net_api.rs`
+  - `net_echo_rtt_256b`:
+    - `tokio_tcp_echo_qd1`
+    - `spargio_uring_bound_tcp_qd1`
+  - `net_stream_throughput_4k_window32`:
+    - `tokio_tcp_echo_window32`
+    - `spargio_uring_bound_tcp_window32`
+- updated `Cargo.toml` benchmark targets:
+  - `ping_pong`
+  - `fanout_fanin`
+  - `fs_api`
+  - `net_api`
+
+Validation run:
+
+- `cargo fmt --all`
+- `cargo bench --no-run`
+- `cargo bench --no-run --features uring-native`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+Latest benchmark readout (short smoke profile):
+
+From `fs_api`:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.59-1.68 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`1.98-2.11 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`7.66-7.76 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`7.51-8.23 ms`
+
+From `net_api`:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`8.17-8.54 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`6.89-6.97 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`11.12-11.42 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`29.33-30.01 ms`
+
+## Net benchmark tuning pass: reduce `net_stream_throughput_4k_window32` gap
+
+Goal:
+
+- reduce overhead in the `uring-native` TCP path and re-run `net_api` to improve `net_stream_throughput_4k_window32`.
+
+Implemented runtime/API changes (`src/lib.rs`):
+
+- added owned-buffer native APIs:
+  - `UringNativeLane::recv_owned(fd, Vec<u8>) -> io::Result<(usize, Vec<u8>)>`
+  - `UringNativeLane::send_owned(fd, Vec<u8>) -> io::Result<(usize, Vec<u8>)>`
+  - `UringBoundFd::recv_owned(Vec<u8>) -> io::Result<(usize, Vec<u8>)>`
+  - `UringBoundFd::send_owned(Vec<u8>) -> io::Result<(usize, Vec<u8>)>`
+- kept existing convenience APIs by adapting through owned-buffer path:
+  - `recv(fd, len)` now uses `recv_owned` + truncate
+  - `send(fd, &[u8])` now uses `send_owned`
+- added same-shard fast path in `recv_owned`/`send_owned`:
+  - if called from matching runtime/shard context, enqueue native op directly to local command queue instead of spawning a new pinned task.
+- wired owned-buffer request/response shapes through local command + backend + io_uring native op completion path.
+
+TDD coverage:
+
+- added `uring_bound_tcp_stream_supports_owned_send_and_recv_buffers` in `tests/uring_native_tdd.rs`.
+
+Benchmark harness tuning (`benches/net_api.rs`):
+
+- moved Spargio net workload execution into a pinned runtime worker task (command-driven harness), instead of issuing all ops from outside the runtime.
+- switched throughput receive path to stream-byte draining with a reusable scratch buffer (`64 KiB`) for both Tokio and Spargio:
+  - reduces per-op overhead and keeps the workload apples-to-apples as stream throughput.
+- switched Spargio send path to owned-buffer reuse (`send_owned`) with fallback for partial sends.
+
+Validation:
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+Result delta from this tuning pass:
+
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: improved from ~`6.89-6.97 ms` to ~`5.46-5.70 ms`.
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: improved from ~`29.33-30.01 ms` to ~`12.96-13.16 ms`.
+
+Current comparison (same run):
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.62-8.10 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`5.46-5.70 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.47-11.01 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`12.96-13.16 ms`
+
+Interpretation:
+
+- RTT is now clearly in Spargio’s favor for this harness.
+- Stream throughput gap versus Tokio is substantially reduced (from ~2.6x slower to ~1.2x slower), but still present.

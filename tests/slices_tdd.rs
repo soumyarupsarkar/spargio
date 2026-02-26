@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use spargio::{BackendKind, Event, Runtime, ShardCtx, TaskPlacement};
+use spargio::{BackendKind, Event, Runtime, RuntimeError, ShardCtx, TaskPlacement};
 use std::time::Duration;
 
 #[test]
@@ -187,4 +187,87 @@ fn io_uring_stealable_dispatch_uses_msg_ring_wake() {
 
     let stats = handle.stats_snapshot();
     assert!(stats.ring_msgs_submitted >= 1);
+}
+
+#[test]
+fn stealable_queue_capacity_applies_backpressure() {
+    let rt = Runtime::builder()
+        .shards(1)
+        .stealable_queue_capacity(1)
+        .build()
+        .expect("runtime");
+    let handle = rt.handle();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    let blocker = handle
+        .spawn_pinned(0, async move {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(75));
+            1usize
+        })
+        .expect("blocker");
+    started_rx.recv().expect("started");
+
+    let first = handle
+        .spawn_stealable_on(0, async {
+            std::thread::sleep(Duration::from_millis(10));
+            7usize
+        })
+        .expect("first stealable");
+    match handle.spawn_stealable_on(0, async { 8usize }) {
+        Ok(_) => panic!("expected overloaded error"),
+        Err(RuntimeError::Overloaded) => {}
+        Err(err) => panic!("unexpected error: {err:?}"),
+    }
+
+    let _ = block_on(first).expect("first join");
+    let _ = block_on(blocker).expect("blocker join");
+}
+
+#[test]
+fn steal_stats_track_attempts_and_success() {
+    let rt = Runtime::builder()
+        .shards(3)
+        .steal_budget(64)
+        .build()
+        .expect("runtime");
+    let handle = rt.handle();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    let blocker = handle
+        .spawn_pinned(0, async move {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(90));
+            0usize
+        })
+        .expect("blocker");
+    started_rx.recv().expect("blocker started");
+
+    let mut joins = Vec::new();
+    for _ in 0..32 {
+        let join = handle
+            .spawn_stealable_on(0, async {
+                std::thread::sleep(Duration::from_millis(1));
+                ShardCtx::current().expect("on shard").shard_id()
+            })
+            .expect("spawn stealable");
+        joins.push(join);
+    }
+
+    let mut ran_elsewhere = false;
+    for join in joins {
+        let shard = block_on(join).expect("join");
+        if shard != 0 {
+            ran_elsewhere = true;
+        }
+    }
+    assert!(
+        ran_elsewhere,
+        "expected stolen work to run on non-owner shard"
+    );
+    let _ = block_on(blocker).expect("blocker join");
+
+    let stats = handle.stats_snapshot();
+    assert!(stats.steal_attempts > 0);
+    assert!(stats.steal_success > 0);
 }

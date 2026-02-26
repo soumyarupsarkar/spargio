@@ -29,5 +29,8 @@ jobs:
       - name: Fanout bench smoke
         run: ./scripts/bench_fanout_smoke.sh
 
+      - name: Ping perf guardrail
+        run: ./scripts/bench_ping_guardrail.sh
+
       - name: Fanout perf guardrail
         run: ./scripts/bench_fanout_guardrail.sh

@@ -6,11 +6,12 @@ use core::task::{Context, Poll, Waker};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use futures::channel::oneshot;
 use futures::executor::{LocalPool, LocalSpawner};
+use futures::future::{Either, select};
 use futures::task::LocalSpawnExt;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,8 +20,14 @@ use std::time::Duration;
 use io_uring::{IoUring, opcode, types};
 #[cfg(target_os = "linux")]
 use slab::Slab;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::fs::File;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::net::{TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 
@@ -257,6 +264,153 @@ pub mod boundary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutError;
+
+pub async fn sleep(duration: Duration) {
+    let (tx, rx) = oneshot::channel();
+    thread::spawn(move || {
+        thread::sleep(duration);
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
+}
+
+pub async fn timeout<F>(duration: Duration, fut: F) -> Result<F::Output, TimeoutError>
+where
+    F: Future,
+{
+    let mut fut = Box::pin(fut);
+    let mut timer = Box::pin(sleep(duration));
+    match select(fut.as_mut(), timer.as_mut()).await {
+        Either::Left((value, _)) => Ok(value),
+        Either::Right((_, _)) => Err(TimeoutError),
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    canceled: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if self.inner.canceled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let waiters = {
+            let mut waiters = self.inner.waiters.lock().expect("cancel waiters poisoned");
+            waiters.drain(..).collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.inner.canceled.load(Ordering::SeqCst)
+    }
+
+    pub fn cancelled(&self) -> CancellationFuture {
+        CancellationFuture {
+            token: self.clone(),
+        }
+    }
+}
+
+pub struct CancellationFuture {
+    token: CancellationToken,
+}
+
+impl Future for CancellationFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.token.is_canceled() {
+            return Poll::Ready(());
+        }
+
+        let mut waiters = self
+            .token
+            .inner
+            .waiters
+            .lock()
+            .expect("cancel waiters poisoned");
+        if self.token.is_canceled() {
+            return Poll::Ready(());
+        }
+        if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+pub struct TaskGroup {
+    handle: RuntimeHandle,
+    token: CancellationToken,
+}
+
+impl TaskGroup {
+    pub fn new(handle: RuntimeHandle) -> Self {
+        Self {
+            handle,
+            token: CancellationToken::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    pub fn spawn_with_placement<F, T>(
+        &self,
+        placement: TaskPlacement,
+        fut: F,
+    ) -> Result<TaskGroupJoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let token = self.token.clone();
+        let join = self.handle.spawn_with_placement(placement, async move {
+            let mut task = Box::pin(fut);
+            let mut canceled = Box::pin(token.cancelled());
+            match select(task.as_mut(), canceled.as_mut()).await {
+                Either::Left((value, _)) => Some(value),
+                Either::Right((_, _)) => None,
+            }
+        })?;
+        Ok(TaskGroupJoinHandle { inner: join })
+    }
+}
+
+pub struct TaskGroupJoinHandle<T> {
+    inner: JoinHandle<Option<T>>,
+}
+
+impl<T> Future for TaskGroupJoinHandle<T> {
+    type Output = Result<Option<T>, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     RingMsg { from: ShardId, tag: u16, val: u32 },
 }
@@ -288,6 +442,9 @@ pub struct RuntimeStats {
     pub spawn_stealable_submitted: u64,
     pub stealable_executed: u64,
     pub stealable_stolen: u64,
+    pub stealable_backpressure: u64,
+    pub steal_attempts: u64,
+    pub steal_success: u64,
     pub ring_msgs_submitted: u64,
     pub ring_msgs_completed: u64,
     pub ring_msgs_failed: u64,
@@ -325,6 +482,8 @@ pub struct RuntimeBuilder {
     backend: BackendKind,
     ring_entries: u32,
     msg_ring_queue_capacity: usize,
+    stealable_queue_capacity: usize,
+    steal_budget: usize,
     #[cfg(target_os = "linux")]
     io_uring: IoUringBuildConfig,
 }
@@ -338,6 +497,8 @@ impl Default for RuntimeBuilder {
             backend: BackendKind::Queue,
             ring_entries: 256,
             msg_ring_queue_capacity: 4096,
+            stealable_queue_capacity: 4096,
+            steal_budget: 64,
             #[cfg(target_os = "linux")]
             io_uring: IoUringBuildConfig::default(),
         }
@@ -376,6 +537,16 @@ impl RuntimeBuilder {
 
     pub fn msg_ring_queue_capacity(mut self, capacity: usize) -> Self {
         self.msg_ring_queue_capacity = capacity.max(1);
+        self
+    }
+
+    pub fn stealable_queue_capacity(mut self, capacity: usize) -> Self {
+        self.stealable_queue_capacity = capacity.max(1);
+        self
+    }
+
+    pub fn steal_budget(mut self, budget: usize) -> Self {
+        self.steal_budget = budget.max(1);
         self
     }
 
@@ -435,6 +606,7 @@ impl RuntimeBuilder {
             backend: self.backend,
             command_txs: senders.clone(),
             stealable_inboxes: stealable_inboxes.clone(),
+            stealable_queue_capacity: self.stealable_queue_capacity,
             stats: stats.clone(),
         });
         let remotes: Vec<RemoteShard> = (0..self.shards)
@@ -449,11 +621,11 @@ impl RuntimeBuilder {
             BackendKind::Queue => {
                 for (idx, rx) in receivers.into_iter().enumerate() {
                     let remotes_for_shard = remotes.clone();
+                    let stealable_deques = stealable_inboxes.clone();
                     let thread_name = format!("{}-{}", self.thread_prefix, idx);
                     let idle_wait = self.idle_wait;
                     let runtime_id = shared.runtime_id;
                     let backend = ShardBackend::Queue;
-                    let stealable_inbox = stealable_inboxes[idx].clone();
                     let stats = stats.clone();
 
                     let join = match thread::Builder::new().name(thread_name).spawn(move || {
@@ -462,7 +634,8 @@ impl RuntimeBuilder {
                             idx as ShardId,
                             rx,
                             remotes_for_shard,
-                            stealable_inbox,
+                            stealable_deques,
+                            self.steal_budget,
                             idle_wait,
                             backend,
                             stats,
@@ -511,6 +684,7 @@ impl RuntimeBuilder {
                         receivers.into_iter().zip(rings.into_iter()).enumerate()
                     {
                         let remotes_for_shard = remotes.clone();
+                        let stealable_deques = stealable_inboxes.clone();
                         let thread_name = format!("{}-{}", self.thread_prefix, idx);
                         let idle_wait = self.idle_wait;
                         let runtime_id = shared.runtime_id;
@@ -522,7 +696,6 @@ impl RuntimeBuilder {
                             stats.clone(),
                             self.msg_ring_queue_capacity,
                         ));
-                        let stealable_inbox = stealable_inboxes[idx].clone();
                         let stats = stats.clone();
 
                         let join = match thread::Builder::new().name(thread_name).spawn(move || {
@@ -531,7 +704,8 @@ impl RuntimeBuilder {
                                 idx as ShardId,
                                 rx,
                                 remotes_for_shard,
-                                stealable_inbox,
+                                stealable_deques,
+                                self.steal_budget,
                                 idle_wait,
                                 backend,
                                 stats,
@@ -847,6 +1021,250 @@ impl UringNativeLane {
 
         join.await.map_err(join_error_to_io)?
     }
+
+    pub async fn recv(&self, fd: RawFd, len: usize) -> std::io::Result<Vec<u8>> {
+        let (read_len, mut buf) = self.recv_owned(fd, vec![0; len]).await?;
+        buf.truncate(read_len.min(buf.len()));
+        Ok(buf)
+    }
+
+    pub async fn recv_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        let mut pending_buf = Some(buf);
+        if let Some(reply_rx) = {
+            let maybe_ctx = ShardCtx::current().filter(|ctx| {
+                ctx.runtime_id() == self.handle.inner.shared.runtime_id
+                    && ctx.shard_id() == self.shard
+            });
+            maybe_ctx.map(|ctx| {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeRecvOwned {
+                        origin_shard: ctx.shard_id(),
+                        fd,
+                        buf: pending_buf
+                            .take()
+                            .expect("native recv pending buffer must exist"),
+                        reply: reply_tx,
+                    },
+                );
+                reply_rx
+            })
+        } {
+            return reply_rx.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native recv response channel closed",
+                ))
+            });
+        }
+
+        let buf = pending_buf
+            .take()
+            .expect("native recv pending buffer must exist");
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeRecvOwned {
+                            origin_shard: ctx.shard_id(),
+                            fd,
+                            buf,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native recv response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
+    }
+
+    pub async fn send(&self, fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+        let (sent, _) = self.send_owned(fd, buf.to_vec()).await?;
+        Ok(sent)
+    }
+
+    pub async fn send_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        let mut pending_buf = Some(buf);
+        if let Some(reply_rx) = {
+            let maybe_ctx = ShardCtx::current().filter(|ctx| {
+                ctx.runtime_id() == self.handle.inner.shared.runtime_id
+                    && ctx.shard_id() == self.shard
+            });
+            maybe_ctx.map(|ctx| {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeSendOwned {
+                        origin_shard: ctx.shard_id(),
+                        fd,
+                        buf: pending_buf
+                            .take()
+                            .expect("native send pending buffer must exist"),
+                        reply: reply_tx,
+                    },
+                );
+                reply_rx
+            })
+        } {
+            return reply_rx.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native send response channel closed",
+                ))
+            });
+        }
+
+        let buf = pending_buf
+            .take()
+            .expect("native send pending buffer must exist");
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeSendOwned {
+                            origin_shard: ctx.shard_id(),
+                            fd,
+                            buf,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native send response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
+    }
+
+    pub async fn fsync(&self, fd: RawFd) -> std::io::Result<()> {
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeFsync {
+                            origin_shard: ctx.shard_id(),
+                            fd,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native fsync response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
+    }
+
+    pub fn bind_owned_fd(&self, fd: OwnedFd) -> UringBoundFd {
+        UringBoundFd {
+            lane: self.clone(),
+            fd: Arc::new(fd),
+        }
+    }
+
+    pub fn bind_file(&self, file: File) -> UringBoundFd {
+        self.bind_owned_fd(file.into())
+    }
+
+    pub fn bind_tcp_stream(&self, stream: TcpStream) -> UringBoundFd {
+        self.bind_owned_fd(stream.into())
+    }
+
+    pub fn bind_udp_socket(&self, socket: UdpSocket) -> UringBoundFd {
+        self.bind_owned_fd(socket.into())
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone)]
+pub struct UringBoundFd {
+    lane: UringNativeLane,
+    fd: Arc<OwnedFd>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl UringBoundFd {
+    pub fn shard(&self) -> ShardId {
+        self.lane.shard()
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    pub async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.lane.read_at(self.raw_fd(), offset, len).await
+    }
+
+    pub async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        self.lane.write_at(self.raw_fd(), offset, buf).await
+    }
+
+    pub async fn recv(&self, len: usize) -> std::io::Result<Vec<u8>> {
+        self.lane.recv(self.raw_fd(), len).await
+    }
+
+    pub async fn recv_owned(&self, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        self.lane.recv_owned(self.raw_fd(), buf).await
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.lane.send(self.raw_fd(), buf).await
+    }
+
+    pub async fn send_owned(&self, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        self.lane.send_owned(self.raw_fd(), buf).await
+    }
+
+    pub async fn fsync(&self) -> std::io::Result<()> {
+        self.lane.fsync(self.raw_fd()).await
+    }
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -862,6 +1280,9 @@ fn runtime_error_to_io(err: RuntimeError) -> std::io::Error {
         ),
         RuntimeError::Closed => {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "runtime closed")
+        }
+        RuntimeError::Overloaded => {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "runtime overloaded")
         }
         RuntimeError::UnsupportedBackend(msg) => {
             std::io::Error::new(std::io::ErrorKind::Unsupported, msg)
@@ -914,7 +1335,7 @@ where
     if usize::from(preferred_shard) >= shared.command_txs.len() {
         return Err(RuntimeError::InvalidShard(preferred_shard));
     }
-    let target = shared.pick_stealable_target(preferred_shard);
+    let target = preferred_shard;
 
     let (tx, rx) = oneshot::channel();
     shared
@@ -924,16 +1345,22 @@ where
     let Some(inbox) = shared.stealable_inboxes.get(usize::from(target)) else {
         return Err(RuntimeError::InvalidShard(target));
     };
-    inbox
-        .lock()
-        .expect("stealable queue lock poisoned")
-        .push_back(StealableTask {
-            preferred_shard,
-            task: Box::pin(async move {
-                let out = fut.await;
-                let _ = tx.send(out);
-            }),
-        });
+    let mut queue = inbox.lock().expect("stealable queue lock poisoned");
+    if queue.len() >= shared.stealable_queue_capacity {
+        shared
+            .stats
+            .stealable_backpressure
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(RuntimeError::Overloaded);
+    }
+    queue.push_back(StealableTask {
+        preferred_shard,
+        task: Box::pin(async move {
+            let out = fut.await;
+            let _ = tx.send(out);
+        }),
+    });
+    drop(queue);
     shared.notify_stealable_target(target);
 
     Ok(JoinHandle { rx: Some(rx) })
@@ -960,6 +1387,9 @@ struct RuntimeStatsInner {
     spawn_stealable_submitted: AtomicU64,
     stealable_executed: AtomicU64,
     stealable_stolen: AtomicU64,
+    stealable_backpressure: AtomicU64,
+    steal_attempts: AtomicU64,
+    steal_success: AtomicU64,
     ring_msgs_submitted: AtomicU64,
     ring_msgs_completed: AtomicU64,
     ring_msgs_failed: AtomicU64,
@@ -981,6 +1411,9 @@ impl RuntimeStatsInner {
             spawn_stealable_submitted: AtomicU64::new(0),
             stealable_executed: AtomicU64::new(0),
             stealable_stolen: AtomicU64::new(0),
+            stealable_backpressure: AtomicU64::new(0),
+            steal_attempts: AtomicU64::new(0),
+            steal_success: AtomicU64::new(0),
             ring_msgs_submitted: AtomicU64::new(0),
             ring_msgs_completed: AtomicU64::new(0),
             ring_msgs_failed: AtomicU64::new(0),
@@ -1001,6 +1434,9 @@ impl RuntimeStatsInner {
             spawn_stealable_submitted: self.spawn_stealable_submitted.load(Ordering::Relaxed),
             stealable_executed: self.stealable_executed.load(Ordering::Relaxed),
             stealable_stolen: self.stealable_stolen.load(Ordering::Relaxed),
+            stealable_backpressure: self.stealable_backpressure.load(Ordering::Relaxed),
+            steal_attempts: self.steal_attempts.load(Ordering::Relaxed),
+            steal_success: self.steal_success.load(Ordering::Relaxed),
             ring_msgs_submitted: self.ring_msgs_submitted.load(Ordering::Relaxed),
             ring_msgs_completed: self.ring_msgs_completed.load(Ordering::Relaxed),
             ring_msgs_failed: self.ring_msgs_failed.load(Ordering::Relaxed),
@@ -1031,6 +1467,7 @@ struct RuntimeShared {
     backend: BackendKind,
     command_txs: Vec<Sender<Command>>,
     stealable_inboxes: StealableInboxes,
+    stealable_queue_capacity: usize,
     stats: Arc<RuntimeStatsInner>,
 }
 
@@ -1045,33 +1482,6 @@ impl RuntimeShared {
         }
         self.stats.decrement_command_depth(shard);
         Err(())
-    }
-
-    fn pick_stealable_target(&self, preferred: ShardId) -> ShardId {
-        let preferred_idx = usize::from(preferred);
-        if preferred_idx >= self.stealable_inboxes.len() {
-            return preferred;
-        }
-
-        let mut best_idx = preferred_idx;
-        let mut best_len = self.stealable_inboxes[preferred_idx]
-            .lock()
-            .expect("stealable queue lock poisoned")
-            .len();
-
-        for (idx, queue) in self.stealable_inboxes.iter().enumerate() {
-            if idx == preferred_idx {
-                continue;
-            }
-
-            let len = queue.lock().expect("stealable queue lock poisoned").len();
-            if len < best_len {
-                best_len = len;
-                best_idx = idx;
-            }
-        }
-
-        best_idx as ShardId
     }
 
     fn notify_stealable_target(&self, target: ShardId) {
@@ -1402,6 +1812,7 @@ pub enum RuntimeError {
     ThreadSpawn(std::io::Error),
     InvalidShard(ShardId),
     Closed,
+    Overloaded,
     UnsupportedBackend(&'static str),
     #[cfg(target_os = "linux")]
     IoUringInit(std::io::Error),
@@ -1540,6 +1951,26 @@ enum LocalCommand {
         offset: u64,
         buf: Vec<u8>,
         reply: oneshot::Sender<std::io::Result<usize>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeRecvOwned {
+        origin_shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeSendOwned {
+        origin_shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeFsync {
+        origin_shard: ShardId,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<()>>,
     },
 }
 
@@ -1769,6 +2200,107 @@ impl ShardBackend {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_recv(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring recv violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring recv requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_recv(fd, buf, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_send(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring send violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring send requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_send(fd, buf, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_fsync(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<()>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring fsync violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring fsync requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_fsync(fd, reply);
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         if let Self::IoUring(driver) = self {
@@ -1796,6 +2328,17 @@ enum NativeIoOp {
     Write {
         buf: Vec<u8>,
         reply: oneshot::Sender<std::io::Result<usize>>,
+    },
+    Recv {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    Send {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    Fsync {
+        reply: oneshot::Sender<std::io::Result<()>>,
     },
 }
 
@@ -2044,6 +2587,100 @@ impl IoUringDriver {
         self.mark_submission_pending()
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_recv(
+        &mut self,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    ) -> Result<(), SendError> {
+        let Ok(len_u32) = u32::try_from(buf.len()) else {
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native recv length exceeds u32::MAX",
+            )));
+            return Ok(());
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::Recv { buf, reply });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+
+        let buf_ptr = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Recv { buf, .. }) => buf.as_mut_ptr(),
+            _ => unreachable!("native recv op kind mismatch"),
+        };
+
+        let entry = opcode::Recv::new(types::Fd(fd), buf_ptr, len_u32)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_send(
+        &mut self,
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    ) -> Result<(), SendError> {
+        let Ok(len_u32) = u32::try_from(buf.len()) else {
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native send length exceeds u32::MAX",
+            )));
+            return Ok(());
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::Send { buf, reply });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+
+        let buf_ptr = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Send { buf, .. }) => buf.as_ptr(),
+            _ => unreachable!("native send op kind mismatch"),
+        };
+
+        let entry = opcode::Send::new(types::Fd(fd), buf_ptr, len_u32)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_fsync(
+        &mut self,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    ) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::Fsync { reply });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+
+        let entry = opcode::Fsync::new(types::Fd(fd))
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
     fn mark_submission_pending(&mut self) -> Result<(), SendError> {
         self.pending_submit += 1;
         if self.pending_submit >= self.submit_batch_limit {
@@ -2086,6 +2723,24 @@ impl IoUringDriver {
                         "native io_uring write failed",
                     )));
                 }
+                NativeIoOp::Recv { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring recv failed",
+                    )));
+                }
+                NativeIoOp::Send { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring send failed",
+                    )));
+                }
+                NativeIoOp::Fsync { reply } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring fsync failed",
+                    )));
+                }
             }
         }
     }
@@ -2115,6 +2770,24 @@ impl IoUringDriver {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring write canceled",
+                    )));
+                }
+                NativeIoOp::Recv { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring recv canceled",
+                    )));
+                }
+                NativeIoOp::Send { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring send canceled",
+                    )));
+                }
+                NativeIoOp::Fsync { reply } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring fsync canceled",
                     )));
                 }
             }
@@ -2258,6 +2931,27 @@ impl IoUringDriver {
                 }
                 let _ = reply.send(Ok(result as usize));
             }
+            NativeIoOp::Recv { buf, reply } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok((result as usize, buf)));
+            }
+            NativeIoOp::Send { buf, reply } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok((result as usize, buf)));
+            }
+            NativeIoOp::Fsync { reply } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok(()));
+            }
         }
     }
 
@@ -2334,7 +3028,8 @@ fn run_shard(
     shard_id: ShardId,
     rx: Receiver<Command>,
     remotes: Vec<RemoteShard>,
-    stealable_inbox: Arc<Mutex<VecDeque<StealableTask>>>,
+    stealable_deques: StealableInboxes,
+    steal_budget: usize,
     idle_wait: Duration,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
@@ -2365,6 +3060,8 @@ fn run_shard(
         *slot.borrow_mut() = Some(ctx.clone());
     });
 
+    let mut steal_cursor = (usize::from(shard_id) + 1) % stealable_deques.len().max(1);
+
     let mut stop = false;
     while !stop {
         pool.run_until_stalled();
@@ -2375,7 +3072,14 @@ fn run_shard(
             &command_txs,
             &stats,
         );
-        let stealable_drained = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
+        let stealable_drained = drain_stealable_tasks(
+            shard_id,
+            &stealable_deques,
+            steal_budget,
+            &mut steal_cursor,
+            &spawner,
+            &stats,
+        );
         backend.poll(&event_state);
 
         let mut drained = stealable_drained;
@@ -2409,7 +3113,14 @@ fn run_shard(
                 &command_txs,
                 &stats,
             );
-            let _ = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
+            let _ = drain_stealable_tasks(
+                shard_id,
+                &stealable_deques,
+                steal_budget,
+                &mut steal_cursor,
+                &spawner,
+                &stats,
+            );
             if backend.prefers_busy_poll() {
                 thread::yield_now();
             } else {
@@ -2431,7 +3142,14 @@ fn run_shard(
             &command_txs,
             &stats,
         );
-        let _ = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
+        let _ = drain_stealable_tasks(
+            shard_id,
+            &stealable_deques,
+            steal_budget,
+            &mut steal_cursor,
+            &spawner,
+            &stats,
+        );
         backend.poll(&event_state);
     }
 
@@ -2484,26 +3202,78 @@ fn handle_command(
 
 fn drain_stealable_tasks(
     shard_id: ShardId,
-    stealable_inbox: &Arc<Mutex<VecDeque<StealableTask>>>,
+    stealable_deques: &StealableInboxes,
+    steal_budget: usize,
+    steal_cursor: &mut usize,
     spawner: &LocalSpawner,
     stats: &RuntimeStatsInner,
 ) -> bool {
+    fn spawn_task(
+        shard_id: ShardId,
+        task: StealableTask,
+        spawner: &LocalSpawner,
+        stats: &RuntimeStatsInner,
+    ) {
+        stats.stealable_executed.fetch_add(1, Ordering::Relaxed);
+        if task.preferred_shard != shard_id {
+            stats.stealable_stolen.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = spawner.spawn_local(task.task);
+    }
+
     let mut drained = false;
-    for _ in 0..64 {
-        let task = stealable_inbox
+    let budget = steal_budget.max(1);
+    let local_idx = usize::from(shard_id);
+    let Some(local_deque) = stealable_deques.get(local_idx) else {
+        return false;
+    };
+    let mut remaining = budget;
+
+    while remaining > 0 {
+        let task = local_deque
             .lock()
             .expect("stealable queue lock poisoned")
             .pop_front();
         let Some(task) = task else {
             break;
         };
-
         drained = true;
-        stats.stealable_executed.fetch_add(1, Ordering::Relaxed);
-        if task.preferred_shard != shard_id {
-            stats.stealable_stolen.fetch_add(1, Ordering::Relaxed);
+        remaining -= 1;
+        spawn_task(shard_id, task, spawner, stats);
+    }
+
+    if remaining == 0 || stealable_deques.len() <= 1 {
+        return drained;
+    }
+
+    let shard_count = stealable_deques.len();
+    let max_attempts = shard_count.saturating_sub(1);
+    let mut attempts = 0usize;
+    while remaining > 0 && attempts < max_attempts {
+        let mut victim_idx = *steal_cursor % shard_count;
+        *steal_cursor = (*steal_cursor + 1) % shard_count;
+        if victim_idx == local_idx {
+            victim_idx = *steal_cursor % shard_count;
+            *steal_cursor = (*steal_cursor + 1) % shard_count;
         }
-        let _ = spawner.spawn_local(task.task);
+        if victim_idx == local_idx {
+            break;
+        }
+
+        attempts += 1;
+        stats.steal_attempts.fetch_add(1, Ordering::Relaxed);
+        let task = stealable_deques[victim_idx]
+            .lock()
+            .expect("stealable queue lock poisoned")
+            .pop_back();
+        let Some(task) = task else {
+            continue;
+        };
+
+        stats.steal_success.fetch_add(1, Ordering::Relaxed);
+        drained = true;
+        remaining -= 1;
+        spawn_task(shard_id, task, spawner, stats);
     }
     drained
 }
@@ -2553,6 +3323,26 @@ fn drain_local_commands(
                 buf,
                 reply,
             } => backend.submit_native_write(shard_id, origin_shard, fd, offset, buf, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeRecvOwned {
+                origin_shard,
+                fd,
+                buf,
+                reply,
+            } => backend.submit_native_recv(shard_id, origin_shard, fd, buf, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeSendOwned {
+                origin_shard,
+                fd,
+                buf,
+                reply,
+            } => backend.submit_native_send(shard_id, origin_shard, fd, buf, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeFsync {
+                origin_shard,
+                fd,
+                reply,
+            } => backend.submit_native_fsync(shard_id, origin_shard, fd, reply, stats),
         }
     }
 }
