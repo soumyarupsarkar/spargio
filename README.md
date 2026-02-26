@@ -18,6 +18,8 @@ Built with Codex.
 | `net_echo_rtt_256b` (`qd=1`) | `8.044-8.518 ms` | `5.375-5.806 ms` | `spargio io_uring ~1.5x faster than tokio` |
 | `net_stream_throughput_4k_window32` | `10.470-10.946 ms` | `10.762-10.901 ms` | `near parity` |
 
+Spargio leads most clearly in coordination-heavy and latency-sensitive paths, while some pure throughput cases (for example `steady_one_way_send_drain` and `net_stream_throughput_4k_window32`) are currently near parity.
+
 Bench suites in this repo:
 
 - `benches/ping_pong.rs`
