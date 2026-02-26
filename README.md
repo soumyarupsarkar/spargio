@@ -1,26 +1,30 @@
 # spargio
 
-`spargio` is an experimental Rust async runtime built around `io_uring` and `msg_ring` for cross-shard coordination and work stealing.
+`spargio` is a work-stealing async runtime for Rust built around `io_uring` and `msg_ring` for cross-shard coordination and submission-time task placement.
 
-Built with Codex.
+Compared with Tokio’s default runtime model, Spargio can steer native disk and network I/O operations to another shard before submission, placing SQEs on a chosen `io_uring` queue. This adds a pre-submission dispatch lever (in addition to task stealing), which can reduce queue imbalance and tail latency in coordination-heavy or bursty workloads; the benchmark results below show where this helps in practice.
+
+## Disclaimer
+
+This is a proof of concept built with Codex; do not use in production.
 
 ## Benchmark Results
 
-| Benchmark | Tokio | spargio io_uring (bound) | spargio io_uring (unbound) | Readout |
+| Benchmark | Description | Tokio | spargio | Speedup |
 | --- | --- | --- | --- | --- |
-| `steady_ping_pong_rtt` | `1.434-1.553 ms` | `366-381 us` | `n/a` | `spargio io_uring ~4.0x faster than tokio` |
-| `steady_one_way_send_drain` | `68.8-76.2 us` | `70.5-71.7 us` | `n/a` | `near parity (tokio slightly faster in this run)` |
-| `cold_start_ping_pong` | `561-610 us` | `249-267 us` | `n/a` | `spargio io_uring ~2.3x faster than tokio` |
-| `fanout_fanin_balanced` | `1.473-1.621 ms` | `1.387-1.404 ms` | `n/a` | `spargio io_uring ~1.1x faster than tokio` |
-| `fanout_fanin_skewed` | `2.366-2.437 ms` | `1.993-2.003 ms` | `n/a` | `spargio io_uring ~1.2x faster than tokio` |
-| `fs_read_rtt_4k` (`qd=1`) | `1.754-1.867 ms` | `1.013-1.062 ms` | `1.003-1.028 ms` | `unbound slightly faster than bound; both faster than tokio` |
-| `fs_read_throughput_4k_qd32` | `8.732-9.015 ms` | `5.967-6.988 ms` | `6.085-6.866 ms` | `both Spargio paths faster than tokio` |
-| `net_echo_rtt_256b` (`qd=1`) | `7.918-8.187 ms` | `6.840-8.632 ms` | `5.539-5.812 ms` | `unbound now leads clearly` |
-| `net_stream_throughput_4k_window32` | `10.544-10.656 ms` | `11.073-11.449 ms` | `10.996-11.408 ms` | `tokio leads; unbound narrows the gap` |
+| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.434-1.553 ms` | `366-381 us` | `4.0x` |
+| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `68.8-76.2 us` | `70.5-71.7 us` | `1.0x` |
+| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `561-610 us` | `249-267 us` | `2.3x` |
+| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.473-1.621 ms` | `1.387-1.404 ms` | `1.1x` |
+| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.366-2.437 ms` | `1.993-2.003 ms` | `1.2x` |
+| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.754-1.867 ms` | `1.003-1.028 ms` | `1.8x` |
+| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `8.732-9.015 ms` | `6.085-6.866 ms` | `1.4x` |
+| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.918-8.187 ms` | `5.539-5.812 ms` | `1.4x` |
+| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `10.544-10.656 ms` | `10.996-11.408 ms` | `0.9x` |
 
 Spargio leads most clearly in coordination-heavy and latency-sensitive paths, while some pure throughput cases (for example `steady_one_way_send_drain` and `net_stream_throughput_4k_window32`) are currently near parity.
 
-The unbound column reflects `UringNativeAny` submission-time steering (`NativeLaneSelector` + FD affinity leases); `n/a` rows are suites where unbound variants are not yet implemented.
+For CPU/coordination-heavy suites, this `spargio` value is the same runtime message path regardless of bound/unbound native-I/O mode. For native-I/O suites, this column reflects the unbound `UringNativeAny` path.
 
 Bench suites in this repo:
 
