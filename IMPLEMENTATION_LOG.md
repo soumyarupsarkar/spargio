@@ -448,3 +448,43 @@ Validation:
 - `cargo test` passes.
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
+
+## Update: Tokio Compat Lane via RuntimeHandle (TDD)
+
+Integrated poll-compat usage into a runtime-lane API so Tokio tasks can use a single handle for both runtime operations and readiness waiting.
+
+### Red phase
+
+Added failing tests in `tests/tokio_runtime_lane_tdd.rs` (`cfg(all(feature = "tokio-compat", target_os = "linux"))`) for:
+
+- `RuntimeHandle::tokio_compat_lane(entries)` creation.
+- Combined lane behavior:
+  - `spawn_pinned`
+  - `remote(...).send_raw(...).await`
+  - event receive path
+- Poll API through lane:
+  - `register`
+  - async `wait_one`
+
+### Green phase
+
+Implemented in `src/lib.rs`:
+
+- `RuntimeHandle::tokio_compat_lane(entries) -> Result<TokioCompatLane, PollReactorError>`
+- New `TokioCompatLane` (`Clone`) with delegated runtime APIs:
+  - `backend`
+  - `shard_count`
+  - `remote`
+  - `spawn_pinned`
+  - `spawn_stealable`
+- Lane poll APIs:
+  - `register`
+  - async `wait_one`
+  - async `deregister`
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.

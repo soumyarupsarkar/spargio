@@ -689,6 +689,74 @@ impl RuntimeHandle {
         let shard = (next % shards) as ShardId;
         self.spawn_pinned(shard, fut)
     }
+
+    #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+    pub fn tokio_compat_lane(
+        &self,
+        entries: u32,
+    ) -> Result<TokioCompatLane, tokio_compat::PollReactorError> {
+        Ok(TokioCompatLane {
+            handle: self.clone(),
+            poll: tokio_compat::TokioPollReactor::new(entries)?,
+        })
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+#[derive(Clone)]
+pub struct TokioCompatLane {
+    handle: RuntimeHandle,
+    poll: tokio_compat::TokioPollReactor,
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl TokioCompatLane {
+    pub fn backend(&self) -> BackendKind {
+        self.handle.backend()
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.handle.shard_count()
+    }
+
+    pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
+        self.handle.remote(shard)
+    }
+
+    pub fn spawn_pinned<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.handle.spawn_pinned(shard, fut)
+    }
+
+    pub fn spawn_stealable<F, T>(&self, fut: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.handle.spawn_stealable(fut)
+    }
+
+    pub fn register(
+        &self,
+        fd: RawFd,
+        interest: tokio_compat::PollInterest,
+    ) -> Result<tokio_compat::PollToken, tokio_compat::PollReactorError> {
+        self.poll.register(fd, interest)
+    }
+
+    pub async fn wait_one(&self) -> Result<tokio_compat::PollEvent, tokio_compat::PollReactorError> {
+        self.poll.wait_one().await
+    }
+
+    pub async fn deregister(
+        &self,
+        token: tokio_compat::PollToken,
+    ) -> Result<(), tokio_compat::PollReactorError> {
+        self.poll.deregister(token).await
+    }
 }
 
 fn spawn_on_shared<F, T>(
