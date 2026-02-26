@@ -340,3 +340,37 @@ Added a dedicated disk benchmark:
 
 - This first disk RTT harness is not yet optimized for io_uring throughput; it is currently request/ack serialized and favors simplicity/debuggability.
 - VFS work is still present for both paths; `io_uring` changes submission/completion mechanics, not filesystem lookup/permission/page-cache semantics.
+
+## Update: Tokio Interop API Slice (TDD)
+
+Started implementation toward the ADR with a first interop slice focused on submission APIs that can be called from Tokio tasks.
+
+### Red phase
+
+Added failing tests in `tests/tokio_compat_tdd.rs` for:
+
+- `Runtime::handle()` availability.
+- `RuntimeHandle::spawn_pinned(shard, fut)` execution on requested shard.
+- `RuntimeHandle::spawn_stealable(fut)` round-robin placement.
+- `RuntimeHandle` usage from Tokio tasks, including remote send + ticket await.
+- `RuntimeHandle` cloneability and `Send + Sync`.
+
+### Green phase
+
+Implemented in `src/lib.rs`:
+
+- New public `RuntimeHandle` (`Clone`, `Send + Sync`).
+- `Runtime::handle() -> RuntimeHandle`.
+- `RuntimeHandle` APIs:
+  - `backend()`
+  - `shard_count()`
+  - `remote(shard)`
+  - `spawn_pinned(shard, fut)`
+  - `spawn_stealable(fut)` (round-robin via `AtomicUsize`)
+- Refactored spawn logic into shared helper:
+  - `spawn_on_shared(...)`
+
+Validation:
+
+- `cargo test` passes (including new `tokio_compat_tdd` tests).
+- `cargo bench --no-run` passes.

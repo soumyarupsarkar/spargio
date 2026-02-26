@@ -10,7 +10,7 @@ use futures::task::LocalSpawnExt;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -332,23 +332,22 @@ impl Runtime {
         self.remotes.get(usize::from(shard)).cloned()
     }
 
+    pub fn handle(&self) -> RuntimeHandle {
+        RuntimeHandle {
+            inner: Arc::new(RuntimeHandleInner {
+                shared: self.shared.clone(),
+                remotes: self.remotes.clone(),
+                next_shard: AtomicUsize::new(0),
+            }),
+        }
+    }
+
     pub fn spawn_on<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        self.shared
-            .send_to(
-                shard,
-                Command::Spawn(Box::pin(async move {
-                    let out = fut.await;
-                    let _ = tx.send(out);
-                })),
-            )
-            .map_err(|_| RuntimeError::InvalidShard(shard))?;
-
-        Ok(JoinHandle { rx: Some(rx) })
+        spawn_on_shared(&self.shared, shard, fut)
     }
 
     pub fn shutdown(&mut self) {
@@ -371,6 +370,77 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    inner: Arc<RuntimeHandleInner>,
+}
+
+struct RuntimeHandleInner {
+    shared: Arc<RuntimeShared>,
+    remotes: Vec<RemoteShard>,
+    next_shard: AtomicUsize,
+}
+
+impl RuntimeHandle {
+    pub fn backend(&self) -> BackendKind {
+        self.inner.shared.backend
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.inner.remotes.len()
+    }
+
+    pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
+        self.inner.remotes.get(usize::from(shard)).cloned()
+    }
+
+    pub fn spawn_pinned<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        spawn_on_shared(&self.inner.shared, shard, fut)
+    }
+
+    pub fn spawn_stealable<F, T>(&self, fut: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let shards = self.shard_count();
+        if shards == 0 {
+            return Err(RuntimeError::Closed);
+        }
+
+        let next = self.inner.next_shard.fetch_add(1, Ordering::Relaxed);
+        let shard = (next % shards) as ShardId;
+        self.spawn_pinned(shard, fut)
+    }
+}
+
+fn spawn_on_shared<F, T>(
+    shared: &Arc<RuntimeShared>,
+    shard: ShardId,
+    fut: F,
+) -> Result<JoinHandle<T>, RuntimeError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    shared
+        .send_to(
+            shard,
+            Command::Spawn(Box::pin(async move {
+                let out = fut.await;
+                let _ = tx.send(out);
+            })),
+        )
+        .map_err(|_| RuntimeError::InvalidShard(shard))?;
+
+    Ok(JoinHandle { rx: Some(rx) })
 }
 
 #[derive(Clone)]
