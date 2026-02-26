@@ -488,3 +488,49 @@ Validation:
 - `cargo test` passes.
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
+
+## Update: Lane Readiness Futures + Cancellation Cleanup (TDD)
+
+Implemented lane-scoped readiness waits and fixed cancellation behavior.
+
+### Red phase
+
+Added failing tests in `tests/tokio_runtime_wait_tdd.rs` (`cfg(all(feature = "tokio-compat", target_os = "linux"))`) for:
+
+- `wait_writable(fd)` and `wait_readable(fd)` APIs through `TokioCompatLane`.
+- cancellation cleanup:
+  - aborting `wait_readable` should not leak poll registrations.
+
+### Green phase
+
+Implemented in `src/lib.rs`:
+
+- `TokioCompatLane` readiness methods:
+  - `wait_readable(fd).await`
+  - `wait_writable(fd).await`
+- Drop cleanup guard for wait futures:
+  - best-effort deregistration on cancellation.
+- Debug helper for validation:
+  - `debug_poll_registered_count()`.
+
+Important fix during this slice:
+
+- Reworked `TokioPollReactor` implementation from `spawn_blocking + Mutex<PollReactor>` to a dedicated worker-thread command loop.
+- Reason:
+  - prior design could deadlock cleanup when aborted tasks left blocking waits holding the mutex.
+- New design:
+  - command channel (`register` / `wait_one` / `deregister`)
+  - non-blocking waiter pump (`try_wait_one`) to keep deregistration responsive.
+
+Additional reactor hardening:
+
+- Track active poll tokens in `PollReactor`.
+- Ignore stale completions for inactive tokens.
+- Fast `NotFound` on deregister for unknown token.
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.

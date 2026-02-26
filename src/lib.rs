@@ -37,10 +37,16 @@ const DOORBELL_TAG: u16 = u16::MAX;
 
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 pub mod tokio_compat {
+    use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
     use io_uring::{IoUring, opcode, types};
+    use std::collections::HashSet;
     use std::collections::VecDeque;
     use std::os::fd::RawFd;
+    use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
     const INTERNAL_USER_BIT: u64 = 1 << 63;
     const TOKEN_USER_MASK: u64 = !INTERNAL_USER_BIT;
@@ -118,6 +124,7 @@ pub mod tokio_compat {
         next_token: u64,
         next_internal: u64,
         ready: VecDeque<PollEvent>,
+        active_tokens: HashSet<PollToken>,
     }
 
     impl PollReactor {
@@ -128,6 +135,7 @@ pub mod tokio_compat {
                 next_token: 1,
                 next_internal: 1,
                 ready: VecDeque::new(),
+                active_tokens: HashSet::new(),
             })
         }
 
@@ -141,16 +149,24 @@ pub mod tokio_compat {
                 .build()
                 .user_data(token_user_data(token));
             self.submit_entry(entry)?;
+            self.active_tokens.insert(token);
             Ok(token)
         }
 
         pub fn deregister(&mut self, token: PollToken) -> Result<(), PollReactorError> {
+            if !self.active_tokens.contains(&token) {
+                return Err(PollReactorError::NotFound);
+            }
             let completion_user_data = self.next_internal_user_data();
             let entry = opcode::PollRemove::new(token_user_data(token))
                 .build()
                 .user_data(completion_user_data);
             self.submit_entry(entry)?;
-            self.wait_for_internal(completion_user_data)
+            let out = self.wait_for_internal(completion_user_data);
+            if out.is_ok() {
+                self.active_tokens.remove(&token);
+            }
+            out
         }
 
         pub fn wait_one(&mut self) -> Result<PollEvent, PollReactorError> {
@@ -165,6 +181,16 @@ pub mod tokio_compat {
                     return Ok(event);
                 }
             }
+        }
+
+        pub fn try_wait_one(&mut self) -> Result<Option<PollEvent>, PollReactorError> {
+            if let Some(event) = self.ready.pop_front() {
+                return Ok(Some(event));
+            }
+
+            self.ring.submit().map_err(PollReactorError::Io)?;
+            let _ = self.reap_completions(None)?;
+            Ok(self.ready.pop_front())
         }
 
         fn wait_for_internal(&mut self, internal_user_data: u64) -> Result<(), PollReactorError> {
@@ -201,10 +227,13 @@ pub mod tokio_compat {
                 }
 
                 if result >= 0 {
-                    self.ready.push_back(PollEvent {
-                        token: PollToken(user_data),
-                        mask: result as u32,
-                    });
+                    let token = PollToken(user_data);
+                    if self.active_tokens.remove(&token) {
+                        self.ready.push_back(PollEvent {
+                            token,
+                            mask: result as u32,
+                        });
+                    }
                 }
             }
 
@@ -249,6 +278,10 @@ pub mod tokio_compat {
             }
             id
         }
+
+        pub fn registered_count(&self) -> usize {
+            self.active_tokens.len()
+        }
     }
 
     fn token_user_data(token: PollToken) -> u64 {
@@ -265,13 +298,60 @@ pub mod tokio_compat {
 
     #[derive(Clone)]
     pub struct TokioPollReactor {
-        inner: Arc<Mutex<PollReactor>>,
+        inner: Arc<TokioPollReactorInner>,
+    }
+
+    struct TokioPollReactorInner {
+        cmd_tx: Sender<ReactorCmd>,
+        worker: Mutex<Option<thread::JoinHandle<()>>>,
+    }
+
+    enum ReactorCmd {
+        Register {
+            fd: RawFd,
+            interest: PollInterest,
+            reply: std_mpsc::Sender<Result<PollToken, PollReactorError>>,
+        },
+        WaitOne {
+            reply: oneshot::Sender<Result<PollEvent, PollReactorError>>,
+        },
+        DeregisterSync {
+            token: PollToken,
+            reply: std_mpsc::Sender<Result<(), PollReactorError>>,
+        },
+        DeregisterAsync {
+            token: PollToken,
+            reply: oneshot::Sender<Result<(), PollReactorError>>,
+        },
+        RegisteredCount {
+            reply: std_mpsc::Sender<usize>,
+        },
+        Shutdown,
+    }
+
+    impl Drop for TokioPollReactorInner {
+        fn drop(&mut self) {
+            let _ = self.cmd_tx.send(ReactorCmd::Shutdown);
+            if let Some(join) = self.worker.lock().expect("worker lock poisoned").take() {
+                let _ = join.join();
+            }
+        }
     }
 
     impl TokioPollReactor {
         pub fn new(entries: u32) -> Result<Self, PollReactorError> {
+            let reactor = PollReactor::new(entries)?;
+            let (cmd_tx, cmd_rx) = unbounded();
+            let worker = thread::Builder::new()
+                .name("tokio-compat-poll-reactor".to_owned())
+                .spawn(move || run_poll_reactor_worker(reactor, cmd_rx))
+                .map_err(PollReactorError::Io)?;
+
             Ok(Self {
-                inner: Arc::new(Mutex::new(PollReactor::new(entries)?)),
+                inner: Arc::new(TokioPollReactorInner {
+                    cmd_tx,
+                    worker: Mutex::new(Some(worker)),
+                }),
             })
         }
 
@@ -280,28 +360,187 @@ pub mod tokio_compat {
             fd: RawFd,
             interest: PollInterest,
         ) -> Result<PollToken, PollReactorError> {
-            let mut reactor = self.inner.lock().expect("poll reactor lock poisoned");
-            reactor.register(fd, interest)
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            self.send_cmd(ReactorCmd::Register {
+                fd,
+                interest,
+                reply: reply_tx,
+            })?;
+            reply_rx.recv().unwrap_or(Err(PollReactorError::Closed))
         }
 
         pub async fn wait_one(&self) -> Result<PollEvent, PollReactorError> {
-            let inner = self.inner.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut reactor = inner.lock().expect("poll reactor lock poisoned");
-                reactor.wait_one()
-            })
-            .await
-            .map_err(|_| PollReactorError::Closed)?
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.send_cmd(ReactorCmd::WaitOne { reply: reply_tx })?;
+            reply_rx.await.unwrap_or(Err(PollReactorError::Closed))
         }
 
         pub async fn deregister(&self, token: PollToken) -> Result<(), PollReactorError> {
-            let inner = self.inner.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut reactor = inner.lock().expect("poll reactor lock poisoned");
-                reactor.deregister(token)
-            })
-            .await
-            .map_err(|_| PollReactorError::Closed)?
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.send_cmd(ReactorCmd::DeregisterAsync {
+                token,
+                reply: reply_tx,
+            })?;
+            reply_rx.await.unwrap_or(Err(PollReactorError::Closed))
+        }
+
+        pub fn deregister_blocking(&self, token: PollToken) -> Result<(), PollReactorError> {
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            self.send_cmd(ReactorCmd::DeregisterSync {
+                token,
+                reply: reply_tx,
+            })?;
+            reply_rx.recv().unwrap_or(Err(PollReactorError::Closed))
+        }
+
+        pub fn registered_count(&self) -> usize {
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            if self
+                .send_cmd(ReactorCmd::RegisteredCount { reply: reply_tx })
+                .is_err()
+            {
+                return 0;
+            }
+            reply_rx.recv().unwrap_or(0)
+        }
+
+        fn send_cmd(&self, cmd: ReactorCmd) -> Result<(), PollReactorError> {
+            self.inner.cmd_tx.send(cmd).map_err(|_| PollReactorError::Closed)
+        }
+    }
+
+    fn run_poll_reactor_worker(mut reactor: PollReactor, cmd_rx: Receiver<ReactorCmd>) {
+        let mut waiters: VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>> =
+            VecDeque::new();
+        let mut stop = false;
+
+        while !stop {
+            if waiters.is_empty() {
+                match cmd_rx.recv() {
+                    Ok(cmd) => stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters),
+                    Err(_) => break,
+                }
+                continue;
+            }
+
+            loop {
+                match cmd_rx.try_recv() {
+                    Ok(cmd) => {
+                        stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters);
+                        if stop {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+
+            prune_closed_waiters(&mut waiters);
+            if let Err(_) = service_waiters(&mut reactor, &mut waiters) {
+                fail_waiters_closed(&mut waiters);
+                break;
+            }
+            if waiters.is_empty() {
+                continue;
+            }
+
+            match cmd_rx.recv_timeout(Duration::from_millis(1)) {
+                Ok(cmd) => {
+                    stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        fail_waiters_closed(&mut waiters);
+    }
+
+    fn handle_reactor_cmd(
+        cmd: ReactorCmd,
+        reactor: &mut PollReactor,
+        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
+    ) -> bool {
+        match cmd {
+            ReactorCmd::Register {
+                fd,
+                interest,
+                reply,
+            } => {
+                let _ = reply.send(reactor.register(fd, interest));
+                false
+            }
+            ReactorCmd::WaitOne { reply } => {
+                if reply.is_closed() {
+                    return false;
+                }
+                match reactor.try_wait_one() {
+                    Ok(Some(event)) => {
+                        let _ = reply.send(Ok(event));
+                    }
+                    Ok(None) => waiters.push_back(reply),
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+                false
+            }
+            ReactorCmd::DeregisterSync { token, reply } => {
+                let _ = reply.send(reactor.deregister(token));
+                false
+            }
+            ReactorCmd::DeregisterAsync { token, reply } => {
+                let _ = reply.send(reactor.deregister(token));
+                false
+            }
+            ReactorCmd::RegisteredCount { reply } => {
+                let _ = reply.send(reactor.registered_count());
+                false
+            }
+            ReactorCmd::Shutdown => true,
+        }
+    }
+
+    fn service_waiters(
+        reactor: &mut PollReactor,
+        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
+    ) -> Result<(), PollReactorError> {
+        loop {
+            prune_closed_waiters(waiters);
+            if waiters.is_empty() {
+                return Ok(());
+            }
+
+            let Some(event) = reactor.try_wait_one()? else {
+                return Ok(());
+            };
+
+            while let Some(waiter) = waiters.pop_front() {
+                if waiter.send(Ok(event)).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn prune_closed_waiters(
+        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
+    ) {
+        waiters.retain(|waiter| !waiter.is_closed());
+    }
+
+    fn fail_waiters_closed(
+        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
+    ) {
+        while let Some(waiter) = waiters.pop_front() {
+            let _ = waiter.send(Err(PollReactorError::Closed));
         }
     }
 }
@@ -756,6 +995,77 @@ impl TokioCompatLane {
         token: tokio_compat::PollToken,
     ) -> Result<(), tokio_compat::PollReactorError> {
         self.poll.deregister(token).await
+    }
+
+    pub async fn wait_readable(&self, fd: RawFd) -> Result<(), tokio_compat::PollReactorError> {
+        self.wait_interest(fd, tokio_compat::PollInterest::Readable)
+            .await
+    }
+
+    pub async fn wait_writable(&self, fd: RawFd) -> Result<(), tokio_compat::PollReactorError> {
+        self.wait_interest(fd, tokio_compat::PollInterest::Writable)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub fn debug_poll_registered_count(&self) -> usize {
+        self.poll.registered_count()
+    }
+
+    async fn wait_interest(
+        &self,
+        fd: RawFd,
+        interest: tokio_compat::PollInterest,
+    ) -> Result<(), tokio_compat::PollReactorError> {
+        let token = self.register(fd, interest)?;
+        let mut cleanup = PollRegistrationCleanup::new(self.clone(), token);
+
+        loop {
+            let event = self.wait_one().await?;
+            if event.token() == token {
+                cleanup.disarm();
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+struct PollRegistrationCleanup {
+    lane: TokioCompatLane,
+    token: Option<tokio_compat::PollToken>,
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl PollRegistrationCleanup {
+    fn new(lane: TokioCompatLane, token: tokio_compat::PollToken) -> Self {
+        Self {
+            lane,
+            token: Some(token),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl Drop for PollRegistrationCleanup {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let lane = self.lane.clone();
+            handle.spawn(async move {
+                let _ = lane.deregister(token).await;
+            });
+            return;
+        }
+
+        let _ = self.lane.poll.deregister_blocking(token);
     }
 }
 
