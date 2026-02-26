@@ -1,6 +1,6 @@
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 mod linux_uring_native_tests {
-    use msg_ring_runtime::{BackendKind, Runtime, RuntimeError};
+    use spargio::{BackendKind, Runtime, RuntimeError};
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;

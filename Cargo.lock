@@ -647,21 +647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "msg_ring_runtime"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "crossbeam-channel",
- "flume 0.11.1",
- "futures",
- "glommio",
- "io-uring",
- "libc",
- "slab",
- "tokio",
-]
-
-[[package]]
 name = "nanorand"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -934,6 +919,21 @@ checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "spargio"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "crossbeam-channel",
+ "flume 0.11.1",
+ "futures",
+ "glommio",
+ "io-uring",
+ "libc",
+ "slab",
+ "tokio",
 ]
 
 [[package]]

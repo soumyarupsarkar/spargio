@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use msg_ring_runtime::{Event, Runtime, ShardCtx};
+use spargio::{Event, Runtime, ShardCtx};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tokio_handle_spawn_pinned_runs_on_requested_shard() {
@@ -96,7 +96,7 @@ fn runtime_handle_is_cloneable_and_send_sync() {
     let handle = rt.handle();
     let cloned = handle.clone();
     assert_eq!(cloned.shard_count(), 1);
-    assert_send_sync::<msg_ring_runtime::RuntimeHandle>();
+    assert_send_sync::<spargio::RuntimeHandle>();
     let join = cloned.spawn_pinned(0, async { 1u8 }).expect("spawn");
     let out = block_on(join).expect("join");
     assert_eq!(out, 1u8);

@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use msg_ring_runtime::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx};
+use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {

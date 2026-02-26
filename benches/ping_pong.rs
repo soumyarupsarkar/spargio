@@ -2,7 +2,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use futures::executor::block_on;
-use msg_ring_runtime::{BackendKind, Event, Runtime, ShardCtx};
+use spargio::{BackendKind, Event, Runtime, ShardCtx};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -35,8 +35,8 @@ enum MsgRingCmd {
 struct MsgRingHarness {
     runtime: Runtime,
     cmd_tx: mpsc::UnboundedSender<MsgRingCmd>,
-    client_join: Option<msg_ring_runtime::JoinHandle<()>>,
-    responder_join: Option<msg_ring_runtime::JoinHandle<()>>,
+    client_join: Option<spargio::JoinHandle<()>>,
+    responder_join: Option<spargio::JoinHandle<()>>,
 }
 
 impl MsgRingHarness {
@@ -627,7 +627,7 @@ impl Drop for GlommioHarness {
     }
 }
 
-fn run_msg_ring_cold(rounds: usize, backend: BackendKind) {
+fn run_spargio_cold(rounds: usize, backend: BackendKind) {
     let mut harness = MsgRingHarness::new(backend).expect("runtime harness");
     black_box(harness.ping_pong(rounds));
 }
@@ -648,14 +648,14 @@ fn bench_steady_ping_pong(c: &mut Criterion) {
 
     let mut queue = MsgRingHarness::new(BackendKind::Queue).expect("queue harness");
     black_box(queue.ping_pong(16));
-    group.bench_function("msg_ring_runtime_queue", |b| {
+    group.bench_function("spargio_queue", |b| {
         b.iter(|| black_box(queue.ping_pong(RTT_ROUNDS)))
     });
 
     #[cfg(target_os = "linux")]
     if let Some(mut uring) = MsgRingHarness::new(BackendKind::IoUring) {
         black_box(uring.ping_pong(16));
-        group.bench_function("msg_ring_runtime_io_uring", |b| {
+        group.bench_function("spargio_io_uring", |b| {
             b.iter(|| black_box(uring.ping_pong(RTT_ROUNDS)))
         });
     }
@@ -683,7 +683,7 @@ fn bench_steady_one_way(c: &mut Criterion) {
 
     let mut queue = MsgRingHarness::new(BackendKind::Queue).expect("queue harness");
     black_box(queue.one_way(64));
-    group.bench_function("msg_ring_runtime_queue", |b| {
+    group.bench_function("spargio_queue", |b| {
         b.iter(|| black_box(queue.one_way(ONE_WAY_ROUNDS)))
     });
 
@@ -691,7 +691,7 @@ fn bench_steady_one_way(c: &mut Criterion) {
     if let Some(mut uring) = MsgRingHarness::new_with_ring_entries(BackendKind::IoUring, Some(4096))
     {
         black_box(uring.one_way(64));
-        group.bench_function("msg_ring_runtime_io_uring", |b| {
+        group.bench_function("spargio_io_uring", |b| {
             b.iter(|| black_box(uring.one_way(ONE_WAY_ROUNDS)))
         });
     }
@@ -729,14 +729,14 @@ fn bench_steady_one_way(c: &mut Criterion) {
 fn bench_cold_start_ping_pong(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_start_ping_pong");
 
-    group.bench_function("msg_ring_runtime_queue", |b| {
-        b.iter(|| run_msg_ring_cold(COLD_ROUNDS, BackendKind::Queue))
+    group.bench_function("spargio_queue", |b| {
+        b.iter(|| run_spargio_cold(COLD_ROUNDS, BackendKind::Queue))
     });
 
     #[cfg(target_os = "linux")]
     if MsgRingHarness::new(BackendKind::IoUring).is_some() {
-        group.bench_function("msg_ring_runtime_io_uring", |b| {
-            b.iter(|| run_msg_ring_cold(COLD_ROUNDS, BackendKind::IoUring))
+        group.bench_function("spargio_io_uring", |b| {
+            b.iter(|| run_spargio_cold(COLD_ROUNDS, BackendKind::IoUring))
         });
     }
 

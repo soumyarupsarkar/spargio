@@ -56,7 +56,7 @@ impl DiskFixture {
             .expect("time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "msg_ring_runtime_disk_bench_{}_{}.dat",
+            "spargio_disk_bench_{}_{}.dat",
             process::id(),
             unique
         ));

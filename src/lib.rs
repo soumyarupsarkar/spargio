@@ -599,7 +599,7 @@ impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self {
             shards: std::thread::available_parallelism().map_or(1, usize::from),
-            thread_prefix: "msg-ring-shard".to_owned(),
+            thread_prefix: "spargio-shard".to_owned(),
             idle_wait: Duration::from_millis(1),
             backend: BackendKind::Queue,
             ring_entries: 256,

@@ -18,7 +18,7 @@ Repository state at start of this log:
 ### Runtime crate
 
 - Created crate:
-  - `msg_ring_runtime`
+  - `spargio`
 - Implemented a sharded runtime with:
   - `RuntimeBuilder`, `Runtime`, `ShardCtx`, `RemoteShard`
   - `spawn_on` and `spawn_local`
@@ -65,7 +65,7 @@ Executed and passing:
 
 Short benchmark sample run completed:
 
-- `msg_ring_runtime`: ~1.62 ms (sample config)
+- `spargio`: ~1.62 ms (sample config)
 - `tokio_unbounded_channel`: ~1.53 ms (sample config)
 - `glommio_simple`: ~3.77–4.47 ms (with `glommio-bench`)
 
@@ -123,8 +123,8 @@ Implemented after the snapshot above:
 ### Benchmarks updated
 
 - `benches/ping_pong.rs` now benchmarks:
-  - `msg_ring_runtime_queue`
-  - `msg_ring_runtime_io_uring` (only when backend init succeeds)
+  - `spargio_queue`
+  - `spargio_io_uring` (only when backend init succeeds)
   - `tokio_unbounded_channel`
   - `glommio_simple` (with `glommio-bench` feature)
 
@@ -135,8 +135,8 @@ Validation:
 
 Quick benchmark sample (short run config):
 
-- `msg_ring_runtime_queue`: ~1.66-1.70 ms
-- `msg_ring_runtime_io_uring`: ~0.60-0.72 ms
+- `spargio_queue`: ~1.66-1.70 ms
+- `spargio_io_uring`: ~0.60-0.72 ms
 - `tokio_unbounded_channel`: ~1.49-1.58 ms
 - `glommio_simple`: ~4.05-4.85 ms
 
@@ -159,7 +159,7 @@ Implemented to improve comparability and isolate what is being measured:
   - per-round request/ack round-trip latency over persistent workers.
 - `steady_one_way_send_drain`:
   - repeated one-way sends followed by a flush barrier ack.
-  - for `msg_ring_runtime`, this now uses a bounded send-ticket window (`SEND_WINDOW=64`) to avoid fully serial per-send awaiting while preserving backpressure.
+  - for `spargio`, this now uses a bounded send-ticket window (`SEND_WINDOW=64`) to avoid fully serial per-send awaiting while preserving backpressure.
   - for Tokio/Glommio channel sends, send completion is synchronous enqueue.
 - `cold_start_ping_pong`:
   - includes harness/runtime construction and teardown each iteration.
@@ -212,11 +212,11 @@ Implemented next optimization wave:
 
 ### Current quick sample numbers (50ms warmup/50ms measure)
 
-- `steady_ping_pong_rtt/msg_ring_runtime_queue`: ~`1.47-1.51 ms`
-- `steady_ping_pong_rtt/msg_ring_runtime_io_uring`: ~`336-348 us`
+- `steady_ping_pong_rtt/spargio_queue`: ~`1.47-1.51 ms`
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`336-348 us`
 - `steady_ping_pong_rtt/tokio_two_worker`: ~`1.21-1.34 ms`
-- `steady_one_way_send_drain/msg_ring_runtime_queue`: ~`1.25-1.27 ms`
-- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`232-234 us`
+- `steady_one_way_send_drain/spargio_queue`: ~`1.25-1.27 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`232-234 us`
 - `steady_one_way_send_drain/tokio_two_worker`: ~`69-71 us`
 
 ## Update: Fast-Path Checklist Pass (Current)
@@ -271,14 +271,14 @@ Requested optimization checklist from the prior analysis and status:
 
 ### Latest quick benchmark sample (50ms warmup/50ms measure)
 
-- `steady_ping_pong_rtt/msg_ring_runtime_queue`: ~`1.36-1.39 ms`
-- `steady_ping_pong_rtt/msg_ring_runtime_io_uring`: ~`365-370 us`
+- `steady_ping_pong_rtt/spargio_queue`: ~`1.36-1.39 ms`
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`365-370 us`
 - `steady_ping_pong_rtt/tokio_two_worker`: ~`1.23-1.31 ms`
-- `steady_one_way_send_drain/msg_ring_runtime_queue`: ~`1.23-1.25 ms`
-- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`62.8-64.5 us`
+- `steady_one_way_send_drain/spargio_queue`: ~`1.23-1.25 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`62.8-64.5 us`
 - `steady_one_way_send_drain/tokio_two_worker`: ~`69.0-72.7 us`
-- `cold_start_ping_pong/msg_ring_runtime_queue`: ~`2.39-2.40 ms`
-- `cold_start_ping_pong/msg_ring_runtime_io_uring`: ~`255-276 us`
+- `cold_start_ping_pong/spargio_queue`: ~`2.39-2.40 ms`
+- `cold_start_ping_pong/spargio_io_uring`: ~`255-276 us`
 - `cold_start_ping_pong/tokio_two_worker`: ~`453-484 us`
 
 ## Update: Tokio Batched One-Way Controls
@@ -296,7 +296,7 @@ Implementation notes:
 
 Quick sample (50ms warmup/50ms measure):
 
-- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`64.2-65.4 us`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`64.2-65.4 us`
 - `steady_one_way_send_drain/tokio_two_worker`: ~`83.7-96.0 us`
 - `steady_one_way_send_drain/tokio_two_worker_batched_64`: ~`23.3-25.3 us`
 - `steady_one_way_send_drain/tokio_two_worker_batched_all`: ~`14.9-15.7 us`

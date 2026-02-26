@@ -1,7 +1,7 @@
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 mod linux_tokio_runtime_lane_tests {
-    use msg_ring_runtime::tokio_compat::{PollInterest, PollReactorError};
-    use msg_ring_runtime::{Event, Runtime, ShardCtx};
+    use spargio::tokio_compat::{PollInterest, PollReactorError};
+    use spargio::{Event, Runtime, ShardCtx};
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
