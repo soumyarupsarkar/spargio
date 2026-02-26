@@ -949,6 +949,13 @@ pub struct TokioCompatLane {
 }
 
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+#[derive(Clone)]
+pub struct CompatFd {
+    lane: TokioCompatLane,
+    fd: RawFd,
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 impl TokioCompatLane {
     pub fn backend(&self) -> BackendKind {
         self.handle.backend()
@@ -976,6 +983,13 @@ impl TokioCompatLane {
         T: Send + 'static,
     {
         self.handle.spawn_stealable(fut)
+    }
+
+    pub fn compat_fd(&self, fd: RawFd) -> CompatFd {
+        CompatFd {
+            lane: self.clone(),
+            fd,
+        }
     }
 
     pub fn register(
@@ -1027,6 +1041,21 @@ impl TokioCompatLane {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl CompatFd {
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    pub async fn readable(&self) -> Result<(), tokio_compat::PollReactorError> {
+        self.lane.wait_readable(self.fd).await
+    }
+
+    pub async fn writable(&self) -> Result<(), tokio_compat::PollReactorError> {
+        self.lane.wait_writable(self.fd).await
     }
 }
 

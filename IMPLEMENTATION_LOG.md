@@ -415,6 +415,127 @@ Validation:
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
 
+## Current Status: Tokio-Uring Alternative Scope
+
+Snapshot of what is implemented vs remaining for the target architecture (`msg_ring` + poll-compat + work-stealing + native fast lane):
+
+### Implemented
+
+- Core `msg_ring` runtime and Linux `io_uring` backend.
+- Tokio interop handle APIs:
+  - `Runtime::handle()`
+  - `spawn_pinned(...)`
+  - `spawn_stealable(...)` (current policy: round-robin placement).
+- `tokio-compat` lane scaffold:
+  - `PollReactor` (`IORING_OP_POLL_ADD` / `IORING_OP_POLL_REMOVE`)
+  - async `TokioPollReactor`
+  - `TokioCompatLane` via `RuntimeHandle::tokio_compat_lane(...)`
+  - lane readiness helpers: `wait_readable(fd)`, `wait_writable(fd)`.
+- Cancellation cleanup and active-token tracking for poll registrations.
+- TDD coverage for all above in:
+  - `tokio_compat_tdd.rs`
+  - `tokio_poll_reactor_tdd.rs`
+  - `tokio_poll_async_tdd.rs`
+  - `tokio_runtime_lane_tdd.rs`
+  - `tokio_runtime_wait_tdd.rs`
+
+### Remaining
+
+- True work-stealing scheduler:
+  - per-worker deque + global injector + steal loop (not implemented yet).
+- Submission-time stealing/placement policy for native I/O work (not implemented yet).
+- Poll-compat path integrated into shard driver with `msg_ring` doorbells:
+  - current poll path uses dedicated reactor worker thread + command channel.
+- `uring-native` fast lane:
+  - feature flag exists, but native async API surface is not implemented yet.
+- Tokio-like compatibility wrappers (`AsyncRead`/`AsyncWrite`) are not implemented yet.
+- Full stress/race suite for rearm/cancel/drop edge cases under load is not complete yet.
+- Compat-vs-native and mixed-load stealing benchmark suite is not complete yet.
+
+## Proposed Sequence: Functional Slices First
+
+Priority order to ship usable slices earlier:
+
+1. Compat ergonomics slice:
+   - stabilize `tokio-compat` lane ergonomics and add simple compatibility wrappers.
+2. Native fast-lane MVP:
+   - add first `uring-native` read/write APIs with pinned submission.
+3. Mixed-mode app slice:
+   - make compat and native lanes easy to combine in one app.
+4. Submission-time placement policies:
+   - add `round_robin`, `sticky`, and explicit shard placement options.
+5. True work-stealing scheduler:
+   - introduce per-worker deque + global injector + steal loop for stealable tasks.
+6. Poll path re-home to shard driver:
+   - move poll processing into shard driver path with `msg_ring` wakeups.
+7. Hardening and benchmark gate slice:
+   - race stress tests + mixed-load benchmark gates.
+
+User stories unlocked after each slice:
+
+1. After compat ergonomics:
+   - migrate Tokio readiness-style code with minimal rewrites.
+2. After native fast-lane MVP:
+   - move only hot I/O paths to native `io_uring` APIs.
+3. After mixed-mode:
+   - run compatibility code and native ops side by side.
+4. After placement policies:
+   - control locality/load-balance at submission time.
+5. After true work-stealing:
+   - auto-balance CPU/control tasks while keeping I/O ring-affine.
+6. After poll re-home:
+   - reduce poll-path overhead without API changes.
+7. After hardening/bench gates:
+   - rely on correctness/perf regression protection in CI.
+
+## User Stories Already Possible
+
+With current implementation, users can already:
+
+1. Build and run a sharded runtime with queue or Linux `io_uring` backend.
+2. Send typed/raw shard-to-shard messages and await sender tickets.
+3. Use no-ticket batched message sends and explicit flush barriers.
+4. Spawn pinned or round-robin stealable tasks from Tokio tasks via `RuntimeHandle`.
+5. Create a `tokio-compat` lane and use poll registration (`POLL_ADD`/`POLL_REMOVE`) through:
+   - direct poll API (`register`, `wait_one`, `deregister`)
+   - lane helpers (`wait_readable`, `wait_writable`).
+6. Cancel readiness waits without leaking poll registrations (covered by tests).
+7. Benchmark message RTT/one-way/cold-start and run a first disk I/O RTT comparison harness.
+
+## Update: Compat Ergonomics Slice (TDD)
+
+Implemented the next functional slice aimed at easier migration ergonomics for readiness-style code.
+
+### Red phase
+
+Added failing tests in `tests/tokio_compat_fd_tdd.rs` (`cfg(all(feature = "tokio-compat", target_os = "linux"))`) for:
+
+- lane-scoped compatibility FD wrapper creation.
+- wrapper `writable().await` and `readable().await` behavior.
+- wrapper cloneability and FD identity access.
+
+### Green phase
+
+Implemented in `src/lib.rs`:
+
+- New `CompatFd` type (`Clone`) under `tokio-compat`:
+  - stores `TokioCompatLane` + `RawFd`.
+- New lane factory:
+  - `TokioCompatLane::compat_fd(fd) -> CompatFd`
+- Wrapper methods:
+  - `fd()`
+  - `readable().await`
+  - `writable().await`
+
+This reuses the lane's cancellation-safe wait logic and poll token cleanup.
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.
+
 ## Update: Async Tokio Poll Wrapper (TDD)
 
 Added a Tokio-usable async wrapper over the `POLL_ADD` scaffold to allow direct use from Tokio tasks.
