@@ -16,6 +16,7 @@ const SHUTDOWN_TAG: u16 = 9;
 const RTT_ROUNDS: usize = 256;
 const ONE_WAY_ROUNDS: usize = 2048;
 const COLD_ROUNDS: usize = 64;
+const TOKIO_BATCH_SIZE: usize = 64;
 
 enum MsgRingCmd {
     PingPong {
@@ -219,6 +220,7 @@ impl Drop for MsgRingHarness {
 enum TokioWire {
     Ping(u32),
     OneWay(u32),
+    OneWayBatch(Vec<u32>),
     Flush,
     Shutdown,
 }
@@ -235,6 +237,11 @@ enum TokioCmd {
     },
     OneWay {
         rounds: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    OneWayBatched {
+        rounds: usize,
+        batch: usize,
         reply: std_mpsc::Sender<u64>,
     },
     Shutdown {
@@ -276,6 +283,11 @@ impl TokioHarness {
                                 }
                                 TokioWire::OneWay(v) => {
                                     one_way_acc = one_way_acc.wrapping_add(v);
+                                }
+                                TokioWire::OneWayBatch(batch) => {
+                                    for v in batch {
+                                        one_way_acc = one_way_acc.wrapping_add(v);
+                                    }
                                 }
                                 TokioWire::Flush => {
                                     if ack_tx.send(TokioAck::Flush(one_way_acc)).is_err() {
@@ -323,6 +335,41 @@ impl TokioHarness {
                                 };
                                 let _ = reply.send(sum);
                             }
+                            TokioCmd::OneWayBatched {
+                                rounds,
+                                batch,
+                                reply,
+                            } => {
+                                let batch = batch.max(1);
+                                let mut chunk = Vec::with_capacity(batch.min(rounds.max(1)));
+                                for i in 0..(rounds as u32) {
+                                    chunk.push(i);
+                                    if chunk.len() == batch {
+                                        wire_tx
+                                            .send(TokioWire::OneWayBatch(std::mem::take(
+                                                &mut chunk,
+                                            )))
+                                            .expect("wire one-way batch");
+                                    }
+                                }
+                                if !chunk.is_empty() {
+                                    wire_tx
+                                        .send(TokioWire::OneWayBatch(chunk))
+                                        .expect("wire one-way final batch");
+                                }
+
+                                wire_tx.send(TokioWire::Flush).expect("wire flush");
+                                let sum = loop {
+                                    match ack_rx.recv().await {
+                                        Some(TokioAck::Flush(v)) => {
+                                            break u64::from(v);
+                                        }
+                                        Some(TokioAck::Ping(_)) => {}
+                                        None => break 0,
+                                    }
+                                };
+                                let _ = reply.send(sum);
+                            }
                             TokioCmd::Shutdown { reply } => {
                                 let _ = wire_tx.send(TokioWire::Shutdown);
                                 let _ = responder.await;
@@ -353,6 +400,18 @@ impl TokioHarness {
         let (tx, rx) = std_mpsc::channel();
         self.cmd_tx
             .send(TokioCmd::OneWay { rounds, reply: tx })
+            .expect("send command");
+        rx.recv().expect("recv reply")
+    }
+
+    fn one_way_batched(&mut self, rounds: usize, batch: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(TokioCmd::OneWayBatched {
+                rounds,
+                batch,
+                reply: tx,
+            })
             .expect("send command");
         rx.recv().expect("recv reply")
     }
@@ -641,6 +700,18 @@ fn bench_steady_one_way(c: &mut Criterion) {
     black_box(tokio.one_way(64));
     group.bench_function("tokio_two_worker", |b| {
         b.iter(|| black_box(tokio.one_way(ONE_WAY_ROUNDS)))
+    });
+
+    let mut tokio_batched = TokioHarness::new();
+    black_box(tokio_batched.one_way_batched(64, TOKIO_BATCH_SIZE));
+    group.bench_function("tokio_two_worker_batched_64", |b| {
+        b.iter(|| black_box(tokio_batched.one_way_batched(ONE_WAY_ROUNDS, TOKIO_BATCH_SIZE)))
+    });
+
+    let mut tokio_batched_all = TokioHarness::new();
+    black_box(tokio_batched_all.one_way_batched(64, 64));
+    group.bench_function("tokio_two_worker_batched_all", |b| {
+        b.iter(|| black_box(tokio_batched_all.one_way_batched(ONE_WAY_ROUNDS, ONE_WAY_ROUNDS)))
     });
 
     #[cfg(all(target_os = "linux", feature = "glommio-bench"))]

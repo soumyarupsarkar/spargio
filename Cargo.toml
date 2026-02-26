@@ -24,3 +24,7 @@ glommio-bench = ["dep:glommio"]
 [[bench]]
 name = "ping_pong"
 harness = false
+
+[[bench]]
+name = "disk_io"
+harness = false

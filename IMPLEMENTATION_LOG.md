@@ -280,3 +280,63 @@ Requested optimization checklist from the prior analysis and status:
 - `cold_start_ping_pong/msg_ring_runtime_queue`: ~`2.39-2.40 ms`
 - `cold_start_ping_pong/msg_ring_runtime_io_uring`: ~`255-276 us`
 - `cold_start_ping_pong/tokio_two_worker`: ~`453-484 us`
+
+## Update: Tokio Batched One-Way Controls
+
+To make the one-way comparison fairer, added additional Tokio benchmarks that batch payloads before crossing threads:
+
+- `steady_one_way_send_drain/tokio_two_worker_batched_64`
+- `steady_one_way_send_drain/tokio_two_worker_batched_all`
+
+Implementation notes:
+
+- Added `TokioWire::OneWayBatch(Vec<u32>)`.
+- Added `TokioCmd::OneWayBatched { rounds, batch, reply }`.
+- Existing `tokio_two_worker` remains unchanged as the per-message baseline.
+
+Quick sample (50ms warmup/50ms measure):
+
+- `steady_one_way_send_drain/msg_ring_runtime_io_uring`: ~`64.2-65.4 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`83.7-96.0 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_64`: ~`23.3-25.3 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_all`: ~`14.9-15.7 us`
+
+Interpretation:
+
+- The previous Tokio gap was largely due to per-send cross-thread signaling overhead, not an inherent runtime scheduler limit.
+- With batching, Tokio is substantially faster on this one-way synthetic workload.
+
+## Update: Disk IO Benchmark (4K Read RTT)
+
+Added a dedicated disk benchmark:
+
+- New bench target:
+  - `benches/disk_io.rs`
+- Cargo bench config:
+  - `[[bench]] name = "disk_io" harness = false`
+
+### Benchmark shape
+
+- Persistent fixture file:
+  - 16 MiB (`4096 * 4 KiB`) temp file under system temp dir.
+- Metric:
+  - `disk_read_rtt_4k` (per-iteration round-trip for `256` 4 KiB reads).
+- Compared paths:
+  - `tokio_two_worker_pread`
+    - two-worker Tokio runtime
+    - request/ack over Tokio unbounded channels
+    - worker performs `pread` (`FileExt::read_at`)
+  - `io_uring_msg_ring_two_ring_pread` (Linux)
+    - two rings (`client` + `worker`)
+    - request/ack over `IORING_OP_MSG_RING`
+    - worker performs `IORING_OP_READ` and replies via `msg_ring`
+
+### Quick sample (50ms warmup/50ms measure)
+
+- `disk_read_rtt_4k/tokio_two_worker_pread`: ~`1.71-1.91 ms`
+- `disk_read_rtt_4k/io_uring_msg_ring_two_ring_pread`: ~`2.64-3.09 ms`
+
+### Notes
+
+- This first disk RTT harness is not yet optimized for io_uring throughput; it is currently request/ack serialized and favors simplicity/debuggability.
+- VFS work is still present for both paths; `io_uring` changes submission/completion mechanics, not filesystem lookup/permission/page-cache semantics.
