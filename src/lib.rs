@@ -35,6 +35,234 @@ const IOURING_SUBMIT_BATCH: usize = 64;
 #[cfg(target_os = "linux")]
 const DOORBELL_TAG: u16 = u16::MAX;
 
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+pub mod tokio_compat {
+    use io_uring::{IoUring, opcode, types};
+    use std::collections::VecDeque;
+    use std::os::fd::RawFd;
+
+    const INTERNAL_USER_BIT: u64 = 1 << 63;
+    const TOKEN_USER_MASK: u64 = !INTERNAL_USER_BIT;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct PollToken(u64);
+
+    impl PollToken {
+        pub fn raw(self) -> u64 {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PollInterest {
+        Readable,
+        Writable,
+        ReadWrite,
+    }
+
+    impl PollInterest {
+        fn mask(self) -> u32 {
+            match self {
+                Self::Readable => libc::POLLIN as u32,
+                Self::Writable => libc::POLLOUT as u32,
+                Self::ReadWrite => (libc::POLLIN | libc::POLLOUT) as u32,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PollEvent {
+        token: PollToken,
+        mask: u32,
+    }
+
+    impl PollEvent {
+        pub fn token(self) -> PollToken {
+            self.token
+        }
+
+        pub fn mask(self) -> u32 {
+            self.mask
+        }
+
+        pub fn is_readable(self) -> bool {
+            (self.mask & libc::POLLIN as u32) != 0
+        }
+
+        pub fn is_writable(self) -> bool {
+            (self.mask & libc::POLLOUT as u32) != 0
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum PollReactorError {
+        Io(std::io::Error),
+        NotFound,
+        Closed,
+    }
+
+    impl PartialEq for PollReactorError {
+        fn eq(&self, other: &Self) -> bool {
+            matches!(
+                (self, other),
+                (Self::NotFound, Self::NotFound) | (Self::Closed, Self::Closed)
+            )
+        }
+    }
+
+    impl Eq for PollReactorError {}
+
+    pub struct PollReactor {
+        ring: IoUring,
+        next_token: u64,
+        next_internal: u64,
+        ready: VecDeque<PollEvent>,
+    }
+
+    impl PollReactor {
+        pub fn new(entries: u32) -> Result<Self, PollReactorError> {
+            let ring = IoUring::new(entries.max(1)).map_err(PollReactorError::Io)?;
+            Ok(Self {
+                ring,
+                next_token: 1,
+                next_internal: 1,
+                ready: VecDeque::new(),
+            })
+        }
+
+        pub fn register(
+            &mut self,
+            fd: RawFd,
+            interest: PollInterest,
+        ) -> Result<PollToken, PollReactorError> {
+            let token = self.next_poll_token();
+            let entry = opcode::PollAdd::new(types::Fd(fd), interest.mask())
+                .build()
+                .user_data(token_user_data(token));
+            self.submit_entry(entry)?;
+            Ok(token)
+        }
+
+        pub fn deregister(&mut self, token: PollToken) -> Result<(), PollReactorError> {
+            let completion_user_data = self.next_internal_user_data();
+            let entry = opcode::PollRemove::new(token_user_data(token))
+                .build()
+                .user_data(completion_user_data);
+            self.submit_entry(entry)?;
+            self.wait_for_internal(completion_user_data)
+        }
+
+        pub fn wait_one(&mut self) -> Result<PollEvent, PollReactorError> {
+            if let Some(event) = self.ready.pop_front() {
+                return Ok(event);
+            }
+
+            loop {
+                self.ring.submit_and_wait(1).map_err(PollReactorError::Io)?;
+                let _ = self.reap_completions(None)?;
+                if let Some(event) = self.ready.pop_front() {
+                    return Ok(event);
+                }
+            }
+        }
+
+        fn wait_for_internal(&mut self, internal_user_data: u64) -> Result<(), PollReactorError> {
+            loop {
+                self.ring.submit_and_wait(1).map_err(PollReactorError::Io)?;
+                if let Some(result) = self.reap_completions(Some(internal_user_data))? {
+                    return match result {
+                        0 => Ok(()),
+                        r if r == -libc::ENOENT => Err(PollReactorError::NotFound),
+                        r if r < 0 => Err(PollReactorError::Io(std::io::Error::from_raw_os_error(
+                            -r,
+                        ))),
+                        _ => Ok(()),
+                    };
+                }
+            }
+        }
+
+        fn reap_completions(
+            &mut self,
+            internal_target: Option<u64>,
+        ) -> Result<Option<i32>, PollReactorError> {
+            let mut internal_result = None;
+            let mut cq = self.ring.completion();
+            for cqe in &mut cq {
+                let user_data = cqe.user_data();
+                let result = cqe.result();
+
+                if is_internal_user_data(user_data) {
+                    if Some(user_data) == internal_target {
+                        internal_result = Some(result);
+                    }
+                    continue;
+                }
+
+                if result >= 0 {
+                    self.ready.push_back(PollEvent {
+                        token: PollToken(user_data),
+                        mask: result as u32,
+                    });
+                }
+            }
+
+            Ok(internal_result)
+        }
+
+        fn submit_entry(
+            &mut self,
+            entry: io_uring::squeue::Entry,
+        ) -> Result<(), PollReactorError> {
+            self.push_entry(entry)?;
+            self.ring.submit().map_err(PollReactorError::Io)?;
+            Ok(())
+        }
+
+        fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), PollReactorError> {
+            for _ in 0..2 {
+                let mut sq = self.ring.submission();
+                if unsafe { sq.push(&entry) }.is_ok() {
+                    return Ok(());
+                }
+                drop(sq);
+                self.ring.submit().map_err(PollReactorError::Io)?;
+            }
+            Err(PollReactorError::Closed)
+        }
+
+        fn next_poll_token(&mut self) -> PollToken {
+            let token = PollToken(self.next_token);
+            self.next_token = self.next_token.wrapping_add(1) & TOKEN_USER_MASK;
+            if self.next_token == 0 {
+                self.next_token = 1;
+            }
+            token
+        }
+
+        fn next_internal_user_data(&mut self) -> u64 {
+            let id = internal_user_data(self.next_internal);
+            self.next_internal = self.next_internal.wrapping_add(1);
+            if self.next_internal == 0 {
+                self.next_internal = 1;
+            }
+            id
+        }
+    }
+
+    fn token_user_data(token: PollToken) -> u64 {
+        token.0 & TOKEN_USER_MASK
+    }
+
+    fn internal_user_data(id: u64) -> u64 {
+        INTERNAL_USER_BIT | (id & TOKEN_USER_MASK)
+    }
+
+    fn is_internal_user_data(user_data: u64) -> bool {
+        (user_data & INTERNAL_USER_BIT) != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     RingMsg { from: ShardId, tag: u16, val: u32 },

@@ -374,3 +374,43 @@ Validation:
 
 - `cargo test` passes (including new `tokio_compat_tdd` tests).
 - `cargo bench --no-run` passes.
+
+## Update: Tokio-Compat POLL_ADD Reactor Scaffold (TDD)
+
+Implemented the first compatibility-reactor scaffold behind feature gating.
+
+### Red phase
+
+Added failing tests in `tests/tokio_poll_reactor_tdd.rs` (`cfg(all(feature = "tokio-compat", target_os = "linux"))`) for:
+
+- `PollReactor::register(..., PollInterest::Readable)` receives readable event.
+- `PollReactor::deregister(token)` returns `NotFound` on second deregister.
+- Token uniqueness across registrations.
+
+### Green phase
+
+Implemented new module in `src/lib.rs`:
+
+- `tokio_compat` (Linux + feature gated):
+  - `PollReactor`
+  - `PollInterest`
+  - `PollToken`
+  - `PollEvent`
+  - `PollReactorError`
+- Uses `IORING_OP_POLL_ADD` for registration and `IORING_OP_POLL_REMOVE` for deregistration.
+- Includes minimal completion routing and internal completion tagging for deterministic deregister behavior.
+
+Cargo feature updates (`Cargo.toml`):
+
+- Added features:
+  - `tokio-compat`
+  - `uring-native`
+- Added Linux dependency:
+  - `libc`
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.

@@ -15,11 +15,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 [target.'cfg(target_os = "linux")'.dependencies]
 glommio = { version = "0.9", optional = true }
 io-uring = "0.7.11"
+libc = "0.2"
 slab = "0.4"
 
 [features]
 default = []
 glommio-bench = ["dep:glommio"]
+tokio-compat = []
+uring-native = []
 
 [[bench]]
 name = "ping_pong"
