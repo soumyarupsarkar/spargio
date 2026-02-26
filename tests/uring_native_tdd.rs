@@ -129,6 +129,74 @@ mod linux_uring_native_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_bound_file_supports_read_at_into_reuse() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let path = unique_temp_path("uring-native-read-into");
+        let mut file = File::create(&path).expect("create file");
+        file.write_all(b"0123456789").expect("seed data");
+        drop(file);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open file");
+        let lane = rt.handle().uring_native_lane(0).expect("native lane");
+        let bound = lane.bind_file(file);
+
+        let (got, buf) = bound
+            .read_at_into(2, vec![0u8; 4])
+            .await
+            .expect("read_at_into");
+        assert_eq!(got, 4);
+        assert_eq!(&buf[..4], b"2345");
+
+        let (got2, buf2) = bound
+            .read_at_into(6, buf)
+            .await
+            .expect("read_at_into reuse");
+        assert_eq!(got2, 4);
+        assert_eq!(&buf2[..4], b"6789");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_bound_file_session_supports_repeated_reads() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let path = unique_temp_path("uring-native-file-session");
+        let mut file = File::create(&path).expect("create file");
+        file.write_all(b"abcdefghij").expect("seed data");
+        drop(file);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open file");
+        let lane = rt.handle().uring_native_lane(0).expect("native lane");
+        let bound = lane.bind_file(file);
+        let session = bound.start_file_session().expect("file session");
+
+        let first = session.read_at(0, 4).await.expect("first read");
+        assert_eq!(&first, b"abcd");
+
+        let (got, buf) = session
+            .read_at_into(6, vec![0u8; 4])
+            .await
+            .expect("second read");
+        assert_eq!(got, 4);
+        assert_eq!(&buf[..4], b"ghij");
+
+        session.shutdown().await.expect("session shutdown");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uring_bound_tcp_stream_supports_send_and_recv() {
         let Some(rt) = try_build_io_uring_runtime() else {
             return;

@@ -4,6 +4,10 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use futures::StreamExt;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -976,12 +980,132 @@ pub struct UringRecvMultishotSegments {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+enum UringFileSessionCmd {
+    ReadAtInto {
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone)]
+pub struct UringFileSession {
+    shard: ShardId,
+    tx: mpsc::UnboundedSender<UringFileSessionCmd>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl UringFileSession {
+    pub fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    pub async fn read_at_into(
+        &self,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .unbounded_send(UringFileSessionCmd::ReadAtInto {
+                offset,
+                buf,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "file session command channel closed",
+                )
+            })?;
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "file session read response channel closed",
+            ))
+        })
+    }
+
+    pub async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let (read_len, mut buf) = self.read_at_into(offset, vec![0; len]).await?;
+        buf.truncate(read_len.min(buf.len()));
+        Ok(buf)
+    }
+
+    pub async fn shutdown(self) -> std::io::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .unbounded_send(UringFileSessionCmd::Shutdown { ack: ack_tx })
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "file session command channel closed",
+                )
+            })?;
+        ack_rx.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "file session shutdown ack channel closed",
+            )
+        })
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 impl UringNativeLane {
     pub fn shard(&self) -> ShardId {
         self.shard
     }
 
     pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let (read_len, mut buf) = self.read_at_into(fd, offset, vec![0; len]).await?;
+        buf.truncate(read_len.min(buf.len()));
+        Ok(buf)
+    }
+
+    pub async fn read_at_into(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        let mut pending_buf = Some(buf);
+        if let Some(reply_rx) = {
+            let maybe_ctx = ShardCtx::current().filter(|ctx| {
+                ctx.runtime_id() == self.handle.inner.shared.runtime_id
+                    && ctx.shard_id() == self.shard
+            });
+            maybe_ctx.map(|ctx| {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeReadOwned {
+                        origin_shard: ctx.shard_id(),
+                        fd,
+                        offset,
+                        buf: pending_buf
+                            .take()
+                            .expect("native read pending buffer must exist"),
+                        reply: reply_tx,
+                    },
+                );
+                reply_rx
+            })
+        } {
+            return reply_rx.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native read response channel closed",
+                ))
+            });
+        }
+
+        let buf = pending_buf
+            .take()
+            .expect("native read pending buffer must exist");
         let join = self
             .handle
             .spawn_pinned(self.shard, async move {
@@ -994,11 +1118,11 @@ impl UringNativeLane {
                     })?;
                     let (reply_tx, reply_rx) = oneshot::channel();
                     ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeRead {
+                        LocalCommand::SubmitNativeReadOwned {
                             origin_shard: ctx.shard_id(),
                             fd,
                             offset,
-                            len,
+                            buf,
                             reply: reply_tx,
                         },
                     );
@@ -1490,6 +1614,14 @@ impl UringBoundFd {
         self.lane.read_at(self.raw_fd(), offset, len).await
     }
 
+    pub async fn read_at_into(
+        &self,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        self.lane.read_at_into(self.raw_fd(), offset, buf).await
+    }
+
     pub async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
         self.lane.write_at(self.raw_fd(), offset, buf).await
     }
@@ -1562,6 +1694,26 @@ impl UringBoundFd {
 
     pub async fn fsync(&self) -> std::io::Result<()> {
         self.lane.fsync(self.raw_fd()).await
+    }
+
+    pub fn start_file_session(&self) -> Result<UringFileSession, RuntimeError> {
+        let (tx, mut rx) = mpsc::unbounded::<UringFileSessionCmd>();
+        let bound = self.clone();
+        let shard = self.shard();
+        self.lane.handle.spawn_pinned(shard, async move {
+            while let Some(cmd) = rx.next().await {
+                match cmd {
+                    UringFileSessionCmd::ReadAtInto { offset, buf, reply } => {
+                        let _ = reply.send(bound.read_at_into(offset, buf).await);
+                    }
+                    UringFileSessionCmd::Shutdown { ack } => {
+                        let _ = ack.send(());
+                        break;
+                    }
+                }
+            }
+        })?;
+        Ok(UringFileSession { shard, tx })
     }
 }
 
@@ -2243,6 +2395,14 @@ enum LocalCommand {
         reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeReadOwned {
+        origin_shard: ShardId,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeWrite {
         origin_shard: ShardId,
         fd: RawFd,
@@ -2476,6 +2636,41 @@ impl ShardBackend {
             }
             Self::IoUring(driver) => {
                 let _ = driver.submit_native_read(fd, offset, len, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_read_owned(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring read violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring read requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_read_owned(fd, offset, buf, reply);
             }
         }
     }
@@ -2716,6 +2911,10 @@ enum NativeIoOp {
     Read {
         buf: Vec<u8>,
         reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    },
+    ReadOwned {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
     },
     Write {
         buf: Vec<u8>,
@@ -2991,6 +3190,44 @@ impl IoUringDriver {
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Read { buf, .. }) => buf.as_mut_ptr(),
             _ => unreachable!("native read op kind mismatch"),
+        };
+
+        let entry = opcode::Read::new(types::Fd(fd), buf_ptr, len_u32)
+            .offset(offset)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_read_owned(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+    ) -> Result<(), SendError> {
+        let Ok(len_u32) = u32::try_from(buf.len()) else {
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native read length exceeds u32::MAX",
+            )));
+            return Ok(());
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::ReadOwned { buf, reply });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+
+        let buf_ptr = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::ReadOwned { buf, .. }) => buf.as_mut_ptr(),
+            _ => unreachable!("native read-owned op kind mismatch"),
         };
 
         let entry = opcode::Read::new(types::Fd(fd), buf_ptr, len_u32)
@@ -3598,6 +3835,12 @@ impl IoUringDriver {
                         "native io_uring read failed",
                     )));
                 }
+                NativeIoOp::ReadOwned { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring read failed",
+                    )));
+                }
                 NativeIoOp::Write { reply, .. } => {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -3655,6 +3898,12 @@ impl IoUringDriver {
         for (_, op) in ops {
             match op {
                 NativeIoOp::Read { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring read canceled",
+                    )));
+                }
+                NativeIoOp::ReadOwned { reply, .. } => {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring read canceled",
@@ -4036,6 +4285,13 @@ impl IoUringDriver {
                 let read_len = result as usize;
                 buf.truncate(read_len);
                 let _ = reply.send(Ok(buf));
+            }
+            NativeIoOp::ReadOwned { buf, reply } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok((result as usize, buf)));
             }
             NativeIoOp::Write { reply, .. } => {
                 if result < 0 {
@@ -4483,6 +4739,22 @@ fn drain_local_commands(
                 len,
                 reply,
             } => backend.submit_native_read(shard_id, origin_shard, fd, offset, len, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeReadOwned {
+                origin_shard,
+                fd,
+                offset,
+                buf,
+                reply,
+            } => backend.submit_native_read_owned(
+                shard_id,
+                origin_shard,
+                fd,
+                offset,
+                buf,
+                reply,
+                stats,
+            ),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeWrite {
                 origin_shard,

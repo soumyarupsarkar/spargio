@@ -1902,3 +1902,113 @@ Interpretation:
 
 - stream-throughput gap narrowed further and is now close to parity in this short-run harness.
 - RTT lead for Spargio remains.
+
+## Implementation: fs RTT (`qd=1`) optimization batch (items 1-3)
+
+Implemented the requested three-item set for `fs_read_rtt_4k`.
+
+### 1) Run Spargio FS loops inside pinned runtime worker
+
+`benches/fs_api.rs`:
+
+- replaced external `block_on` Spargio loop with a pinned worker command loop (`SpargioFsCmd`).
+- `ReadRtt` and `ReadQd` now execute on shard `1` in the runtime task itself.
+- benchmark caller uses std mpsc request/reply to drive the worker, mirroring Tokio harness structure more closely.
+
+### 2) Reusable read buffer API (`read_at_into`)
+
+`src/lib.rs`:
+
+- added:
+  - `UringNativeLane::read_at_into(fd, offset, buf)`
+  - `UringBoundFd::read_at_into(offset, buf)`
+- `read_at(...)` now adapts through `read_at_into(...)`.
+- added native read-owned command path:
+  - `LocalCommand::SubmitNativeReadOwned`
+  - backend routing `submit_native_read_owned(...)`
+  - driver submission `submit_native_read_owned(...)`
+  - native op state `NativeIoOp::ReadOwned`
+- completion and failure handling updated for `ReadOwned`.
+
+### 3) Persistent file session API (actor-style)
+
+`src/lib.rs`:
+
+- added `UringFileSession`:
+  - `read_at_into(...)`
+  - `read_at(...)`
+  - `shutdown(...)`
+  - `shard()`
+- new constructor on bound fd:
+  - `UringBoundFd::start_file_session()`
+- session is implemented as a pinned shard task with command channel (`UringFileSessionCmd`), keeping repeated file operations on one shard.
+
+### Red/Green TDD
+
+Added failing tests first, then implemented until green:
+
+- `uring_bound_file_supports_read_at_into_reuse`
+- `uring_bound_file_session_supports_repeated_reads`
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest FS benchmark snapshot after this batch
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.62-1.73 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`0.99-1.01 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`7.59-7.75 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`5.74-6.27 ms`
+
+Interpretation:
+
+- `qd=1` RTT moved from slower-than-Tokio to faster-than-Tokio in this short-run harness.
+- throughput lead at `qd=32` remains.
+
+## Proposal: unbound submission-time steering for all native ops
+
+Goal:
+
+- allow stealable tasks to issue native ops without pre-pinning a lane, while selecting target shard at submission time.
+
+Design slices:
+
+1. Unbound native entrypoint:
+   - add `RuntimeHandle::uring_native_unbound() -> UringNativeAny`.
+   - expose all native ops (`read/write/fsync`, `send/recv`, batch, multishot) on `UringNativeAny`.
+2. Lane selector:
+   - introduce `NativeLaneSelector` using per-shard pending native-op depth + round-robin tie-break.
+   - support optional locality hints (`preferred_shard`).
+3. FD affinity lease table:
+   - add `FdAffinityTable` (`fd -> shard`) with TTL/release on idle.
+   - use weak leases for file ops, stronger leases for stream/socket ops, hard affinity for multishot lifetime.
+4. Generic native command envelope:
+   - add `SubmitNativeAny { op, reply }` and route to selected shard.
+   - preserve local fast path when selected shard == current shard.
+5. Op-family behavior:
+   - file single-shot ops steerable per op,
+   - stream single-shot ops steerable with lease-aware ordering,
+   - batch ops single-lane per batch,
+   - multishot fixed-lane for op lifetime (token/stream tied to owning lane).
+6. Cancellation/timeouts:
+   - add global `op_id -> shard` tracking for correct cancel routing.
+   - keep resource cleanup on owning lane.
+7. TDD rollout:
+   - slice A: unbound file ops + selector correctness/distribution tests.
+   - slice B: unbound stream single-shot + batch ordering tests.
+   - slice C: unbound multishot lifecycle/cancel/cleanup tests.
+   - slice D: benchmark variants (`*_unbound_*`) vs pinned/session APIs.
+
+Recommendation:
+
+- yes, this is worth doing, but as a phased effort.
+- rationale:
+  - it preserves explicit pinned/session fast paths while adding flexible scheduler-friendly mode for stealable compute tasks.
+  - it unlocks broader ergonomics without forcing users to choose one affinity model globally.
+- risk:
+  - correctness complexity is non-trivial (lease ownership, cancellation routing, multishot lifetime rules), so TDD slice gating is required.

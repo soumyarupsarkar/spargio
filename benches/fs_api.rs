@@ -1,6 +1,10 @@
 #[cfg(unix)]
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+use futures::StreamExt;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use futures::channel::mpsc;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 use futures::executor::block_on;
 #[cfg(unix)]
 use futures::future::join_all;
@@ -213,10 +217,26 @@ async fn tokio_read_at(file: Arc<File>, block: u32) -> u64 {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+enum SpargioFsCmd {
+    ReadRtt {
+        rounds: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    ReadQd {
+        rounds: usize,
+        qd: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    Shutdown {
+        reply: std_mpsc::Sender<()>,
+    },
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 struct SpargioFsHarness {
     runtime: Runtime,
-    bound: spargio::UringBoundFd,
-    blocks: u32,
+    cmd_tx: mpsc::UnboundedSender<SpargioFsCmd>,
+    worker_join: Option<spargio::JoinHandle<()>>,
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -246,62 +266,107 @@ impl SpargioFsHarness {
             .open(path)
             .expect("open fixture");
         let bound = lane.bind_file(file);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioFsCmd>();
+        let worker_join = runtime
+            .spawn_on(1, async move {
+                let mut rtt_buf = vec![0u8; BLOCK_SIZE];
+                while let Some(cmd) = cmd_rx.next().await {
+                    match cmd {
+                        SpargioFsCmd::ReadRtt { rounds, reply } => {
+                            let mut checksum = 0u64;
+                            for i in 0..rounds {
+                                let block = (i as u32) % blocks;
+                                let offset = u64::from(block) * BLOCK_SIZE as u64;
+                                let buf = std::mem::take(&mut rtt_buf);
+                                let (got, returned) =
+                                    bound.read_at_into(offset, buf).await.expect("read_at_into");
+                                rtt_buf = returned;
+                                assert_eq!(got, BLOCK_SIZE, "short read in spargio bench");
+                                checksum =
+                                    checksum.wrapping_add(u64::from(block) ^ u64::from(rtt_buf[0]));
+                            }
+                            let _ = reply.send(checksum);
+                        }
+                        SpargioFsCmd::ReadQd { rounds, qd, reply } => {
+                            let mut checksum = 0u64;
+                            let mut next = 0usize;
+                            while next < rounds {
+                                let batch = (rounds - next).min(qd.max(1));
+                                let mut reads = Vec::with_capacity(batch);
+                                for offset in 0..batch {
+                                    let block = ((next + offset) as u32) % blocks;
+                                    let bound = bound.clone();
+                                    reads.push(async move {
+                                        let off = u64::from(block) * BLOCK_SIZE as u64;
+                                        let bytes =
+                                            bound.read_at(off, BLOCK_SIZE).await.expect("read_at");
+                                        assert_eq!(
+                                            bytes.len(),
+                                            BLOCK_SIZE,
+                                            "short read in spargio bench"
+                                        );
+                                        u64::from(block) ^ u64::from(bytes[0])
+                                    });
+                                }
+                                for value in join_all(reads).await {
+                                    checksum = checksum.wrapping_add(value);
+                                }
+                                next += batch;
+                            }
+                            let _ = reply.send(checksum);
+                        }
+                        SpargioFsCmd::Shutdown { reply } => {
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
         Some(Self {
             runtime,
-            bound,
-            blocks,
+            cmd_tx,
+            worker_join: Some(worker_join),
         })
     }
 
     fn read_rtt(&mut self, rounds: usize) -> u64 {
-        let bound = self.bound.clone();
-        let blocks = self.blocks;
-        block_on(async move {
-            let mut checksum = 0u64;
-            for i in 0..rounds {
-                let block = (i as u32) % blocks;
-                let offset = u64::from(block) * BLOCK_SIZE as u64;
-                let bytes = bound.read_at(offset, BLOCK_SIZE).await.expect("read_at");
-                assert_eq!(bytes.len(), BLOCK_SIZE, "short read in spargio bench");
-                checksum = checksum.wrapping_add(u64::from(block) ^ u64::from(bytes[0]));
-            }
-            checksum
-        })
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioFsCmd::ReadRtt { rounds, reply: tx })
+            .expect("send spargio rtt cmd");
+        rx.recv().expect("spargio rtt reply")
     }
 
     fn read_qd(&mut self, rounds: usize, qd: usize) -> u64 {
-        let bound = self.bound.clone();
-        let blocks = self.blocks;
-        block_on(async move {
-            let mut checksum = 0u64;
-            let mut next = 0usize;
-            while next < rounds {
-                let batch = (rounds - next).min(qd.max(1));
-                let mut reads = Vec::with_capacity(batch);
-                for offset in 0..batch {
-                    let block = ((next + offset) as u32) % blocks;
-                    let bound = bound.clone();
-                    reads.push(async move {
-                        let off = u64::from(block) * BLOCK_SIZE as u64;
-                        let bytes = bound.read_at(off, BLOCK_SIZE).await.expect("read_at");
-                        assert_eq!(bytes.len(), BLOCK_SIZE, "short read in spargio bench");
-                        u64::from(block) ^ u64::from(bytes[0])
-                    });
-                }
-                for value in join_all(reads).await {
-                    checksum = checksum.wrapping_add(value);
-                }
-                next += batch;
-            }
-            checksum
-        })
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioFsCmd::ReadQd {
+                rounds,
+                qd,
+                reply: tx,
+            })
+            .expect("send spargio qd cmd");
+        rx.recv().expect("spargio qd reply")
+    }
+
+    fn shutdown(&mut self) {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self
+            .cmd_tx
+            .unbounded_send(SpargioFsCmd::Shutdown { reply: tx });
+        let _ = rx.recv();
+        if let Some(join) = self.worker_join.take() {
+            let _ = block_on(join);
+        }
+        let _ = &self.runtime;
     }
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 impl Drop for SpargioFsHarness {
     fn drop(&mut self) {
-        let _ = &self.runtime;
+        self.shutdown();
     }
 }
 
