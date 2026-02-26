@@ -14,6 +14,8 @@ use spargio::{BackendKind, Runtime, RuntimeError};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::sync::mpsc as std_mpsc;
 #[cfg(unix)]
@@ -502,6 +504,242 @@ impl Drop for SpargioNetHarness {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct SpargioNetUnboundHarness {
+    runtime: Runtime,
+    cmd_tx: mpsc::UnboundedSender<SpargioNetCmd>,
+    worker_join: Option<spargio::JoinHandle<()>>,
+    echo_thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct SpargioWindowedSessionAny {
+    payload_len: usize,
+    window: usize,
+    recv: Vec<u8>,
+    tx_pool: Vec<Vec<u8>>,
+    multishot_supported: bool,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl SpargioWindowedSessionAny {
+    fn new(payload_len: usize, window: usize) -> Self {
+        let window = window.max(1);
+        Self {
+            payload_len: payload_len.max(1),
+            window,
+            recv: vec![0u8; THROUGHPUT_RECV_SCRATCH],
+            tx_pool: (0..window).map(|_| vec![0u8; payload_len.max(1)]).collect(),
+            multishot_supported: true,
+        }
+    }
+
+    fn matches(&self, payload_len: usize, window: usize) -> bool {
+        self.payload_len == payload_len.max(1) && self.window == window.max(1)
+    }
+
+    async fn run_windowed(
+        &mut self,
+        native_any: &spargio::UringNativeAny,
+        fd: std::os::fd::RawFd,
+        frames: usize,
+    ) -> u64 {
+        let mut checksum = 0u64;
+        let mut next = 0usize;
+        while next < frames {
+            let batch = (frames - next).min(self.window);
+            let mut send_batch = Vec::with_capacity(batch);
+            for idx in 0..batch {
+                let mut buf = self
+                    .tx_pool
+                    .pop()
+                    .unwrap_or_else(|| vec![0u8; self.payload_len]);
+                buf[0] = (next + idx) as u8;
+                send_batch.push(buf);
+            }
+            let (_sent, mut returned) = native_any
+                .send_all_batch(fd, send_batch, batch)
+                .await
+                .expect("send_all_batch");
+            self.tx_pool.append(&mut returned);
+
+            let mut remaining = batch * self.payload_len;
+            if self.multishot_supported {
+                let buffer_count = ((batch * 2).max(4)).min(u16::MAX as usize) as u16;
+                match native_any
+                    .recv_multishot_segments(fd, self.payload_len, buffer_count, remaining)
+                    .await
+                {
+                    Ok(multishot) => {
+                        for seg in multishot.segments {
+                            let end = seg
+                                .offset
+                                .saturating_add(seg.len)
+                                .min(multishot.buffer.len());
+                            if seg.offset < end {
+                                checksum =
+                                    checksum.wrapping_add(u64::from(multishot.buffer[seg.offset]));
+                                remaining = remaining.saturating_sub(end - seg.offset);
+                                if remaining == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let raw = err.raw_os_error().unwrap_or_default();
+                        if raw == libc::EINVAL || raw == libc::ENOSYS || raw == libc::EOPNOTSUPP {
+                            self.multishot_supported = false;
+                        } else {
+                            panic!("recv_multishot_segments failed unexpectedly: {err}");
+                        }
+                    }
+                }
+            }
+
+            while remaining > 0 {
+                let recv_buf = std::mem::take(&mut self.recv);
+                let (got, returned) = native_any.recv_owned(fd, recv_buf).await.expect("recv");
+                self.recv = returned;
+                if got == 0 {
+                    panic!("spargio stream closed during throughput receive");
+                }
+                checksum = checksum.wrapping_add(u64::from(self.recv[0]));
+                remaining = remaining.saturating_sub(got);
+            }
+            next += batch;
+        }
+        checksum
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl SpargioNetUnboundHarness {
+    fn new() -> Option<Self> {
+        let runtime = match Runtime::builder()
+            .backend(BackendKind::IoUring)
+            .shards(2)
+            .io_uring_throughput_mode(None)
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(RuntimeError::IoUringInit(_)) => match Runtime::builder()
+                .backend(BackendKind::IoUring)
+                .shards(2)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(RuntimeError::IoUringInit(_)) => return None,
+                Err(err) => panic!("unexpected runtime init error: {err:?}"),
+            },
+            Err(err) => panic!("unexpected runtime init error: {err:?}"),
+        };
+
+        let native_any = runtime.handle().uring_native_unbound().ok()?;
+        let (client, echo_thread) = spawn_echo_peer(true, "bench-net-echo-spargio-unbound");
+        let fd = client.as_raw_fd();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioNetCmd>();
+        let handle = runtime.handle();
+        let worker_join = handle
+            .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), async move {
+                let _stream_guard = client;
+                let mut windowed_session: Option<SpargioWindowedSessionAny> = None;
+                while let Some(cmd) = cmd_rx.next().await {
+                    match cmd {
+                        SpargioNetCmd::EchoRtt {
+                            rounds,
+                            payload,
+                            reply,
+                        } => {
+                            let value =
+                                spargio_echo_rtt_unbound(&native_any, fd, rounds, payload).await;
+                            let _ = reply.send(value);
+                        }
+                        SpargioNetCmd::EchoWindowed {
+                            frames,
+                            payload,
+                            window,
+                            reply,
+                        } => {
+                            if !windowed_session
+                                .as_ref()
+                                .is_some_and(|session| session.matches(payload, window))
+                            {
+                                windowed_session =
+                                    Some(SpargioWindowedSessionAny::new(payload, window));
+                            }
+                            let value = windowed_session
+                                .as_mut()
+                                .expect("windowed session")
+                                .run_windowed(&native_any, fd, frames)
+                                .await;
+                            let _ = reply.send(value);
+                        }
+                        SpargioNetCmd::Shutdown { reply } => {
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            runtime,
+            cmd_tx,
+            worker_join: Some(worker_join),
+            echo_thread: Some(echo_thread),
+        })
+    }
+
+    fn echo_rtt(&mut self, rounds: usize, payload_len: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioNetCmd::EchoRtt {
+                rounds,
+                payload: payload_len,
+                reply: tx,
+            })
+            .expect("send spargio unbound rtt cmd");
+        rx.recv().expect("spargio unbound rtt reply")
+    }
+
+    fn echo_windowed(&mut self, frames: usize, payload_len: usize, window: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioNetCmd::EchoWindowed {
+                frames,
+                payload: payload_len,
+                window,
+                reply: tx,
+            })
+            .expect("send spargio unbound windowed cmd");
+        rx.recv().expect("spargio unbound windowed reply")
+    }
+
+    fn shutdown(&mut self) {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self
+            .cmd_tx
+            .unbounded_send(SpargioNetCmd::Shutdown { reply: tx });
+        let _ = rx.recv();
+        if let Some(join) = self.worker_join.take() {
+            let _ = block_on(join);
+        }
+        if let Some(join) = self.echo_thread.take() {
+            let _ = join.join();
+        }
+        let _ = &self.runtime;
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl Drop for SpargioNetUnboundHarness {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 async fn spargio_echo_rtt(bound: &spargio::UringBoundFd, rounds: usize, payload_len: usize) -> u64 {
     let mut payload = vec![0u8; payload_len.max(1)];
     let mut recv = vec![0u8; payload_len.max(1)];
@@ -575,6 +813,91 @@ async fn uring_recv_exact_owned(
     Ok(dst)
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_rtt_unbound(
+    native_any: &spargio::UringNativeAny,
+    fd: std::os::fd::RawFd,
+    rounds: usize,
+    payload_len: usize,
+) -> u64 {
+    let mut payload = vec![0u8; payload_len.max(1)];
+    let mut recv = vec![0u8; payload_len.max(1)];
+    let mut checksum = 0u64;
+
+    for i in 0..rounds {
+        payload[0] = i as u8;
+        payload = uring_send_all_owned_unbound(native_any, fd, payload)
+            .await
+            .expect("send");
+        recv = uring_recv_exact_owned_unbound(native_any, fd, recv)
+            .await
+            .expect("recv");
+        checksum = checksum.wrapping_add(u64::from(recv[0]));
+    }
+
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn uring_send_all_owned_unbound(
+    native_any: &spargio::UringNativeAny,
+    fd: std::os::fd::RawFd,
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let mut sent = 0usize;
+    while sent < buf.len() {
+        if sent == 0 {
+            let (wrote, returned) = native_any.send_owned(fd, buf).await?;
+            buf = returned;
+            if wrote == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "zero-length send",
+                ));
+            }
+            sent += wrote;
+        } else {
+            let wrote = native_any.send(fd, &buf[sent..]).await?;
+            if wrote == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "zero-length send",
+                ));
+            }
+            sent += wrote;
+        }
+    }
+    Ok(buf)
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn uring_recv_exact_owned_unbound(
+    native_any: &spargio::UringNativeAny,
+    fd: std::os::fd::RawFd,
+    mut dst: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let mut received = 0usize;
+    let mut first_byte = None;
+    while received < dst.len() {
+        let (got, returned) = native_any.recv_owned(fd, dst).await?;
+        dst = returned;
+        if got == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream closed",
+            ));
+        }
+        if first_byte.is_none() {
+            first_byte = Some(dst[0]);
+        }
+        received += got;
+    }
+    if let Some(b) = first_byte {
+        dst[0] = b;
+    }
+    Ok(dst)
+}
+
 #[cfg(unix)]
 fn bench_net_echo_rtt(c: &mut Criterion) {
     let mut group = c.benchmark_group("net_echo_rtt_256b");
@@ -591,6 +914,14 @@ fn bench_net_echo_rtt(c: &mut Criterion) {
         black_box(spargio.echo_rtt(32, RTT_PAYLOAD));
         group.bench_function("spargio_uring_bound_tcp_qd1", |b| {
             b.iter(|| black_box(spargio.echo_rtt(RTT_ROUNDS, RTT_PAYLOAD)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio_unbound) = SpargioNetUnboundHarness::new() {
+        black_box(spargio_unbound.echo_rtt(32, RTT_PAYLOAD));
+        group.bench_function("spargio_uring_unbound_tcp_qd1", |b| {
+            b.iter(|| black_box(spargio_unbound.echo_rtt(RTT_ROUNDS, RTT_PAYLOAD)))
         });
     }
 
@@ -622,6 +953,20 @@ fn bench_net_stream_throughput(c: &mut Criterion) {
         group.bench_function("spargio_uring_bound_tcp_window32", |b| {
             b.iter(|| {
                 black_box(spargio.echo_windowed(
+                    THROUGHPUT_FRAMES,
+                    THROUGHPUT_FRAME_BYTES,
+                    THROUGHPUT_WINDOW,
+                ))
+            })
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio_unbound) = SpargioNetUnboundHarness::new() {
+        black_box(spargio_unbound.echo_windowed(128, THROUGHPUT_FRAME_BYTES, THROUGHPUT_WINDOW));
+        group.bench_function("spargio_uring_unbound_tcp_window32", |b| {
+            b.iter(|| {
+                black_box(spargio_unbound.echo_windowed(
                     THROUGHPUT_FRAMES,
                     THROUGHPUT_FRAME_BYTES,
                     THROUGHPUT_WINDOW,

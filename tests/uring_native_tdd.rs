@@ -31,6 +31,18 @@ mod linux_uring_native_tests {
         }
     }
 
+    fn try_build_io_uring_runtime_shards(shards: usize) -> Option<Runtime> {
+        match Runtime::builder()
+            .shards(shards)
+            .backend(BackendKind::IoUring)
+            .build()
+        {
+            Ok(rt) => Some(rt),
+            Err(RuntimeError::IoUringInit(_)) => None,
+            Err(err) => panic!("unexpected runtime init error: {err:?}"),
+        }
+    }
+
     #[test]
     fn uring_native_lane_requires_io_uring_backend() {
         let rt = Runtime::builder()
@@ -42,6 +54,36 @@ mod linux_uring_native_tests {
             Ok(_) => panic!("expected unsupported backend error"),
             Err(err) => assert!(matches!(err, RuntimeError::UnsupportedBackend(_))),
         }
+    }
+
+    #[test]
+    fn uring_native_unbound_requires_io_uring_backend() {
+        let rt = Runtime::builder()
+            .shards(1)
+            .backend(BackendKind::Queue)
+            .build()
+            .expect("runtime");
+        match rt.handle().uring_native_unbound() {
+            Ok(_) => panic!("expected unsupported backend error"),
+            Err(err) => assert!(matches!(err, RuntimeError::UnsupportedBackend(_))),
+        }
+    }
+
+    #[test]
+    fn uring_native_unbound_selector_distributes_when_depths_equal() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let native_any = rt.handle().uring_native_unbound().expect("native any");
+        let mut hits = [0usize; 2];
+        for _ in 0..16 {
+            let shard = native_any.select_shard(None).expect("select shard");
+            if let Some(slot) = hits.get_mut(usize::from(shard)) {
+                *slot += 1;
+            }
+        }
+        assert!(hits[0] > 0, "expected shard 0 to be selected");
+        assert!(hits[1] > 0, "expected shard 1 to be selected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -498,5 +540,151 @@ mod linux_uring_native_tests {
         assert_eq!(wrote, 2);
         let got = bound.recv(2).await.expect("recv");
         assert_eq!(&got, b"cd");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_file_ops_work() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let path = unique_temp_path("uring-native-any-file");
+        let mut file = File::create(&path).expect("create");
+        file.write_all(b"abcde12345").expect("seed");
+        drop(file);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        let fd = file.as_raw_fd();
+        let any = rt.handle().uring_native_unbound().expect("native any");
+
+        let got = any.read_at(fd, 0, 5).await.expect("read");
+        assert_eq!(&got, b"abcde");
+
+        let wrote = any.write_at(fd, 5, b"XYZ").await.expect("write");
+        assert_eq!(wrote, 3);
+        any.fsync(fd).await.expect("fsync");
+
+        let check = any.read_at(fd, 0, 10).await.expect("read all");
+        assert_eq!(&check, b"abcdeXYZ45");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_stream_ops_preserve_affinity_and_order() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept");
+
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let fd = server.as_raw_fd();
+        let mut client_rx = client.try_clone().expect("clone");
+        let mut client_tx = client;
+        let io_thread = std::thread::spawn(move || {
+            client_tx.write_all(b"ping").expect("client write");
+            let mut got = [0u8; 4];
+            client_rx.read_exact(&mut got).expect("client read");
+            got
+        });
+
+        let (received, recv_buf) = any.recv_owned(fd, vec![0u8; 4]).await.expect("recv");
+        assert_eq!(received, 4);
+        assert_eq!(&recv_buf[..4], b"ping");
+
+        let (sent, returned) = any
+            .send_all_batch(fd, vec![b"po".to_vec(), b"ng".to_vec()], 2)
+            .await
+            .expect("send all batch");
+        assert_eq!(sent, 4);
+        assert_eq!(returned.len(), 2);
+
+        let affinity = any.fd_affinity_shard(fd);
+        assert!(affinity.is_some(), "expected stream fd affinity lease");
+
+        let echoed = io_thread.join().expect("join io");
+        assert_eq!(&echoed, b"pong");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_multishot_releases_hard_affinity_after_completion() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept");
+        let fd = server.as_raw_fd();
+        let any = rt.handle().uring_native_unbound().expect("native any");
+
+        let sender = std::thread::spawn(move || {
+            client.write_all(b"multishot-data").expect("client write");
+        });
+
+        let out = match any.recv_multishot_segments(fd, 1024, 8, 14).await {
+            Ok(out) => out,
+            Err(err) => {
+                let raw = err.raw_os_error().unwrap_or_default();
+                if raw == libc::EINVAL || raw == libc::ENOSYS || raw == libc::EOPNOTSUPP {
+                    let _ = sender.join();
+                    return;
+                }
+                panic!("recv_multishot_segments failed unexpectedly: {err}");
+            }
+        };
+        let _ = sender.join();
+        assert!(!out.segments.is_empty(), "expected at least one segment");
+        assert_eq!(
+            any.fd_affinity_shard(fd),
+            None,
+            "hard multishot affinity should be released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_tracks_active_op_routes_for_inflight_work() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept");
+        let fd = server.as_raw_fd();
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let recv_any = any.clone();
+
+        let recv_task = tokio::spawn(async move { recv_any.recv(fd, 4).await.expect("recv") });
+
+        let mut seen_active = false;
+        for _ in 0..50 {
+            if any.active_native_op_count() > 0 {
+                seen_active = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            seen_active,
+            "expected active unbound op route while recv is pending"
+        );
+
+        client.write_all(b"done").expect("send payload");
+        let out = recv_task.await.expect("recv join");
+        assert_eq!(&out, b"done");
+
+        for _ in 0..50 {
+            if any.active_native_op_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("expected active op routes to drain to zero");
     }
 }

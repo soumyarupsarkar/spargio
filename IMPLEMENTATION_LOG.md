@@ -2012,3 +2012,114 @@ Recommendation:
   - it unlocks broader ergonomics without forcing users to choose one affinity model globally.
 - risk:
   - correctness complexity is non-trivial (lease ownership, cancellation routing, multishot lifetime rules), so TDD slice gating is required.
+
+## Implementation: unbound submission-time steering (slices A-D)
+
+Implemented the full unbound slice set in this pass.
+
+### Slice A: unbound entrypoint + selector + file ops
+
+`src/lib.rs`:
+
+- added `RuntimeHandle::uring_native_unbound() -> UringNativeAny`.
+- added `NativeLaneSelector`:
+  - selection by per-shard pending native-op depth (`pending_native_ops_by_shard`) with round-robin tie-break.
+  - optional preferred-shard hinting.
+- added `UringNativeAny` API surface for native ops:
+  - `read_at`, `read_at_into`, `write_at`, `fsync`
+  - plus stream/batch/multishot methods (below).
+- added FD affinity lease table (`FdAffinityTable`):
+  - weak lease for file-family ops,
+  - strong lease for stream single-shot/batch,
+  - hard lease for multishot lifetime.
+- added unbound op-route tracking:
+  - global `NativeOpId` allocation and `op_id -> shard` map.
+  - `active_native_op_count()` / `active_native_op_shard(...)` observability.
+
+Stats:
+
+- `RuntimeStats` now includes `pending_native_ops_by_shard`.
+- io_uring driver now updates both global pending-native count and per-shard pending-native depth.
+
+### Slice B: stream single-shot + batch behavior
+
+`UringNativeAny` now supports:
+
+- `recv`, `recv_owned`, `recv_into`
+- `send`, `send_owned`
+- `send_batch`, `send_all_batch`
+- `recv_batch_into`
+
+Behavior:
+
+- stream ops are lease-aware (`strong` lease), preserving lane-local ordering tendencies for repeated ops on the same FD.
+- batch ops run single-lane per batch.
+
+### Slice C: multishot lifecycle + cleanup
+
+`UringNativeAny` now supports:
+
+- `recv_multishot`
+- `recv_multishot_segments`
+
+Behavior:
+
+- multishot uses `hard` FD affinity for operation lifetime.
+- affinity is released when multishot completes.
+- op-route map entries are added/removed around each unbound op, preserving ownership tracking.
+
+### Slice D: benchmark variants (`*_unbound_*`)
+
+`benches/fs_api.rs`:
+
+- added `SpargioFsUnboundHarness`.
+- added benchmark cases:
+  - `spargio_uring_unbound_file_qd1`
+  - `spargio_uring_unbound_file_qd32`
+
+`benches/net_api.rs`:
+
+- added `SpargioNetUnboundHarness`.
+- added benchmark cases:
+  - `spargio_uring_unbound_tcp_qd1`
+  - `spargio_uring_unbound_tcp_window32`
+
+### Red/Green TDD
+
+Added failing tests first in `tests/uring_native_tdd.rs`, then implemented to green:
+
+- `uring_native_unbound_requires_io_uring_backend`
+- `uring_native_unbound_selector_distributes_when_depths_equal`
+- `uring_native_unbound_file_ops_work`
+- `uring_native_unbound_stream_ops_preserve_affinity_and_order`
+- `uring_native_unbound_multishot_releases_hard_affinity_after_completion`
+- `uring_native_unbound_tracks_active_op_routes_for_inflight_work`
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest short-run benchmark snapshot
+
+FS:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.55-1.68 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`1.03-1.07 ms`
+- `fs_read_rtt_4k/spargio_uring_unbound_file_qd1`: ~`1.01-1.03 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`8.55-8.70 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`5.93-6.68 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_unbound_file_qd32`: ~`6.57-7.38 ms`
+
+Net:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.74-7.97 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`5.48-5.75 ms`
+- `net_echo_rtt_256b/spargio_uring_unbound_tcp_qd1`: ~`7.64-8.04 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.69-11.17 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`11.09-11.33 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_unbound_tcp_window32`: ~`10.83-10.99 ms`

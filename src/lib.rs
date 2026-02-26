@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -40,6 +42,8 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 
 pub type ShardId = u16;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+pub type NativeOpId = u64;
 const EXTERNAL_SENDER: ShardId = ShardId::MAX;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +59,12 @@ const NATIVE_OP_USER_BIT: u64 = 1 << 63;
 const NATIVE_HOUSEKEEPING_USER_BIT: u64 = 1 << 62;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_BATCH_PART_USER_BIT: u64 = 1 << 61;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const NATIVE_WEAK_AFFINITY_TTL: Duration = Duration::from_millis(0);
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const NATIVE_STRONG_AFFINITY_TTL: Duration = Duration::from_millis(200);
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const NATIVE_HARD_AFFINITY_TTL: Duration = Duration::from_secs(5);
 
 pub mod boundary {
     use core::future::Future;
@@ -450,6 +460,7 @@ pub enum TaskPlacement {
 #[derive(Debug, Clone)]
 pub struct RuntimeStats {
     pub shard_command_depths: Vec<usize>,
+    pub pending_native_ops_by_shard: Vec<usize>,
     pub spawn_pinned_submitted: u64,
     pub spawn_stealable_submitted: u64,
     pub stealable_executed: u64,
@@ -630,6 +641,8 @@ impl RuntimeBuilder {
             stealable_inboxes: stealable_inboxes.clone(),
             stealable_queue_capacity: self.stealable_queue_capacity,
             stats: stats.clone(),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            native_unbound: Arc::new(NativeUnboundState::new()),
         });
         let remotes: Vec<RemoteShard> = (0..self.shards)
             .map(|i| RemoteShard {
@@ -955,6 +968,548 @@ impl RuntimeHandle {
             handle: self.clone(),
             shard,
         })
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    pub fn uring_native_unbound(&self) -> Result<UringNativeAny, RuntimeError> {
+        if self.backend() != BackendKind::IoUring {
+            return Err(RuntimeError::UnsupportedBackend(
+                "uring-native requires io_uring backend",
+            ));
+        }
+        Ok(UringNativeAny {
+            handle: self.clone(),
+            selector: NativeLaneSelector {
+                shared: self.inner.shared.clone(),
+            },
+            preferred_shard: None,
+        })
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NativeAffinityStrength {
+    Weak,
+    Strong,
+    Hard,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Debug, Clone, Copy)]
+struct FdAffinityLease {
+    shard: ShardId,
+    strength: NativeAffinityStrength,
+    expires_at: Instant,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct FdAffinityTable {
+    entries: HashMap<RawFd, FdAffinityLease>,
+    weak_ttl: Duration,
+    strong_ttl: Duration,
+    hard_ttl: Duration,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl FdAffinityTable {
+    fn new(weak_ttl: Duration, strong_ttl: Duration, hard_ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            weak_ttl,
+            strong_ttl,
+            hard_ttl,
+        }
+    }
+
+    fn ttl_for(&self, strength: NativeAffinityStrength) -> Duration {
+        match strength {
+            NativeAffinityStrength::Weak => self.weak_ttl,
+            NativeAffinityStrength::Strong => self.strong_ttl,
+            NativeAffinityStrength::Hard => self.hard_ttl,
+        }
+    }
+
+    fn get_active(&mut self, fd: RawFd, now: Instant) -> Option<FdAffinityLease> {
+        let lease = self.entries.get(&fd).copied()?;
+        if now <= lease.expires_at {
+            return Some(lease);
+        }
+        self.entries.remove(&fd);
+        None
+    }
+
+    fn upsert(
+        &mut self,
+        fd: RawFd,
+        shard: ShardId,
+        strength: NativeAffinityStrength,
+        now: Instant,
+    ) {
+        let upgraded = self
+            .entries
+            .get(&fd)
+            .map(|lease| lease.strength.max(strength))
+            .unwrap_or(strength);
+        self.entries.insert(
+            fd,
+            FdAffinityLease {
+                shard,
+                strength: upgraded,
+                expires_at: now + self.ttl_for(upgraded),
+            },
+        );
+    }
+
+    fn release_if(&mut self, fd: RawFd, shard: ShardId) {
+        if self
+            .entries
+            .get(&fd)
+            .is_some_and(|lease| lease.shard == shard)
+        {
+            self.entries.remove(&fd);
+        }
+    }
+
+    fn current_shard(&mut self, fd: RawFd, now: Instant) -> Option<ShardId> {
+        self.get_active(fd, now).map(|lease| lease.shard)
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeUnboundState {
+    selector_cursor: AtomicUsize,
+    next_op_id: AtomicU64,
+    fd_affinity: Mutex<FdAffinityTable>,
+    op_routes: Mutex<HashMap<NativeOpId, ShardId>>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl NativeUnboundState {
+    fn new() -> Self {
+        Self {
+            selector_cursor: AtomicUsize::new(0),
+            next_op_id: AtomicU64::new(1),
+            fd_affinity: Mutex::new(FdAffinityTable::new(
+                NATIVE_WEAK_AFFINITY_TTL,
+                NATIVE_STRONG_AFFINITY_TTL,
+                NATIVE_HARD_AFFINITY_TTL,
+            )),
+            op_routes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn next_op_id(&self) -> NativeOpId {
+        self.next_op_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone)]
+pub struct NativeLaneSelector {
+    shared: Arc<RuntimeShared>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl NativeLaneSelector {
+    pub fn select(&self, preferred_shard: Option<ShardId>) -> ShardId {
+        let shard_count = self.shared.command_txs.len();
+        if shard_count == 0 {
+            return 0;
+        }
+
+        let start = self
+            .shared
+            .native_unbound
+            .selector_cursor
+            .fetch_add(1, Ordering::Relaxed)
+            % shard_count;
+
+        let mut best_idx = start;
+        let mut best_depth = usize::MAX;
+        for offset in 0..shard_count {
+            let idx = (start + offset) % shard_count;
+            let depth = self.shared.stats.pending_native_depth(idx as ShardId);
+            if depth < best_depth {
+                best_depth = depth;
+                best_idx = idx;
+            }
+        }
+
+        if let Some(preferred) = preferred_shard {
+            let preferred_idx = usize::from(preferred);
+            if preferred_idx < shard_count {
+                let preferred_depth = self.shared.stats.pending_native_depth(preferred);
+                if preferred_depth <= best_depth.saturating_add(1) {
+                    return preferred;
+                }
+            }
+        }
+
+        best_idx as ShardId
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone)]
+pub struct UringNativeAny {
+    handle: RuntimeHandle,
+    selector: NativeLaneSelector,
+    preferred_shard: Option<ShardId>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl UringNativeAny {
+    pub fn preferred_shard(&self) -> Option<ShardId> {
+        self.preferred_shard
+    }
+
+    pub fn with_preferred_shard(&self, preferred_shard: ShardId) -> Result<Self, RuntimeError> {
+        if usize::from(preferred_shard) >= self.handle.shard_count() {
+            return Err(RuntimeError::InvalidShard(preferred_shard));
+        }
+        Ok(Self {
+            handle: self.handle.clone(),
+            selector: self.selector.clone(),
+            preferred_shard: Some(preferred_shard),
+        })
+    }
+
+    pub fn clear_preferred_shard(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            selector: self.selector.clone(),
+            preferred_shard: None,
+        }
+    }
+
+    pub fn select_shard(&self, preferred_shard: Option<ShardId>) -> Result<ShardId, RuntimeError> {
+        if let Some(preferred) = preferred_shard {
+            if usize::from(preferred) >= self.handle.shard_count() {
+                return Err(RuntimeError::InvalidShard(preferred));
+            }
+        }
+        Ok(self
+            .selector
+            .select(preferred_shard.or(self.preferred_shard)))
+    }
+
+    pub fn fd_affinity_shard(&self, fd: RawFd) -> Option<ShardId> {
+        let now = Instant::now();
+        self.handle
+            .inner
+            .shared
+            .native_unbound
+            .fd_affinity
+            .lock()
+            .expect("native fd affinity lock poisoned")
+            .current_shard(fd, now)
+    }
+
+    pub fn active_native_op_count(&self) -> usize {
+        self.handle
+            .inner
+            .shared
+            .native_unbound
+            .op_routes
+            .lock()
+            .expect("native op route lock poisoned")
+            .len()
+    }
+
+    pub fn active_native_op_shard(&self, op_id: NativeOpId) -> Option<ShardId> {
+        self.handle
+            .inner
+            .shared
+            .native_unbound
+            .op_routes
+            .lock()
+            .expect("native op route lock poisoned")
+            .get(&op_id)
+            .copied()
+    }
+
+    pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Weak,
+            false,
+            move |lane| async move { lane.read_at(fd, offset, len).await },
+        )
+        .await
+    }
+
+    pub async fn read_at_into(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Weak,
+            false,
+            move |lane| async move { lane.read_at_into(fd, offset, buf).await },
+        )
+        .await
+    }
+
+    pub async fn write_at(&self, fd: RawFd, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let payload = buf.to_vec();
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Weak,
+            false,
+            move |lane| async move { lane.write_at(fd, offset, &payload).await },
+        )
+        .await
+    }
+
+    pub async fn fsync(&self, fd: RawFd) -> std::io::Result<()> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Weak,
+            false,
+            move |lane| async move { lane.fsync(fd).await },
+        )
+        .await
+    }
+
+    pub async fn recv(&self, fd: RawFd, len: usize) -> std::io::Result<Vec<u8>> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Strong,
+            false,
+            move |lane| async move { lane.recv(fd, len).await },
+        )
+        .await
+    }
+
+    pub async fn recv_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Strong,
+            false,
+            move |lane| async move { lane.recv_owned(fd, buf).await },
+        )
+        .await
+    }
+
+    pub async fn recv_into(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        self.recv_owned(fd, buf).await
+    }
+
+    pub async fn send(&self, fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+        let payload = buf.to_vec();
+        let (sent, _) = self.send_owned(fd, payload).await?;
+        Ok(sent)
+    }
+
+    pub async fn send_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Strong,
+            false,
+            move |lane| async move { lane.send_owned(fd, buf).await },
+        )
+        .await
+    }
+
+    pub async fn send_batch(
+        &self,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        self.send_all_batch(fd, bufs, window).await
+    }
+
+    pub async fn send_all_batch(
+        &self,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Strong,
+            false,
+            move |lane| async move { lane.send_all_batch(fd, bufs, window).await },
+        )
+        .await
+    }
+
+    pub async fn recv_batch_into(
+        &self,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        let mut pending = VecDeque::from(bufs);
+        let mut returned = Vec::new();
+        let mut total_received = 0usize;
+        let window = window.max(1);
+
+        while !pending.is_empty() {
+            let mut recvs = Vec::with_capacity(window);
+            for _ in 0..window {
+                if let Some(buf) = pending.pop_front() {
+                    recvs.push(self.recv_into(fd, buf));
+                } else {
+                    break;
+                }
+            }
+            for out in join_all(recvs).await {
+                let (received, buf) = out?;
+                total_received = total_received.saturating_add(received);
+                returned.push(buf);
+            }
+        }
+
+        Ok((total_received, returned))
+    }
+
+    pub async fn recv_multishot_segments(
+        &self,
+        fd: RawFd,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+    ) -> std::io::Result<UringRecvMultishotSegments> {
+        self.run_tracked(
+            fd,
+            NativeAffinityStrength::Hard,
+            true,
+            move |lane| async move {
+                lane.recv_multishot_segments(fd, buffer_len, buffer_count, bytes_target)
+                    .await
+            },
+        )
+        .await
+    }
+
+    pub async fn recv_multishot(
+        &self,
+        fd: RawFd,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let out = self
+            .recv_multishot_segments(fd, buffer_len, buffer_count, bytes_target)
+            .await?;
+        let mut chunks = Vec::with_capacity(out.segments.len());
+        for seg in out.segments {
+            let end = seg.offset.saturating_add(seg.len).min(out.buffer.len());
+            if seg.offset >= end {
+                chunks.push(Vec::new());
+            } else {
+                chunks.push(out.buffer[seg.offset..end].to_vec());
+            }
+        }
+        Ok(chunks)
+    }
+
+    fn effective_preferred_shard(&self) -> Option<ShardId> {
+        self.preferred_shard.or_else(|| {
+            ShardCtx::current().and_then(|ctx| {
+                (ctx.runtime_id() == self.handle.inner.shared.runtime_id).then_some(ctx.shard_id())
+            })
+        })
+    }
+
+    fn select_shard_for_fd(&self, fd: RawFd, strength: NativeAffinityStrength) -> ShardId {
+        let now = Instant::now();
+        {
+            let mut table = self
+                .handle
+                .inner
+                .shared
+                .native_unbound
+                .fd_affinity
+                .lock()
+                .expect("native fd affinity lock poisoned");
+            if let Some(lease) = table.get_active(fd, now) {
+                table.upsert(fd, lease.shard, strength, now);
+                return lease.shard;
+            }
+        }
+
+        let preferred = self.effective_preferred_shard();
+        let selected = self.selector.select(preferred);
+        let mut table = self
+            .handle
+            .inner
+            .shared
+            .native_unbound
+            .fd_affinity
+            .lock()
+            .expect("native fd affinity lock poisoned");
+        if let Some(lease) = table.get_active(fd, now) {
+            table.upsert(fd, lease.shard, strength, now);
+            return lease.shard;
+        }
+        table.upsert(fd, selected, strength, now);
+        selected
+    }
+
+    fn begin_op(&self, fd: RawFd, strength: NativeAffinityStrength) -> (NativeOpId, ShardId) {
+        let shard = self.select_shard_for_fd(fd, strength);
+        let op_id = self.handle.inner.shared.native_unbound.next_op_id();
+        self.handle
+            .inner
+            .shared
+            .native_unbound
+            .op_routes
+            .lock()
+            .expect("native op route lock poisoned")
+            .insert(op_id, shard);
+        (op_id, shard)
+    }
+
+    fn finish_op(&self, op_id: NativeOpId, fd: RawFd, shard: ShardId, release_affinity: bool) {
+        self.handle
+            .inner
+            .shared
+            .native_unbound
+            .op_routes
+            .lock()
+            .expect("native op route lock poisoned")
+            .remove(&op_id);
+        if release_affinity {
+            self.handle
+                .inner
+                .shared
+                .native_unbound
+                .fd_affinity
+                .lock()
+                .expect("native fd affinity lock poisoned")
+                .release_if(fd, shard);
+        }
+    }
+
+    async fn run_tracked<T, F, Fut>(
+        &self,
+        fd: RawFd,
+        strength: NativeAffinityStrength,
+        release_affinity: bool,
+        op: F,
+    ) -> std::io::Result<T>
+    where
+        F: FnOnce(UringNativeLane) -> Fut,
+        Fut: Future<Output = std::io::Result<T>>,
+    {
+        let (op_id, shard) = self.begin_op(fd, strength);
+        let lane = match self.handle.uring_native_lane(shard) {
+            Ok(lane) => lane,
+            Err(err) => {
+                self.finish_op(op_id, fd, shard, release_affinity);
+                return Err(runtime_error_to_io(err));
+            }
+        };
+        let out = op(lane).await;
+        self.finish_op(op_id, fd, shard, release_affinity);
+        out
     }
 }
 
@@ -1833,6 +2388,7 @@ type StealableInboxes = Arc<Vec<Arc<Mutex<VecDeque<StealableTask>>>>>;
 
 struct RuntimeStatsInner {
     shard_command_depths: Vec<AtomicUsize>,
+    pending_native_ops_by_shard: Vec<AtomicUsize>,
     spawn_pinned_submitted: AtomicU64,
     spawn_stealable_submitted: AtomicU64,
     stealable_executed: AtomicU64,
@@ -1851,12 +2407,15 @@ struct RuntimeStatsInner {
 impl RuntimeStatsInner {
     fn new(shards: usize) -> Self {
         let mut shard_command_depths = Vec::with_capacity(shards);
+        let mut pending_native_ops_by_shard = Vec::with_capacity(shards);
         for _ in 0..shards {
             shard_command_depths.push(AtomicUsize::new(0));
+            pending_native_ops_by_shard.push(AtomicUsize::new(0));
         }
 
         Self {
             shard_command_depths,
+            pending_native_ops_by_shard,
             spawn_pinned_submitted: AtomicU64::new(0),
             spawn_stealable_submitted: AtomicU64::new(0),
             stealable_executed: AtomicU64::new(0),
@@ -1877,6 +2436,11 @@ impl RuntimeStatsInner {
         RuntimeStats {
             shard_command_depths: self
                 .shard_command_depths
+                .iter()
+                .map(|depth| depth.load(Ordering::Relaxed))
+                .collect(),
+            pending_native_ops_by_shard: self
+                .pending_native_ops_by_shard
                 .iter()
                 .map(|depth| depth.load(Ordering::Relaxed))
                 .collect(),
@@ -1909,6 +2473,32 @@ impl RuntimeStatsInner {
             });
         }
     }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn increment_pending_native_depth(&self, shard: ShardId) {
+        if let Some(depth) = self.pending_native_ops_by_shard.get(usize::from(shard)) {
+            depth.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn decrement_pending_native_depth(&self, shard: ShardId, by: usize) {
+        if by == 0 {
+            return;
+        }
+        if let Some(depth) = self.pending_native_ops_by_shard.get(usize::from(shard)) {
+            let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(by))
+            });
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn pending_native_depth(&self, shard: ShardId) -> usize {
+        self.pending_native_ops_by_shard
+            .get(usize::from(shard))
+            .map_or(0, |depth| depth.load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Clone)]
@@ -1919,6 +2509,8 @@ struct RuntimeShared {
     stealable_inboxes: StealableInboxes,
     stealable_queue_capacity: usize,
     stats: Arc<RuntimeStatsInner>,
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    native_unbound: Arc<NativeUnboundState>,
 }
 
 impl RuntimeShared {
@@ -3037,6 +3629,31 @@ impl IoUringDriver {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn on_native_submit(&self) {
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.increment_pending_native_depth(self.shard_id);
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn on_native_complete_many(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.stats
+            .pending_native_ops
+            .fetch_sub(count as u64, Ordering::Relaxed);
+        self.stats
+            .decrement_pending_native_depth(self.shard_id, count);
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn on_native_complete(&self) {
+        self.on_native_complete_many(1);
+    }
+
     fn submit_ring_msg(
         &mut self,
         target: ShardId,
@@ -3183,9 +3800,7 @@ impl IoUringDriver {
             buf: vec![0; len],
             reply,
         });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Read { buf, .. }) => buf.as_mut_ptr(),
@@ -3221,9 +3836,7 @@ impl IoUringDriver {
         };
 
         let native_index = self.native_ops.insert(NativeIoOp::ReadOwned { buf, reply });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::ReadOwned { buf, .. }) => buf.as_mut_ptr(),
@@ -3259,9 +3872,7 @@ impl IoUringDriver {
         };
 
         let native_index = self.native_ops.insert(NativeIoOp::Write { buf, reply });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Write { buf, .. }) => buf.as_ptr(),
@@ -3296,9 +3907,7 @@ impl IoUringDriver {
         };
 
         let native_index = self.native_ops.insert(NativeIoOp::Recv { buf, reply });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Recv { buf, .. }) => buf.as_mut_ptr(),
@@ -3332,9 +3941,7 @@ impl IoUringDriver {
         };
 
         let native_index = self.native_ops.insert(NativeIoOp::Send { buf, reply });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Send { buf, .. }) => buf.as_ptr(),
@@ -3379,9 +3986,7 @@ impl IoUringDriver {
             failure: None,
             reply: Some(reply),
         });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         if self.submit_more_send_batch_parts(batch_index).is_err() {
             self.mark_send_batch_failed(
@@ -3474,9 +4079,7 @@ impl IoUringDriver {
             segments: Vec::new(),
             reply,
         });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         if needs_register {
             let provide_entry = opcode::ProvideBuffers::new(
@@ -3629,9 +4232,7 @@ impl IoUringDriver {
         reply: oneshot::Sender<std::io::Result<()>>,
     ) -> Result<(), SendError> {
         let native_index = self.native_ops.insert(NativeIoOp::Fsync { reply });
-        self.stats
-            .pending_native_ops
-            .fetch_add(1, Ordering::Relaxed);
+        self.on_native_submit();
 
         let entry = opcode::Fsync::new(types::Fd(fd))
             .build()
@@ -3731,9 +4332,7 @@ impl IoUringDriver {
             return;
         }
 
-        self.stats
-            .pending_native_ops
-            .fetch_sub(1, Ordering::Relaxed);
+        self.on_native_complete();
         let batch = self.native_send_batches.remove(batch_index);
         if let Some(reply) = batch.reply {
             let outcome = if let Some(err) = batch.failure {
@@ -3824,9 +4423,7 @@ impl IoUringDriver {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn fail_native_op(&mut self, index: usize) {
         if self.native_ops.contains(index) {
-            self.stats
-                .pending_native_ops
-                .fetch_sub(1, Ordering::Relaxed);
+            self.on_native_complete();
             let op = self.native_ops.remove(index);
             match op {
                 NativeIoOp::Read { reply, .. } => {
@@ -3892,9 +4489,7 @@ impl IoUringDriver {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn fail_all_native_ops(&mut self) {
         let ops = std::mem::take(&mut self.native_ops);
-        self.stats
-            .pending_native_ops
-            .fetch_sub(ops.len() as u64, Ordering::Relaxed);
+        self.on_native_complete_many(ops.len());
         for (_, op) in ops {
             match op {
                 NativeIoOp::Read { reply, .. } => {
@@ -3949,9 +4544,7 @@ impl IoUringDriver {
             }
         }
         let batches = std::mem::take(&mut self.native_send_batches);
-        self.stats
-            .pending_native_ops
-            .fetch_sub(batches.len() as u64, Ordering::Relaxed);
+        self.on_native_complete_many(batches.len());
         for (_, mut batch) in batches {
             if let Some(reply) = batch.reply.take() {
                 let _ = reply.send(Err(std::io::Error::new(
@@ -4258,9 +4851,7 @@ impl IoUringDriver {
                     return;
                 }
                 MultiOutcome::Finish(outcome, pool_key, consumed_bids) => {
-                    self.stats
-                        .pending_native_ops
-                        .fetch_sub(1, Ordering::Relaxed);
+                    self.on_native_complete();
                     let op = self.native_ops.remove(index);
                     if let NativeIoOp::RecvMulti { reply, .. } = op {
                         let _ = reply.send(outcome);
@@ -4272,9 +4863,7 @@ impl IoUringDriver {
             }
         }
 
-        self.stats
-            .pending_native_ops
-            .fetch_sub(1, Ordering::Relaxed);
+        self.on_native_complete();
         let op = self.native_ops.remove(index);
         match op {
             NativeIoOp::Read { mut buf, reply } => {

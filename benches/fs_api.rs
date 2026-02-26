@@ -14,6 +14,8 @@ use spargio::{BackendKind, Runtime, RuntimeError};
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::io::Write;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(unix)]
@@ -370,6 +372,151 @@ impl Drop for SpargioFsHarness {
     }
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct SpargioFsUnboundHarness {
+    runtime: Runtime,
+    cmd_tx: mpsc::UnboundedSender<SpargioFsCmd>,
+    worker_join: Option<spargio::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl SpargioFsUnboundHarness {
+    fn new(path: &Path, blocks: u32) -> Option<Self> {
+        let runtime = match Runtime::builder()
+            .shards(2)
+            .backend(BackendKind::IoUring)
+            .io_uring_throughput_mode(None)
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(RuntimeError::IoUringInit(_)) => match Runtime::builder()
+                .shards(2)
+                .backend(BackendKind::IoUring)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(RuntimeError::IoUringInit(_)) => return None,
+                Err(err) => panic!("unexpected runtime init error: {err:?}"),
+            },
+            Err(err) => panic!("unexpected runtime init error: {err:?}"),
+        };
+        let native_any = runtime.handle().uring_native_unbound().ok()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .expect("open fixture");
+        let fd = file.as_raw_fd();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioFsCmd>();
+        let handle = runtime.handle();
+        let worker_join = handle
+            .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), async move {
+                let _file_guard = file;
+                let mut rtt_buf = vec![0u8; BLOCK_SIZE];
+                while let Some(cmd) = cmd_rx.next().await {
+                    match cmd {
+                        SpargioFsCmd::ReadRtt { rounds, reply } => {
+                            let mut checksum = 0u64;
+                            for i in 0..rounds {
+                                let block = (i as u32) % blocks;
+                                let offset = u64::from(block) * BLOCK_SIZE as u64;
+                                let buf = std::mem::take(&mut rtt_buf);
+                                let (got, returned) = native_any
+                                    .read_at_into(fd, offset, buf)
+                                    .await
+                                    .expect("read_at_into");
+                                rtt_buf = returned;
+                                assert_eq!(got, BLOCK_SIZE, "short read in spargio unbound bench");
+                                checksum =
+                                    checksum.wrapping_add(u64::from(block) ^ u64::from(rtt_buf[0]));
+                            }
+                            let _ = reply.send(checksum);
+                        }
+                        SpargioFsCmd::ReadQd { rounds, qd, reply } => {
+                            let mut checksum = 0u64;
+                            let mut next = 0usize;
+                            while next < rounds {
+                                let batch = (rounds - next).min(qd.max(1));
+                                let mut reads = Vec::with_capacity(batch);
+                                for offset in 0..batch {
+                                    let block = ((next + offset) as u32) % blocks;
+                                    let native_any = native_any.clone();
+                                    reads.push(async move {
+                                        let off = u64::from(block) * BLOCK_SIZE as u64;
+                                        let bytes = native_any
+                                            .read_at(fd, off, BLOCK_SIZE)
+                                            .await
+                                            .expect("read_at");
+                                        assert_eq!(
+                                            bytes.len(),
+                                            BLOCK_SIZE,
+                                            "short read in spargio unbound bench"
+                                        );
+                                        u64::from(block) ^ u64::from(bytes[0])
+                                    });
+                                }
+                                for value in join_all(reads).await {
+                                    checksum = checksum.wrapping_add(value);
+                                }
+                                next += batch;
+                            }
+                            let _ = reply.send(checksum);
+                        }
+                        SpargioFsCmd::Shutdown { reply } => {
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            runtime,
+            cmd_tx,
+            worker_join: Some(worker_join),
+        })
+    }
+
+    fn read_rtt(&mut self, rounds: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioFsCmd::ReadRtt { rounds, reply: tx })
+            .expect("send spargio unbound rtt cmd");
+        rx.recv().expect("spargio unbound rtt reply")
+    }
+
+    fn read_qd(&mut self, rounds: usize, qd: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioFsCmd::ReadQd {
+                rounds,
+                qd,
+                reply: tx,
+            })
+            .expect("send spargio unbound qd cmd");
+        rx.recv().expect("spargio unbound qd reply")
+    }
+
+    fn shutdown(&mut self) {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self
+            .cmd_tx
+            .unbounded_send(SpargioFsCmd::Shutdown { reply: tx });
+        let _ = rx.recv();
+        if let Some(join) = self.worker_join.take() {
+            let _ = block_on(join);
+        }
+        let _ = &self.runtime;
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl Drop for SpargioFsUnboundHarness {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(unix)]
 fn bench_fs_read_rtt(c: &mut Criterion) {
     let fixture = DiskFixture::new(FILE_BLOCKS);
@@ -387,6 +534,14 @@ fn bench_fs_read_rtt(c: &mut Criterion) {
         black_box(spargio.read_rtt(32));
         group.bench_function("spargio_uring_bound_file_qd1", |b| {
             b.iter(|| black_box(spargio.read_rtt(RTT_ROUNDS)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio_unbound) = SpargioFsUnboundHarness::new(&fixture.path, fixture.blocks) {
+        black_box(spargio_unbound.read_rtt(32));
+        group.bench_function("spargio_uring_unbound_file_qd1", |b| {
+            b.iter(|| black_box(spargio_unbound.read_rtt(RTT_ROUNDS)))
         });
     }
 
@@ -410,6 +565,14 @@ fn bench_fs_read_throughput(c: &mut Criterion) {
         black_box(spargio.read_qd(256, THROUGHPUT_QD));
         group.bench_function("spargio_uring_bound_file_qd32", |b| {
             b.iter(|| black_box(spargio.read_qd(THROUGHPUT_ROUNDS, THROUGHPUT_QD)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio_unbound) = SpargioFsUnboundHarness::new(&fixture.path, fixture.blocks) {
+        black_box(spargio_unbound.read_qd(256, THROUGHPUT_QD));
+        group.bench_function("spargio_uring_unbound_file_qd32", |b| {
+            b.iter(|| black_box(spargio_unbound.read_qd(THROUGHPUT_ROUNDS, THROUGHPUT_QD)))
         });
     }
 
