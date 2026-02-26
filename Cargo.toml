@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 crossbeam-channel = "0.5"
 futures = "0.3"
+tokio = { version = "1", optional = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -21,7 +22,7 @@ slab = "0.4"
 [features]
 default = []
 glommio-bench = ["dep:glommio"]
-tokio-compat = []
+tokio-compat = ["dep:tokio"]
 uring-native = []
 
 [[bench]]

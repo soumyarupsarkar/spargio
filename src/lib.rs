@@ -40,6 +40,7 @@ pub mod tokio_compat {
     use io_uring::{IoUring, opcode, types};
     use std::collections::VecDeque;
     use std::os::fd::RawFd;
+    use std::sync::{Arc, Mutex};
 
     const INTERNAL_USER_BIT: u64 = 1 << 63;
     const TOKEN_USER_MASK: u64 = !INTERNAL_USER_BIT;
@@ -260,6 +261,48 @@ pub mod tokio_compat {
 
     fn is_internal_user_data(user_data: u64) -> bool {
         (user_data & INTERNAL_USER_BIT) != 0
+    }
+
+    #[derive(Clone)]
+    pub struct TokioPollReactor {
+        inner: Arc<Mutex<PollReactor>>,
+    }
+
+    impl TokioPollReactor {
+        pub fn new(entries: u32) -> Result<Self, PollReactorError> {
+            Ok(Self {
+                inner: Arc::new(Mutex::new(PollReactor::new(entries)?)),
+            })
+        }
+
+        pub fn register(
+            &self,
+            fd: RawFd,
+            interest: PollInterest,
+        ) -> Result<PollToken, PollReactorError> {
+            let mut reactor = self.inner.lock().expect("poll reactor lock poisoned");
+            reactor.register(fd, interest)
+        }
+
+        pub async fn wait_one(&self) -> Result<PollEvent, PollReactorError> {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut reactor = inner.lock().expect("poll reactor lock poisoned");
+                reactor.wait_one()
+            })
+            .await
+            .map_err(|_| PollReactorError::Closed)?
+        }
+
+        pub async fn deregister(&self, token: PollToken) -> Result<(), PollReactorError> {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut reactor = inner.lock().expect("poll reactor lock poisoned");
+                reactor.deregister(token)
+            })
+            .await
+            .map_err(|_| PollReactorError::Closed)?
+        }
     }
 }
 

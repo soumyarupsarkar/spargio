@@ -414,3 +414,37 @@ Validation:
 - `cargo test` passes.
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
+
+## Update: Async Tokio Poll Wrapper (TDD)
+
+Added a Tokio-usable async wrapper over the `POLL_ADD` scaffold to allow direct use from Tokio tasks.
+
+### Red phase
+
+Added failing tests in `tests/tokio_poll_async_tdd.rs` (`cfg(all(feature = "tokio-compat", target_os = "linux"))`) for:
+
+- async `wait_one()` returning readable events.
+- async `deregister()` reporting `NotFound` on second remove.
+
+### Green phase
+
+Implemented in `src/lib.rs` (`tokio_compat` module):
+
+- `TokioPollReactor` (`Clone`) wrapping `PollReactor` in `Arc<Mutex<_>>`.
+- Methods:
+  - `new(entries)`
+  - `register(fd, interest)`
+  - `wait_one().await`
+  - `deregister(token).await`
+- Async methods use `tokio::task::spawn_blocking` to execute blocking ring wait/remove logic safely off async worker threads.
+
+Feature/dependency update:
+
+- `tokio-compat` now enables optional Tokio dependency (`dep:tokio`).
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.
