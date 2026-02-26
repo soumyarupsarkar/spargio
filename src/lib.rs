@@ -37,513 +37,222 @@ const DOORBELL_TAG: u16 = u16::MAX;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_OP_USER_BIT: u64 = 1 << 63;
 
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-pub mod tokio_compat {
-    use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
-    use io_uring::{IoUring, opcode, types};
-    use std::collections::HashSet;
-    use std::collections::VecDeque;
-    use std::os::fd::RawFd;
-    use std::sync::mpsc as std_mpsc;
-    use std::sync::{Arc, Mutex};
+pub mod boundary {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+    use futures::channel::oneshot;
     use std::thread;
-    use std::time::Duration;
-    use tokio::sync::oneshot;
-
-    const INTERNAL_USER_BIT: u64 = 1 << 63;
-    const TOKEN_USER_MASK: u64 = !INTERNAL_USER_BIT;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct PollToken(u64);
-
-    impl PollToken {
-        pub fn raw(self) -> u64 {
-            self.0
-        }
-    }
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum PollInterest {
-        Readable,
-        Writable,
-        ReadWrite,
-    }
-
-    impl PollInterest {
-        fn mask(self) -> u32 {
-            match self {
-                Self::Readable => libc::POLLIN as u32,
-                Self::Writable => libc::POLLOUT as u32,
-                Self::ReadWrite => (libc::POLLIN | libc::POLLOUT) as u32,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct PollEvent {
-        token: PollToken,
-        mask: u32,
-    }
-
-    impl PollEvent {
-        pub fn token(self) -> PollToken {
-            self.token
-        }
-
-        pub fn mask(self) -> u32 {
-            self.mask
-        }
-
-        pub fn is_readable(self) -> bool {
-            (self.mask & libc::POLLIN as u32) != 0
-        }
-
-        pub fn is_writable(self) -> bool {
-            (self.mask & libc::POLLOUT as u32) != 0
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum PollReactorError {
-        Io(std::io::Error),
-        NotFound,
+    pub enum BoundaryError {
         Closed,
+        Overloaded,
+        Timeout,
+        Canceled,
     }
 
-    impl PartialEq for PollReactorError {
-        fn eq(&self, other: &Self) -> bool {
-            matches!(
-                (self, other),
-                (Self::NotFound, Self::NotFound) | (Self::Closed, Self::Closed)
-            )
-        }
+    struct BoundaryEnvelope<Request, Response> {
+        request: Request,
+        deadline: Option<Instant>,
+        reply: oneshot::Sender<Result<Response, BoundaryError>>,
     }
 
-    impl Eq for PollReactorError {}
-
-    pub struct PollReactor {
-        ring: IoUring,
-        next_token: u64,
-        next_internal: u64,
-        ready: VecDeque<PollEvent>,
-        active_tokens: HashSet<PollToken>,
+    pub struct BoundaryRequest<Request, Response> {
+        request: Request,
+        deadline: Option<Instant>,
+        reply: Option<oneshot::Sender<Result<Response, BoundaryError>>>,
     }
 
-    impl PollReactor {
-        pub fn new(entries: u32) -> Result<Self, PollReactorError> {
-            let ring = IoUring::new(entries.max(1)).map_err(PollReactorError::Io)?;
-            Ok(Self {
-                ring,
-                next_token: 1,
-                next_internal: 1,
-                ready: VecDeque::new(),
-                active_tokens: HashSet::new(),
-            })
+    impl<Request, Response> BoundaryRequest<Request, Response> {
+        pub fn request(&self) -> &Request {
+            &self.request
         }
 
-        pub fn register(
-            &mut self,
-            fd: RawFd,
-            interest: PollInterest,
-        ) -> Result<PollToken, PollReactorError> {
-            let token = self.next_poll_token();
-            let entry = opcode::PollAdd::new(types::Fd(fd), interest.mask())
-                .build()
-                .user_data(token_user_data(token));
-            self.submit_entry(entry)?;
-            self.active_tokens.insert(token);
-            Ok(token)
+        pub fn deadline(&self) -> Option<Instant> {
+            self.deadline
         }
 
-        pub fn deregister(&mut self, token: PollToken) -> Result<(), PollReactorError> {
-            if !self.active_tokens.contains(&token) {
-                return Err(PollReactorError::NotFound);
-            }
-            let completion_user_data = self.next_internal_user_data();
-            let entry = opcode::PollRemove::new(token_user_data(token))
-                .build()
-                .user_data(completion_user_data);
-            self.submit_entry(entry)?;
-            let out = self.wait_for_internal(completion_user_data);
-            if out.is_ok() {
-                self.active_tokens.remove(&token);
-            }
-            out
+        pub fn into_request(self) -> Request {
+            self.request
         }
 
-        pub fn wait_one(&mut self) -> Result<PollEvent, PollReactorError> {
-            if let Some(event) = self.ready.pop_front() {
-                return Ok(event);
-            }
-
-            loop {
-                self.ring.submit_and_wait(1).map_err(PollReactorError::Io)?;
-                let _ = self.reap_completions(None)?;
-                if let Some(event) = self.ready.pop_front() {
-                    return Ok(event);
-                }
-            }
-        }
-
-        pub fn try_wait_one(&mut self) -> Result<Option<PollEvent>, PollReactorError> {
-            if let Some(event) = self.ready.pop_front() {
-                return Ok(Some(event));
-            }
-
-            self.ring.submit().map_err(PollReactorError::Io)?;
-            let _ = self.reap_completions(None)?;
-            Ok(self.ready.pop_front())
-        }
-
-        fn wait_for_internal(&mut self, internal_user_data: u64) -> Result<(), PollReactorError> {
-            loop {
-                self.ring.submit_and_wait(1).map_err(PollReactorError::Io)?;
-                if let Some(result) = self.reap_completions(Some(internal_user_data))? {
-                    return match result {
-                        0 => Ok(()),
-                        r if r == -libc::ENOENT => Err(PollReactorError::NotFound),
-                        r if r < 0 => {
-                            Err(PollReactorError::Io(std::io::Error::from_raw_os_error(-r)))
-                        }
-                        _ => Ok(()),
-                    };
-                }
-            }
-        }
-
-        fn reap_completions(
-            &mut self,
-            internal_target: Option<u64>,
-        ) -> Result<Option<i32>, PollReactorError> {
-            let mut internal_result = None;
-            let mut cq = self.ring.completion();
-            for cqe in &mut cq {
-                let user_data = cqe.user_data();
-                let result = cqe.result();
-
-                if is_internal_user_data(user_data) {
-                    if Some(user_data) == internal_target {
-                        internal_result = Some(result);
+        pub fn respond(mut self, response: Response) -> Result<(), BoundaryError> {
+            if let Some(deadline) = self.deadline {
+                if Instant::now() > deadline {
+                    if let Some(reply) = self.reply.take() {
+                        let _ = reply.send(Err(BoundaryError::Timeout));
                     }
-                    continue;
-                }
-
-                if result >= 0 {
-                    let token = PollToken(user_data);
-                    if self.active_tokens.remove(&token) {
-                        self.ready.push_back(PollEvent {
-                            token,
-                            mask: result as u32,
-                        });
-                    }
+                    return Err(BoundaryError::Timeout);
                 }
             }
 
-            Ok(internal_result)
+            let Some(reply) = self.reply.take() else {
+                return Err(BoundaryError::Canceled);
+            };
+
+            reply
+                .send(Ok(response))
+                .map_err(|_| BoundaryError::Canceled)
         }
-
-        fn submit_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), PollReactorError> {
-            self.push_entry(entry)?;
-            self.ring.submit().map_err(PollReactorError::Io)?;
-            Ok(())
-        }
-
-        fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), PollReactorError> {
-            for _ in 0..2 {
-                let mut sq = self.ring.submission();
-                if unsafe { sq.push(&entry) }.is_ok() {
-                    return Ok(());
-                }
-                drop(sq);
-                self.ring.submit().map_err(PollReactorError::Io)?;
-            }
-            Err(PollReactorError::Closed)
-        }
-
-        fn next_poll_token(&mut self) -> PollToken {
-            let token = PollToken(self.next_token);
-            self.next_token = self.next_token.wrapping_add(1) & TOKEN_USER_MASK;
-            if self.next_token == 0 {
-                self.next_token = 1;
-            }
-            token
-        }
-
-        fn next_internal_user_data(&mut self) -> u64 {
-            let id = internal_user_data(self.next_internal);
-            self.next_internal = self.next_internal.wrapping_add(1);
-            if self.next_internal == 0 {
-                self.next_internal = 1;
-            }
-            id
-        }
-
-        pub fn registered_count(&self) -> usize {
-            self.active_tokens.len()
-        }
-    }
-
-    fn token_user_data(token: PollToken) -> u64 {
-        token.0 & TOKEN_USER_MASK
-    }
-
-    fn internal_user_data(id: u64) -> u64 {
-        INTERNAL_USER_BIT | (id & TOKEN_USER_MASK)
-    }
-
-    fn is_internal_user_data(user_data: u64) -> bool {
-        (user_data & INTERNAL_USER_BIT) != 0
     }
 
     #[derive(Clone)]
-    pub struct TokioPollReactor {
-        inner: Arc<TokioPollReactorInner>,
+    pub struct BoundaryClient<Request, Response> {
+        tx: Sender<BoundaryEnvelope<Request, Response>>,
     }
 
-    struct TokioPollReactorInner {
-        cmd_tx: Sender<ReactorCmd>,
-        worker: Mutex<Option<thread::JoinHandle<()>>>,
+    pub struct BoundaryServer<Request, Response> {
+        rx: Receiver<BoundaryEnvelope<Request, Response>>,
     }
 
-    enum ReactorCmd {
-        Register {
-            fd: RawFd,
-            interest: PollInterest,
-            reply: std_mpsc::Sender<Result<PollToken, PollReactorError>>,
-        },
-        WaitOne {
-            reply: oneshot::Sender<Result<PollEvent, PollReactorError>>,
-        },
-        DeregisterSync {
-            token: PollToken,
-            reply: std_mpsc::Sender<Result<(), PollReactorError>>,
-        },
-        DeregisterAsync {
-            token: PollToken,
-            reply: oneshot::Sender<Result<(), PollReactorError>>,
-        },
-        RegisteredCount {
-            reply: std_mpsc::Sender<usize>,
-        },
-        Shutdown,
+    pub struct BoundaryTicket<Response> {
+        rx: Option<oneshot::Receiver<Result<Response, BoundaryError>>>,
     }
 
-    impl Drop for TokioPollReactorInner {
-        fn drop(&mut self) {
-            let _ = self.cmd_tx.send(ReactorCmd::Shutdown);
-            if let Some(join) = self.worker.lock().expect("worker lock poisoned").take() {
-                let _ = join.join();
-            }
-        }
-    }
-
-    impl TokioPollReactor {
-        pub fn new(entries: u32) -> Result<Self, PollReactorError> {
-            let reactor = PollReactor::new(entries)?;
-            let (cmd_tx, cmd_rx) = unbounded();
-            let worker = thread::Builder::new()
-                .name("tokio-compat-poll-reactor".to_owned())
-                .spawn(move || run_poll_reactor_worker(reactor, cmd_rx))
-                .map_err(PollReactorError::Io)?;
-
-            Ok(Self {
-                inner: Arc::new(TokioPollReactorInner {
-                    cmd_tx,
-                    worker: Mutex::new(Some(worker)),
-                }),
-            })
-        }
-
-        pub fn register(
-            &self,
-            fd: RawFd,
-            interest: PollInterest,
-        ) -> Result<PollToken, PollReactorError> {
-            let (reply_tx, reply_rx) = std_mpsc::channel();
-            self.send_cmd(ReactorCmd::Register {
-                fd,
-                interest,
-                reply: reply_tx,
-            })?;
-            reply_rx.recv().unwrap_or(Err(PollReactorError::Closed))
-        }
-
-        pub async fn wait_one(&self) -> Result<PollEvent, PollReactorError> {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            self.send_cmd(ReactorCmd::WaitOne { reply: reply_tx })?;
-            reply_rx.await.unwrap_or(Err(PollReactorError::Closed))
-        }
-
-        pub async fn deregister(&self, token: PollToken) -> Result<(), PollReactorError> {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            self.send_cmd(ReactorCmd::DeregisterAsync {
-                token,
-                reply: reply_tx,
-            })?;
-            reply_rx.await.unwrap_or(Err(PollReactorError::Closed))
-        }
-
-        pub fn deregister_blocking(&self, token: PollToken) -> Result<(), PollReactorError> {
-            let (reply_tx, reply_rx) = std_mpsc::channel();
-            self.send_cmd(ReactorCmd::DeregisterSync {
-                token,
-                reply: reply_tx,
-            })?;
-            reply_rx.recv().unwrap_or(Err(PollReactorError::Closed))
-        }
-
-        pub fn registered_count(&self) -> usize {
-            let (reply_tx, reply_rx) = std_mpsc::channel();
-            if self
-                .send_cmd(ReactorCmd::RegisteredCount { reply: reply_tx })
-                .is_err()
-            {
-                return 0;
-            }
-            reply_rx.recv().unwrap_or(0)
-        }
-
-        fn send_cmd(&self, cmd: ReactorCmd) -> Result<(), PollReactorError> {
-            self.inner
-                .cmd_tx
-                .send(cmd)
-                .map_err(|_| PollReactorError::Closed)
-        }
-    }
-
-    fn run_poll_reactor_worker(mut reactor: PollReactor, cmd_rx: Receiver<ReactorCmd>) {
-        let mut waiters: VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>> =
-            VecDeque::new();
-        let mut stop = false;
-
-        while !stop {
-            if waiters.is_empty() {
-                match cmd_rx.recv() {
-                    Ok(cmd) => stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters),
-                    Err(_) => break,
-                }
-                continue;
-            }
-
+    impl<Response> BoundaryTicket<Response> {
+        pub fn wait_timeout_blocking(
+            mut self,
+            timeout: Duration,
+        ) -> Result<Response, BoundaryError> {
+            let deadline = Instant::now() + timeout;
             loop {
-                match cmd_rx.try_recv() {
-                    Ok(cmd) => {
-                        stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters);
-                        if stop {
-                            break;
+                let Some(rx) = self.rx.as_mut() else {
+                    return Err(BoundaryError::Canceled);
+                };
+
+                match rx.try_recv() {
+                    Ok(Some(value)) => {
+                        self.rx = None;
+                        return value;
+                    }
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            self.rx = None;
+                            return Err(BoundaryError::Timeout);
                         }
+                        thread::sleep(Duration::from_millis(1));
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        stop = true;
-                        break;
-                    }
-                }
-            }
-            if stop {
-                break;
-            }
-
-            prune_closed_waiters(&mut waiters);
-            if let Err(_) = service_waiters(&mut reactor, &mut waiters) {
-                fail_waiters_closed(&mut waiters);
-                break;
-            }
-            if waiters.is_empty() {
-                continue;
-            }
-
-            match cmd_rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(cmd) => {
-                    stop = handle_reactor_cmd(cmd, &mut reactor, &mut waiters);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        fail_waiters_closed(&mut waiters);
-    }
-
-    fn handle_reactor_cmd(
-        cmd: ReactorCmd,
-        reactor: &mut PollReactor,
-        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
-    ) -> bool {
-        match cmd {
-            ReactorCmd::Register {
-                fd,
-                interest,
-                reply,
-            } => {
-                let _ = reply.send(reactor.register(fd, interest));
-                false
-            }
-            ReactorCmd::WaitOne { reply } => {
-                if reply.is_closed() {
-                    return false;
-                }
-                match reactor.try_wait_one() {
-                    Ok(Some(event)) => {
-                        let _ = reply.send(Ok(event));
-                    }
-                    Ok(None) => waiters.push_back(reply),
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
+                    Err(_) => {
+                        self.rx = None;
+                        return Err(BoundaryError::Canceled);
                     }
                 }
-                false
             }
-            ReactorCmd::DeregisterSync { token, reply } => {
-                let _ = reply.send(reactor.deregister(token));
-                false
-            }
-            ReactorCmd::DeregisterAsync { token, reply } => {
-                let _ = reply.send(reactor.deregister(token));
-                false
-            }
-            ReactorCmd::RegisteredCount { reply } => {
-                let _ = reply.send(reactor.registered_count());
-                false
-            }
-            ReactorCmd::Shutdown => true,
         }
     }
 
-    fn service_waiters(
-        reactor: &mut PollReactor,
-        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
-    ) -> Result<(), PollReactorError> {
-        loop {
-            prune_closed_waiters(waiters);
-            if waiters.is_empty() {
-                return Ok(());
-            }
+    impl<Response> Future for BoundaryTicket<Response> {
+        type Output = Result<Response, BoundaryError>;
 
-            let Some(event) = reactor.try_wait_one()? else {
-                return Ok(());
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let Some(rx) = self.rx.as_mut() else {
+                return Poll::Ready(Err(BoundaryError::Canceled));
             };
 
-            while let Some(waiter) = waiters.pop_front() {
-                if waiter.send(Ok(event)).is_ok() {
-                    break;
+            match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    self.rx = None;
+                    Poll::Ready(value)
                 }
+                Poll::Ready(Err(_)) => {
+                    self.rx = None;
+                    Poll::Ready(Err(BoundaryError::Canceled))
+                }
+                Poll::Pending => Poll::Pending,
             }
         }
     }
 
-    fn prune_closed_waiters(
-        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
-    ) {
-        waiters.retain(|waiter| !waiter.is_closed());
+    impl<Request, Response> BoundaryClient<Request, Response> {
+        pub fn call(&self, request: Request) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            self.enqueue(request, None, false)
+        }
+
+        pub fn call_with_timeout(
+            &self,
+            request: Request,
+            timeout: Duration,
+        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            self.enqueue(request, Some(Instant::now() + timeout), false)
+        }
+
+        pub fn try_call(
+            &self,
+            request: Request,
+        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            self.enqueue(request, None, true)
+        }
+
+        fn enqueue(
+            &self,
+            request: Request,
+            deadline: Option<Instant>,
+            nonblocking: bool,
+        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let msg = BoundaryEnvelope {
+                request,
+                deadline,
+                reply: reply_tx,
+            };
+
+            if nonblocking {
+                match self.tx.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => return Err(BoundaryError::Overloaded),
+                    Err(TrySendError::Disconnected(_)) => return Err(BoundaryError::Closed),
+                }
+            } else {
+                self.tx.send(msg).map_err(|_| BoundaryError::Closed)?;
+            }
+
+            Ok(BoundaryTicket { rx: Some(reply_rx) })
+        }
     }
 
-    fn fail_waiters_closed(
-        waiters: &mut VecDeque<oneshot::Sender<Result<PollEvent, PollReactorError>>>,
-    ) {
-        while let Some(waiter) = waiters.pop_front() {
-            let _ = waiter.send(Err(PollReactorError::Closed));
+    impl<Request, Response> BoundaryServer<Request, Response> {
+        pub fn recv(&self) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
+            self.rx
+                .recv()
+                .map(boundary_request)
+                .map_err(|_| BoundaryError::Closed)
         }
+
+        pub fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
+            self.rx
+                .recv_timeout(timeout)
+                .map(boundary_request)
+                .map_err(|err| match err {
+                    crossbeam_channel::RecvTimeoutError::Timeout => BoundaryError::Timeout,
+                    crossbeam_channel::RecvTimeoutError::Disconnected => BoundaryError::Closed,
+                })
+        }
+    }
+
+    fn boundary_request<Request, Response>(
+        msg: BoundaryEnvelope<Request, Response>,
+    ) -> BoundaryRequest<Request, Response> {
+        BoundaryRequest {
+            request: msg.request,
+            deadline: msg.deadline,
+            reply: Some(msg.reply),
+        }
+    }
+
+    pub fn channel<Request, Response>(
+        capacity: usize,
+    ) -> (
+        BoundaryClient<Request, Response>,
+        BoundaryServer<Request, Response>,
+    ) {
+        let (tx, rx) = bounded(capacity.max(1));
+        (BoundaryClient { tx }, BoundaryServer { rx })
     }
 }
 
@@ -561,6 +270,30 @@ pub trait RingMsg: Copy + Send + 'static {
 pub enum BackendKind {
     Queue,
     IoUring,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPlacement {
+    Pinned(ShardId),
+    RoundRobin,
+    Sticky(u64),
+    Stealable,
+    StealablePreferred(ShardId),
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeStats {
+    pub shard_command_depths: Vec<usize>,
+    pub spawn_pinned_submitted: u64,
+    pub spawn_stealable_submitted: u64,
+    pub stealable_executed: u64,
+    pub stealable_stolen: u64,
+    pub ring_msgs_submitted: u64,
+    pub ring_msgs_completed: u64,
+    pub ring_msgs_failed: u64,
+    pub ring_msgs_backpressure: u64,
+    pub native_affinity_violations: u64,
+    pub pending_native_ops: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -591,6 +324,7 @@ pub struct RuntimeBuilder {
     idle_wait: Duration,
     backend: BackendKind,
     ring_entries: u32,
+    msg_ring_queue_capacity: usize,
     #[cfg(target_os = "linux")]
     io_uring: IoUringBuildConfig,
 }
@@ -603,6 +337,7 @@ impl Default for RuntimeBuilder {
             idle_wait: Duration::from_millis(1),
             backend: BackendKind::Queue,
             ring_entries: 256,
+            msg_ring_queue_capacity: 4096,
             #[cfg(target_os = "linux")]
             io_uring: IoUringBuildConfig::default(),
         }
@@ -636,6 +371,11 @@ impl RuntimeBuilder {
 
     pub fn ring_entries(mut self, entries: u32) -> Self {
         self.ring_entries = entries.max(1);
+        self
+    }
+
+    pub fn msg_ring_queue_capacity(mut self, capacity: usize) -> Self {
+        self.msg_ring_queue_capacity = capacity.max(1);
         self
     }
 
@@ -687,11 +427,15 @@ impl RuntimeBuilder {
             senders.push(tx);
             receivers.push(rx);
         }
+        let stealable_inboxes = build_stealable_inboxes(self.shards);
+        let stats = Arc::new(RuntimeStatsInner::new(self.shards));
 
         let shared = Arc::new(RuntimeShared {
             runtime_id,
             backend: self.backend,
             command_txs: senders.clone(),
+            stealable_inboxes: stealable_inboxes.clone(),
+            stats: stats.clone(),
         });
         let remotes: Vec<RemoteShard> = (0..self.shards)
             .map(|i| RemoteShard {
@@ -709,6 +453,8 @@ impl RuntimeBuilder {
                     let idle_wait = self.idle_wait;
                     let runtime_id = shared.runtime_id;
                     let backend = ShardBackend::Queue;
+                    let stealable_inbox = stealable_inboxes[idx].clone();
+                    let stats = stats.clone();
 
                     let join = match thread::Builder::new().name(thread_name).spawn(move || {
                         run_shard(
@@ -716,13 +462,15 @@ impl RuntimeBuilder {
                             idx as ShardId,
                             rx,
                             remotes_for_shard,
+                            stealable_inbox,
                             idle_wait,
                             backend,
+                            stats,
                         )
                     }) {
                         Ok(j) => j,
                         Err(err) => {
-                            shutdown_spawned(&shared.command_txs, &mut joins);
+                            shutdown_spawned(&shared.command_txs, &shared.stats, &mut joins);
                             return Err(RuntimeError::ThreadSpawn(err));
                         }
                     };
@@ -771,7 +519,11 @@ impl RuntimeBuilder {
                             ring,
                             ring_fds.clone(),
                             payload_queues.clone(),
+                            stats.clone(),
+                            self.msg_ring_queue_capacity,
                         ));
+                        let stealable_inbox = stealable_inboxes[idx].clone();
+                        let stats = stats.clone();
 
                         let join = match thread::Builder::new().name(thread_name).spawn(move || {
                             run_shard(
@@ -779,13 +531,15 @@ impl RuntimeBuilder {
                                 idx as ShardId,
                                 rx,
                                 remotes_for_shard,
+                                stealable_inbox,
                                 idle_wait,
                                 backend,
+                                stats,
                             )
                         }) {
                             Ok(j) => j,
                             Err(err) => {
-                                shutdown_spawned(&shared.command_txs, &mut joins);
+                                shutdown_spawned(&shared.command_txs, &shared.stats, &mut joins);
                                 return Err(RuntimeError::ThreadSpawn(err));
                             }
                         };
@@ -811,8 +565,13 @@ impl RuntimeBuilder {
     }
 }
 
-fn shutdown_spawned(command_txs: &[Sender<Command>], joins: &mut Vec<thread::JoinHandle<()>>) {
-    for tx in command_txs {
+fn shutdown_spawned(
+    command_txs: &[Sender<Command>],
+    stats: &RuntimeStatsInner,
+    joins: &mut Vec<thread::JoinHandle<()>>,
+) {
+    for (idx, tx) in command_txs.iter().enumerate() {
+        stats.increment_command_depth(idx as ShardId);
         let _ = tx.send(Command::Shutdown);
     }
     for join in joins.drain(..) {
@@ -868,7 +627,8 @@ impl Runtime {
         }
         self.is_shutdown = true;
 
-        for tx in &self.shared.command_txs {
+        for (idx, tx) in self.shared.command_txs.iter().enumerate() {
+            self.shared.stats.increment_command_depth(idx as ShardId);
             let _ = tx.send(Command::Shutdown);
         }
 
@@ -913,10 +673,39 @@ impl RuntimeHandle {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        self.inner
+            .shared
+            .stats
+            .spawn_pinned_submitted
+            .fetch_add(1, Ordering::Relaxed);
         spawn_on_shared(&self.inner.shared, shard, fut)
     }
 
     pub fn spawn_stealable<F, T>(&self, fut: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn_with_placement(TaskPlacement::Stealable, fut)
+    }
+
+    pub fn spawn_stealable_on<F, T>(
+        &self,
+        preferred_shard: ShardId,
+        fut: F,
+    ) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn_with_placement(TaskPlacement::StealablePreferred(preferred_shard), fut)
+    }
+
+    pub fn spawn_with_placement<F, T>(
+        &self,
+        placement: TaskPlacement,
+        fut: F,
+    ) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -926,9 +715,33 @@ impl RuntimeHandle {
             return Err(RuntimeError::Closed);
         }
 
-        let next = self.inner.next_shard.fetch_add(1, Ordering::Relaxed);
-        let shard = (next % shards) as ShardId;
-        self.spawn_pinned(shard, fut)
+        match placement {
+            TaskPlacement::Pinned(shard) => self.spawn_pinned(shard, fut),
+            TaskPlacement::RoundRobin => {
+                let next = self.inner.next_shard.fetch_add(1, Ordering::Relaxed);
+                let shard = (next % shards) as ShardId;
+                self.spawn_pinned(shard, fut)
+            }
+            TaskPlacement::Sticky(key) => {
+                let shard = sticky_key_to_shard(key, shards);
+                self.spawn_pinned(shard, fut)
+            }
+            TaskPlacement::Stealable => {
+                let next = self.inner.next_shard.fetch_add(1, Ordering::Relaxed);
+                let preferred = (next % shards) as ShardId;
+                spawn_stealable_on_shared(&self.inner.shared, preferred, fut)
+            }
+            TaskPlacement::StealablePreferred(preferred) => {
+                if usize::from(preferred) >= shards {
+                    return Err(RuntimeError::InvalidShard(preferred));
+                }
+                spawn_stealable_on_shared(&self.inner.shared, preferred, fut)
+            }
+        }
+    }
+
+    pub fn stats_snapshot(&self) -> RuntimeStats {
+        self.inner.shared.stats.snapshot()
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -947,43 +760,6 @@ impl RuntimeHandle {
             shard,
         })
     }
-
-    #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-    pub fn tokio_compat_lane(
-        &self,
-        entries: u32,
-    ) -> Result<TokioCompatLane, tokio_compat::PollReactorError> {
-        Ok(TokioCompatLane {
-            handle: self.clone(),
-            poll: tokio_compat::TokioPollReactor::new(entries)?,
-        })
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-#[derive(Clone)]
-pub struct TokioCompatLane {
-    handle: RuntimeHandle,
-    poll: tokio_compat::TokioPollReactor,
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-#[derive(Clone)]
-pub struct CompatFd {
-    lane: TokioCompatLane,
-    fd: RawFd,
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-pub struct CompatStreamFd {
-    lane: TokioCompatLane,
-    fd: RawFd,
-    read_wait: Option<
-        Pin<Box<dyn Future<Output = Result<(), tokio_compat::PollReactorError>> + Send + 'static>>,
-    >,
-    write_wait: Option<
-        Pin<Box<dyn Future<Output = Result<(), tokio_compat::PollReactorError>> + Send + 'static>>,
-    >,
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -991,119 +767,6 @@ pub struct CompatStreamFd {
 pub struct UringNativeLane {
     handle: RuntimeHandle,
     shard: ShardId,
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl TokioCompatLane {
-    pub fn backend(&self) -> BackendKind {
-        self.handle.backend()
-    }
-
-    pub fn shard_count(&self) -> usize {
-        self.handle.shard_count()
-    }
-
-    pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
-        self.handle.remote(shard)
-    }
-
-    pub fn spawn_pinned<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.handle.spawn_pinned(shard, fut)
-    }
-
-    pub fn spawn_stealable<F, T>(&self, fut: F) -> Result<JoinHandle<T>, RuntimeError>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.handle.spawn_stealable(fut)
-    }
-
-    #[cfg(feature = "uring-native")]
-    pub fn uring_native_lane(&self, shard: ShardId) -> Result<UringNativeLane, RuntimeError> {
-        self.handle.uring_native_lane(shard)
-    }
-
-    pub fn compat_fd(&self, fd: RawFd) -> CompatFd {
-        CompatFd {
-            lane: self.clone(),
-            fd,
-        }
-    }
-
-    pub fn compat_stream_fd(&self, fd: RawFd) -> Result<CompatStreamFd, std::io::Error> {
-        set_nonblocking(fd)?;
-        Ok(CompatStreamFd {
-            lane: self.clone(),
-            fd,
-            read_wait: None,
-            write_wait: None,
-        })
-    }
-
-    pub fn compat_stream<T>(&self, io: &T) -> Result<CompatStreamFd, std::io::Error>
-    where
-        T: std::os::fd::AsRawFd,
-    {
-        self.compat_stream_fd(io.as_raw_fd())
-    }
-
-    pub fn register(
-        &self,
-        fd: RawFd,
-        interest: tokio_compat::PollInterest,
-    ) -> Result<tokio_compat::PollToken, tokio_compat::PollReactorError> {
-        self.poll.register(fd, interest)
-    }
-
-    pub async fn wait_one(
-        &self,
-    ) -> Result<tokio_compat::PollEvent, tokio_compat::PollReactorError> {
-        self.poll.wait_one().await
-    }
-
-    pub async fn deregister(
-        &self,
-        token: tokio_compat::PollToken,
-    ) -> Result<(), tokio_compat::PollReactorError> {
-        self.poll.deregister(token).await
-    }
-
-    pub async fn wait_readable(&self, fd: RawFd) -> Result<(), tokio_compat::PollReactorError> {
-        self.wait_interest(fd, tokio_compat::PollInterest::Readable)
-            .await
-    }
-
-    pub async fn wait_writable(&self, fd: RawFd) -> Result<(), tokio_compat::PollReactorError> {
-        self.wait_interest(fd, tokio_compat::PollInterest::Writable)
-            .await
-    }
-
-    #[doc(hidden)]
-    pub fn debug_poll_registered_count(&self) -> usize {
-        self.poll.registered_count()
-    }
-
-    async fn wait_interest(
-        &self,
-        fd: RawFd,
-        interest: tokio_compat::PollInterest,
-    ) -> Result<(), tokio_compat::PollReactorError> {
-        let token = self.register(fd, interest)?;
-        let mut cleanup = PollRegistrationCleanup::new(self.clone(), token);
-
-        loop {
-            let event = self.wait_one().await?;
-            if event.token() == token {
-                cleanup.disarm();
-                return Ok(());
-            }
-        }
-    }
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -1126,6 +789,7 @@ impl UringNativeLane {
                     let (reply_tx, reply_rx) = oneshot::channel();
                     ctx.inner.local_commands.borrow_mut().push_back(
                         LocalCommand::SubmitNativeRead {
+                            origin_shard: ctx.shard_id(),
                             fd,
                             offset,
                             len,
@@ -1162,6 +826,7 @@ impl UringNativeLane {
                     let (reply_tx, reply_rx) = oneshot::channel();
                     ctx.inner.local_commands.borrow_mut().push_back(
                         LocalCommand::SubmitNativeWrite {
+                            origin_shard: ctx.shard_id(),
                             fd,
                             offset,
                             buf: payload,
@@ -1181,154 +846,6 @@ impl UringNativeLane {
             .map_err(runtime_error_to_io)?;
 
         join.await.map_err(join_error_to_io)?
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl CompatFd {
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    pub async fn readable(&self) -> Result<(), tokio_compat::PollReactorError> {
-        self.lane.wait_readable(self.fd).await
-    }
-
-    pub async fn writable(&self) -> Result<(), tokio_compat::PollReactorError> {
-        self.lane.wait_writable(self.fd).await
-    }
-
-    pub fn into_stream(self) -> Result<CompatStreamFd, std::io::Error> {
-        self.lane.compat_stream_fd(self.fd)
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl CompatStreamFd {
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl tokio::io::AsyncRead for CompatStreamFd {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let dst = buf.initialize_unfilled();
-            let read = unsafe {
-                libc::read(
-                    self.fd,
-                    dst.as_mut_ptr() as *mut libc::c_void,
-                    dst.len() as libc::size_t,
-                )
-            };
-
-            if read >= 0 {
-                self.read_wait = None;
-                buf.advance(read as usize);
-                return Poll::Ready(Ok(()));
-            }
-
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                self.read_wait = None;
-                return Poll::Ready(Err(err));
-            }
-
-            if self.read_wait.is_none() {
-                let lane = self.lane.clone();
-                let fd = self.fd;
-                self.read_wait = Some(Box::pin(async move { lane.wait_readable(fd).await }));
-            }
-
-            let wait = self.read_wait.as_mut().expect("read wait present");
-            match wait.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.read_wait = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    self.read_wait = None;
-                    return Poll::Ready(Err(poll_error_to_io(err)));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl tokio::io::AsyncWrite for CompatStreamFd {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        loop {
-            let wrote = unsafe {
-                libc::write(
-                    self.fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len() as libc::size_t,
-                )
-            };
-            if wrote >= 0 {
-                self.write_wait = None;
-                return Poll::Ready(Ok(wrote as usize));
-            }
-
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                self.write_wait = None;
-                return Poll::Ready(Err(err));
-            }
-
-            if self.write_wait.is_none() {
-                let lane = self.lane.clone();
-                let fd = self.fd;
-                self.write_wait = Some(Box::pin(async move { lane.wait_writable(fd).await }));
-            }
-
-            let wait = self.write_wait.as_mut().expect("write wait present");
-            match wait.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.write_wait = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Err(poll_error_to_io(err)));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-fn poll_error_to_io(err: tokio_compat::PollReactorError) -> std::io::Error {
-    match err {
-        tokio_compat::PollReactorError::Io(io) => io,
-        tokio_compat::PollReactorError::NotFound => {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "poll token not found")
-        }
-        tokio_compat::PollReactorError::Closed => {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "poll reactor closed")
-        }
     }
 }
 
@@ -1362,64 +879,6 @@ fn join_error_to_io(_err: JoinError) -> std::io::Error {
     )
 }
 
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    if (flags & libc::O_NONBLOCK) != 0 {
-        return Ok(());
-    }
-
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-struct PollRegistrationCleanup {
-    lane: TokioCompatLane,
-    token: Option<tokio_compat::PollToken>,
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl PollRegistrationCleanup {
-    fn new(lane: TokioCompatLane, token: tokio_compat::PollToken) -> Self {
-        Self {
-            lane,
-            token: Some(token),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.token = None;
-    }
-}
-
-#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
-impl Drop for PollRegistrationCleanup {
-    fn drop(&mut self) {
-        let Some(token) = self.token.take() else {
-            return;
-        };
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let lane = self.lane.clone();
-            handle.spawn(async move {
-                let _ = lane.deregister(token).await;
-            });
-            return;
-        }
-
-        let _ = self.lane.poll.deregister_blocking(token);
-    }
-}
-
 fn spawn_on_shared<F, T>(
     shared: &Arc<RuntimeShared>,
     shard: ShardId,
@@ -1443,11 +902,136 @@ where
     Ok(JoinHandle { rx: Some(rx) })
 }
 
+fn spawn_stealable_on_shared<F, T>(
+    shared: &Arc<RuntimeShared>,
+    preferred_shard: ShardId,
+    fut: F,
+) -> Result<JoinHandle<T>, RuntimeError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if usize::from(preferred_shard) >= shared.command_txs.len() {
+        return Err(RuntimeError::InvalidShard(preferred_shard));
+    }
+    let target = shared.pick_stealable_target(preferred_shard);
+
+    let (tx, rx) = oneshot::channel();
+    shared
+        .stats
+        .spawn_stealable_submitted
+        .fetch_add(1, Ordering::Relaxed);
+    let Some(inbox) = shared.stealable_inboxes.get(usize::from(target)) else {
+        return Err(RuntimeError::InvalidShard(target));
+    };
+    inbox
+        .lock()
+        .expect("stealable queue lock poisoned")
+        .push_back(StealableTask {
+            preferred_shard,
+            task: Box::pin(async move {
+                let out = fut.await;
+                let _ = tx.send(out);
+            }),
+        });
+    shared.notify_stealable_target(target);
+
+    Ok(JoinHandle { rx: Some(rx) })
+}
+
+fn sticky_key_to_shard(key: u64, shards: usize) -> ShardId {
+    let mixed = key
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (mixed as usize % shards) as ShardId
+}
+
+struct StealableTask {
+    preferred_shard: ShardId,
+    task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+}
+
+type StealableInboxes = Arc<Vec<Arc<Mutex<VecDeque<StealableTask>>>>>;
+
+struct RuntimeStatsInner {
+    shard_command_depths: Vec<AtomicUsize>,
+    spawn_pinned_submitted: AtomicU64,
+    spawn_stealable_submitted: AtomicU64,
+    stealable_executed: AtomicU64,
+    stealable_stolen: AtomicU64,
+    ring_msgs_submitted: AtomicU64,
+    ring_msgs_completed: AtomicU64,
+    ring_msgs_failed: AtomicU64,
+    ring_msgs_backpressure: AtomicU64,
+    native_affinity_violations: AtomicU64,
+    pending_native_ops: AtomicU64,
+}
+
+impl RuntimeStatsInner {
+    fn new(shards: usize) -> Self {
+        let mut shard_command_depths = Vec::with_capacity(shards);
+        for _ in 0..shards {
+            shard_command_depths.push(AtomicUsize::new(0));
+        }
+
+        Self {
+            shard_command_depths,
+            spawn_pinned_submitted: AtomicU64::new(0),
+            spawn_stealable_submitted: AtomicU64::new(0),
+            stealable_executed: AtomicU64::new(0),
+            stealable_stolen: AtomicU64::new(0),
+            ring_msgs_submitted: AtomicU64::new(0),
+            ring_msgs_completed: AtomicU64::new(0),
+            ring_msgs_failed: AtomicU64::new(0),
+            ring_msgs_backpressure: AtomicU64::new(0),
+            native_affinity_violations: AtomicU64::new(0),
+            pending_native_ops: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeStats {
+        RuntimeStats {
+            shard_command_depths: self
+                .shard_command_depths
+                .iter()
+                .map(|depth| depth.load(Ordering::Relaxed))
+                .collect(),
+            spawn_pinned_submitted: self.spawn_pinned_submitted.load(Ordering::Relaxed),
+            spawn_stealable_submitted: self.spawn_stealable_submitted.load(Ordering::Relaxed),
+            stealable_executed: self.stealable_executed.load(Ordering::Relaxed),
+            stealable_stolen: self.stealable_stolen.load(Ordering::Relaxed),
+            ring_msgs_submitted: self.ring_msgs_submitted.load(Ordering::Relaxed),
+            ring_msgs_completed: self.ring_msgs_completed.load(Ordering::Relaxed),
+            ring_msgs_failed: self.ring_msgs_failed.load(Ordering::Relaxed),
+            ring_msgs_backpressure: self.ring_msgs_backpressure.load(Ordering::Relaxed),
+            native_affinity_violations: self.native_affinity_violations.load(Ordering::Relaxed),
+            pending_native_ops: self.pending_native_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    fn increment_command_depth(&self, shard: ShardId) {
+        if let Some(depth) = self.shard_command_depths.get(usize::from(shard)) {
+            depth.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn decrement_command_depth(&self, shard: ShardId) {
+        if let Some(depth) = self.shard_command_depths.get(usize::from(shard)) {
+            let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeShared {
     runtime_id: u64,
     backend: BackendKind,
     command_txs: Vec<Sender<Command>>,
+    stealable_inboxes: StealableInboxes,
+    stats: Arc<RuntimeStatsInner>,
 }
 
 impl RuntimeShared {
@@ -1455,7 +1039,51 @@ impl RuntimeShared {
         let Some(tx) = self.command_txs.get(usize::from(shard)) else {
             return Err(());
         };
-        tx.send(cmd).map_err(|_| ())
+        self.stats.increment_command_depth(shard);
+        if tx.send(cmd).is_ok() {
+            return Ok(());
+        }
+        self.stats.decrement_command_depth(shard);
+        Err(())
+    }
+
+    fn pick_stealable_target(&self, preferred: ShardId) -> ShardId {
+        let preferred_idx = usize::from(preferred);
+        if preferred_idx >= self.stealable_inboxes.len() {
+            return preferred;
+        }
+
+        let mut best_idx = preferred_idx;
+        let mut best_len = self.stealable_inboxes[preferred_idx]
+            .lock()
+            .expect("stealable queue lock poisoned")
+            .len();
+
+        for (idx, queue) in self.stealable_inboxes.iter().enumerate() {
+            if idx == preferred_idx {
+                continue;
+            }
+
+            let len = queue.lock().expect("stealable queue lock poisoned").len();
+            if len < best_len {
+                best_len = len;
+                best_idx = idx;
+            }
+        }
+
+        best_idx as ShardId
+    }
+
+    fn notify_stealable_target(&self, target: ShardId) {
+        if let Some(ctx) = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.runtime_id) {
+            if ctx.shard_id() == target {
+                return;
+            }
+            let _ = ctx.enqueue_local_stealable_wake(target);
+            return;
+        }
+
+        let _ = self.send_to(target, Command::StealableWake);
     }
 }
 
@@ -1665,6 +1293,18 @@ impl ShardCtx {
         Ok(())
     }
 
+    fn enqueue_local_stealable_wake(&self, target: ShardId) -> Result<(), SendError> {
+        if usize::from(target) >= self.inner.remotes.len() {
+            return Err(SendError::Closed);
+        }
+
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitStealableWake { target });
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<SendTicket, SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner
@@ -1686,6 +1326,7 @@ impl ShardCtx {
             .local_commands
             .borrow_mut()
             .push_back(LocalCommand::SubmitNativeRead {
+                origin_shard: self.inner.shard_id,
                 fd,
                 offset,
                 len,
@@ -1712,6 +1353,7 @@ impl ShardCtx {
             .local_commands
             .borrow_mut()
             .push_back(LocalCommand::SubmitNativeWrite {
+                origin_shard: self.inner.shard_id,
                 fd,
                 offset,
                 buf,
@@ -1768,6 +1410,7 @@ pub enum RuntimeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
     Closed,
+    Backpressure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1876,11 +1519,15 @@ enum LocalCommand {
         target: ShardId,
         messages: Vec<(u16, u32)>,
     },
+    SubmitStealableWake {
+        target: ShardId,
+    },
     Flush {
         ack: oneshot::Sender<Result<(), SendError>>,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeRead {
+        origin_shard: ShardId,
         fd: RawFd,
         offset: u64,
         len: usize,
@@ -1888,6 +1535,7 @@ enum LocalCommand {
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeWrite {
+        origin_shard: ShardId,
         fd: RawFd,
         offset: u64,
         buf: Vec<u8>,
@@ -1903,6 +1551,7 @@ enum Command {
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
     },
+    StealableWake,
     Shutdown,
 }
 
@@ -1974,26 +1623,63 @@ impl ShardBackend {
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
         command_txs: &[Sender<Command>],
+        stats: &RuntimeStatsInner,
     ) {
+        stats.ring_msgs_submitted.fetch_add(1, Ordering::Relaxed);
         match self {
             Self::Queue => {
                 let Some(tx) = command_txs.get(usize::from(target)) else {
+                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
                     if let Some(ack) = ack {
                         let _ = ack.send(Err(SendError::Closed));
                     }
                     return;
                 };
-                let _ = tx.send(Command::InjectRawMessage {
-                    from,
-                    tag,
-                    val,
-                    ack,
-                });
+                stats.increment_command_depth(target);
+                if tx
+                    .send(Command::InjectRawMessage {
+                        from,
+                        tag,
+                        val,
+                        ack,
+                    })
+                    .is_err()
+                {
+                    stats.decrement_command_depth(target);
+                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
             #[cfg(target_os = "linux")]
             Self::IoUring(driver) => {
                 if driver.submit_ring_msg(target, tag, val, ack).is_err() {
+                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
                     // submit_ring_msg already completed ack with an error
+                }
+            }
+        }
+    }
+
+    fn submit_stealable_wake(
+        &mut self,
+        target: ShardId,
+        command_txs: &[Sender<Command>],
+        stats: &RuntimeStatsInner,
+    ) {
+        match self {
+            Self::Queue => {
+                let Some(tx) = command_txs.get(usize::from(target)) else {
+                    return;
+                };
+                stats.increment_command_depth(target);
+                if tx.send(Command::StealableWake).is_err() {
+                    stats.decrement_command_depth(target);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(driver) => {
+                stats.ring_msgs_submitted.fetch_add(1, Ordering::Relaxed);
+                if driver.submit_stealable_wake(target).is_err() {
+                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -2016,11 +1702,25 @@ impl ShardBackend {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_native_read(
         &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
         fd: RawFd,
         offset: u64,
         len: usize,
         reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+        stats: &RuntimeStatsInner,
     ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring read violated ring affinity",
+            )));
+            return;
+        }
+
         match self {
             Self::Queue => {
                 let _ = reply.send(Err(std::io::Error::new(
@@ -2037,11 +1737,25 @@ impl ShardBackend {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_native_write(
         &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
         fd: RawFd,
         offset: u64,
         buf: Vec<u8>,
         reply: oneshot::Sender<std::io::Result<usize>>,
+        stats: &RuntimeStatsInner,
     ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring write violated ring affinity",
+            )));
+            return;
+        }
+
         match self {
             Self::Queue => {
                 let _ = reply.send(Err(std::io::Error::new(
@@ -2096,6 +1810,8 @@ struct IoUringDriver {
     native_ops: Slab<NativeIoOp>,
     pending_submit: usize,
     submit_batch_limit: usize,
+    payload_queue_capacity: usize,
+    stats: Arc<RuntimeStatsInner>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2105,6 +1821,8 @@ impl IoUringDriver {
         ring: IoUring,
         ring_fds: Arc<Vec<RawFd>>,
         payload_queues: PayloadQueues,
+        stats: Arc<RuntimeStatsInner>,
+        payload_queue_capacity: usize,
     ) -> Self {
         Self {
             shard_id,
@@ -2116,6 +1834,8 @@ impl IoUringDriver {
             native_ops: Slab::new(),
             pending_submit: 0,
             submit_batch_limit: IOURING_SUBMIT_BATCH,
+            payload_queue_capacity: payload_queue_capacity.max(1),
+            stats,
         }
     }
 
@@ -2188,6 +1908,12 @@ impl IoUringDriver {
         };
 
         let mut queue = queue.lock().expect("payload queue lock poisoned");
+        if queue.len() >= self.payload_queue_capacity {
+            self.stats
+                .ring_msgs_backpressure
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SendError::Backpressure);
+        }
         let was_empty = queue.is_empty();
         queue.push_back(DoorbellPayload { tag, val });
         Ok(was_empty)
@@ -2215,6 +1941,10 @@ impl IoUringDriver {
                 .flags(io_uring::squeue::Flags::SKIP_SUCCESS);
         self.push_entry(entry)?;
         self.mark_submission_pending()
+    }
+
+    fn submit_stealable_wake(&mut self, target: ShardId) -> Result<(), SendError> {
+        self.submit_doorbell(target)
     }
 
     fn submit_flush(
@@ -2255,6 +1985,9 @@ impl IoUringDriver {
             buf: vec![0; len],
             reply,
         });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Read { buf, .. }) => buf.as_mut_ptr(),
@@ -2290,6 +2023,9 @@ impl IoUringDriver {
         };
 
         let native_index = self.native_ops.insert(NativeIoOp::Write { buf, reply });
+        self.stats
+            .pending_native_ops
+            .fetch_add(1, Ordering::Relaxed);
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
             Some(NativeIoOp::Write { buf, .. }) => buf.as_ptr(),
@@ -2333,6 +2069,9 @@ impl IoUringDriver {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn fail_native_op(&mut self, index: usize) {
         if self.native_ops.contains(index) {
+            self.stats
+                .pending_native_ops
+                .fetch_sub(1, Ordering::Relaxed);
             let op = self.native_ops.remove(index);
             match op {
                 NativeIoOp::Read { reply, .. } => {
@@ -2361,6 +2100,9 @@ impl IoUringDriver {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn fail_all_native_ops(&mut self) {
         let ops = std::mem::take(&mut self.native_ops);
+        self.stats
+            .pending_native_ops
+            .fetch_sub(ops.len() as u64, Ordering::Relaxed);
         for (_, op) in ops {
             match op {
                 NativeIoOp::Read { reply, .. } => {
@@ -2439,6 +2181,9 @@ impl IoUringDriver {
             self.drain_payload_queue(from, event_state);
         }
         for (from, tag, val) in msg_events {
+            self.stats
+                .ring_msgs_completed
+                .fetch_add(1, Ordering::Relaxed);
             event_state.push(Event::RingMsg { from, tag, val });
         }
         for (user_data, result) in waiter_completions {
@@ -2474,6 +2219,9 @@ impl IoUringDriver {
             queue.drain(..).collect::<Vec<_>>()
         };
 
+        self.stats
+            .ring_msgs_completed
+            .fetch_add(drained.len() as u64, Ordering::Relaxed);
         for payload in drained {
             event_state.push(Event::RingMsg {
                 from,
@@ -2489,6 +2237,9 @@ impl IoUringDriver {
             return;
         }
 
+        self.stats
+            .pending_native_ops
+            .fetch_sub(1, Ordering::Relaxed);
         let op = self.native_ops.remove(index);
         match op {
             NativeIoOp::Read { mut buf, reply } => {
@@ -2515,6 +2266,14 @@ impl IoUringDriver {
         #[cfg(all(feature = "uring-native", target_os = "linux"))]
         self.fail_all_native_ops();
     }
+}
+
+fn build_stealable_inboxes(shards: usize) -> StealableInboxes {
+    let mut queues = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        queues.push(Arc::new(Mutex::new(VecDeque::new())));
+    }
+    Arc::new(queues)
 }
 
 #[cfg(target_os = "linux")]
@@ -2575,8 +2334,10 @@ fn run_shard(
     shard_id: ShardId,
     rx: Receiver<Command>,
     remotes: Vec<RemoteShard>,
+    stealable_inbox: Arc<Mutex<VecDeque<StealableTask>>>,
     idle_wait: Duration,
     mut backend: ShardBackend,
+    stats: Arc<RuntimeStatsInner>,
 ) {
     let mut pool = LocalPool::new();
     let spawner = pool.spawner();
@@ -2607,15 +2368,23 @@ fn run_shard(
     let mut stop = false;
     while !stop {
         pool.run_until_stalled();
-        drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
+        drain_local_commands(
+            shard_id,
+            &local_commands,
+            &mut backend,
+            &command_txs,
+            &stats,
+        );
+        let stealable_drained = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
         backend.poll(&event_state);
 
-        let mut drained = false;
+        let mut drained = stealable_drained;
         loop {
             match rx.try_recv() {
                 Ok(cmd) => {
+                    stats.decrement_command_depth(shard_id);
                     drained = true;
-                    stop = handle_command(cmd, &spawner, &event_state);
+                    stop = handle_command(cmd, &spawner, &event_state, &stats);
                     if stop {
                         break;
                     }
@@ -2633,13 +2402,21 @@ fn run_shard(
         }
 
         if !drained {
-            drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
+            drain_local_commands(
+                shard_id,
+                &local_commands,
+                &mut backend,
+                &command_txs,
+                &stats,
+            );
+            let _ = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
             if backend.prefers_busy_poll() {
                 thread::yield_now();
             } else {
                 match rx.recv_timeout(idle_wait) {
                     Ok(cmd) => {
-                        stop = handle_command(cmd, &spawner, &event_state);
+                        stats.decrement_command_depth(shard_id);
+                        stop = handle_command(cmd, &spawner, &event_state, &stats);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => stop = true,
@@ -2647,18 +2424,26 @@ fn run_shard(
             }
         }
 
-        drain_local_commands(shard_id, &local_commands, &mut backend, &command_txs);
+        drain_local_commands(
+            shard_id,
+            &local_commands,
+            &mut backend,
+            &command_txs,
+            &stats,
+        );
+        let _ = drain_stealable_tasks(shard_id, &stealable_inbox, &spawner, &stats);
         backend.poll(&event_state);
     }
 
     while let Ok(cmd) = rx.try_recv() {
+        stats.decrement_command_depth(shard_id);
         match cmd {
             Command::InjectRawMessage { ack, .. } => {
                 if let Some(ack) = ack {
                     let _ = ack.send(Err(SendError::Closed));
                 }
             }
-            Command::Spawn(_) | Command::Shutdown => {}
+            Command::Spawn(_) | Command::StealableWake | Command::Shutdown => {}
         }
     }
     backend.shutdown();
@@ -2668,7 +2453,12 @@ fn run_shard(
     });
 }
 
-fn handle_command(cmd: Command, spawner: &LocalSpawner, event_state: &EventState) -> bool {
+fn handle_command(
+    cmd: Command,
+    spawner: &LocalSpawner,
+    event_state: &EventState,
+    stats: &RuntimeStatsInner,
+) -> bool {
     match cmd {
         Command::Spawn(fut) => {
             let _ = spawner.spawn_local(fut);
@@ -2681,13 +2471,41 @@ fn handle_command(cmd: Command, spawner: &LocalSpawner, event_state: &EventState
             ack,
         } => {
             event_state.push(Event::RingMsg { from, tag, val });
+            stats.ring_msgs_completed.fetch_add(1, Ordering::Relaxed);
             if let Some(ack) = ack {
                 let _ = ack.send(Ok(()));
             }
             false
         }
+        Command::StealableWake => false,
         Command::Shutdown => true,
     }
+}
+
+fn drain_stealable_tasks(
+    shard_id: ShardId,
+    stealable_inbox: &Arc<Mutex<VecDeque<StealableTask>>>,
+    spawner: &LocalSpawner,
+    stats: &RuntimeStatsInner,
+) -> bool {
+    let mut drained = false;
+    for _ in 0..64 {
+        let task = stealable_inbox
+            .lock()
+            .expect("stealable queue lock poisoned")
+            .pop_front();
+        let Some(task) = task else {
+            break;
+        };
+
+        drained = true;
+        stats.stealable_executed.fetch_add(1, Ordering::Relaxed);
+        if task.preferred_shard != shard_id {
+            stats.stealable_stolen.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = spawner.spawn_local(task.task);
+    }
+    drained
 }
 
 fn drain_local_commands(
@@ -2695,6 +2513,7 @@ fn drain_local_commands(
     local_commands: &RefCell<VecDeque<LocalCommand>>,
     backend: &mut ShardBackend,
     command_txs: &[Sender<Command>],
+    stats: &RuntimeStatsInner,
 ) {
     loop {
         let cmd = local_commands.borrow_mut().pop_front();
@@ -2708,27 +2527,32 @@ fn drain_local_commands(
                 tag,
                 val,
                 ack,
-            } => backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs),
+            } => backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs, stats),
             LocalCommand::SubmitRingMsgBatch { target, messages } => {
                 for (tag, val) in messages {
-                    backend.submit_ring_msg(shard_id, target, tag, val, None, command_txs);
+                    backend.submit_ring_msg(shard_id, target, tag, val, None, command_txs, stats);
                 }
+            }
+            LocalCommand::SubmitStealableWake { target } => {
+                backend.submit_stealable_wake(target, command_txs, stats)
             }
             LocalCommand::Flush { ack } => backend.flush(ack),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeRead {
+                origin_shard,
                 fd,
                 offset,
                 len,
                 reply,
-            } => backend.submit_native_read(fd, offset, len, reply),
+            } => backend.submit_native_read(shard_id, origin_shard, fd, offset, len, reply, stats),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeWrite {
+                origin_shard,
                 fd,
                 offset,
                 buf,
                 reply,
-            } => backend.submit_native_write(fd, offset, buf, reply),
+            } => backend.submit_native_write(shard_id, origin_shard, fd, offset, buf, reply, stats),
         }
     }
 }

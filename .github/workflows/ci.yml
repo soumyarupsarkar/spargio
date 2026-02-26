@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["master"]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo test
+        run: cargo test
+
+      - name: Cargo test (uring-native)
+        run: cargo test --features uring-native
+
+      - name: Cargo bench --no-run
+        run: cargo bench --no-run
+
+      - name: Fanout bench smoke
+        run: ./scripts/bench_fanout_smoke.sh
+
+      - name: Fanout perf guardrail
+        run: ./scripts/bench_fanout_guardrail.sh

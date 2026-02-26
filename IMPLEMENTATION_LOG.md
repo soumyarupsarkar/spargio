@@ -745,3 +745,601 @@ Validation:
 - `cargo test --features "tokio-compat uring-native"` passes.
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
+
+## Revised Task List: Value Proposition Execution (2026-02-26)
+
+Revised priority list aligned to the current project premise.
+
+Update:
+
+- reordered for faster proof generation.
+- benchmark evidence is moved near the front so we validate value earlier.
+
+- Core premise:
+  - deliver a differentiated `io_uring` runtime centered on `msg_ring`-based cross-shard coordination and work-stealing.
+- Not the core premise:
+  - broad Tokio drop-in compatibility across dependency internals.
+
+### Slice 1: Compatibility De-Scoping
+
+Goal:
+
+- remove or deprecate `tokio-compat` paths as active project focus.
+- retain only interop boundaries needed for mixed-mode deployment.
+
+Done criteria:
+
+- code/docs/feature flags no longer present `tokio-compat` as strategic direction.
+- README + ADRs + crate feature docs reflect runtime-first focus.
+
+Validation gate:
+
+- `cargo test`
+- `cargo test --features uring-native`
+- `cargo bench --no-run`
+
+### Slice 2: Benchmark MVP Harness (Early Proof)
+
+Goal:
+
+- add the first coordination-heavy benchmark harness early:
+  - intra-request fan-out/fan-in
+  - shard-skew scenarios
+  - mixed control/CPU + ring-affine I/O path.
+
+Done criteria:
+
+- reproducible harness exists and can run quickly on dev machines.
+- first p50/p95/p99 + throughput-at-SLO snapshots are recorded.
+
+Validation gate:
+
+- benchmark smoke run in local workflow.
+- `cargo bench --no-run` remains green.
+
+### Slice 3: Placement Policy MVP
+
+Goal:
+
+- implement policy-driven submission placement needed by the benchmark:
+  - explicit shard
+  - sticky-key routing
+  - policy round-robin.
+
+Done criteria:
+
+- public APIs expose placement policy selection.
+- deterministic tests verify routing behavior.
+
+Validation gate:
+
+- placement policy tests + no regression in existing send/flush tests.
+
+### Slice 4: True Work-Stealing MVP
+
+Goal:
+
+- replace spawn-time round-robin with true stealing mechanics:
+  - per-worker deque
+  - global injector
+  - steal loop with cooperative budgeting.
+
+Done criteria:
+
+- stealable tasks move under load/skew.
+- pinned/ring-affine tasks remain protected.
+
+Validation gate:
+
+- scheduler TDD for steal/no-steal invariants and skew behavior.
+
+### Slice 5: Ring-Affine Native I/O Enforcement
+
+Goal:
+
+- make ring-affinity guarantees explicit in runtime state transitions.
+
+Done criteria:
+
+- in-flight native I/O cannot migrate across shards.
+- cancellation and completion paths preserve ownership invariants.
+
+Validation gate:
+
+- race/cancel/drop tests for native I/O ownership safety.
+
+### Slice 6: `msg_ring` Transport Hardening
+
+Goal:
+
+- harden coordination path under load:
+  - batching behavior
+  - doorbell policy
+  - SQ/CQ pressure handling.
+
+Done criteria:
+
+- overload behavior is well-defined and tested.
+- transport metrics (drops/retries/backpressure) are surfaced.
+
+Validation gate:
+
+- stress tests with bounded memory and deterministic failure semantics.
+
+### Slice 7: Mixed-Runtime Boundary API Hardening
+
+Goal:
+
+- define robust communication contracts between `spargio` and host runtimes (Tokio or others):
+  - bounded request/reply channels
+  - backpressure semantics
+  - cancellation and deadline propagation.
+
+Done criteria:
+
+- boundary API is explicit and documented.
+- tests cover cancellation, timeout, and overload behavior.
+
+Validation gate:
+
+- boundary TDD suite (correctness + cancellation + overload).
+- existing core tests remain green.
+
+### Slice 8: Observability and Operator Signals
+
+Goal:
+
+- expose metrics and debug hooks needed for production tuning.
+
+Candidate signals:
+
+- per-shard queue depth
+- steal rate
+- doorbell rate
+- pending native ops
+- timeout/cancel counters.
+
+Done criteria:
+
+- metrics API and/or tracing events documented and test-covered.
+
+Validation gate:
+
+- instrumentation tests + low-overhead checks in benchmark runs.
+
+### Slice 9: CI Regression Gates
+
+Goal:
+
+- lock in correctness and performance trajectory.
+
+Done criteria:
+
+- mandatory correctness suites for scheduler/transport/native I/O invariants.
+- perf guardrails for critical benchmark scenarios.
+
+Validation gate:
+
+- CI blocks regressions on defined thresholds.
+
+### Slice 10: Reference Mixed-Mode Service + Benchmark Expansion
+
+Goal:
+
+- provide a small reference app showing Tokio + `spargio` mixed-runtime usage:
+  - request fan-out into `spargio`
+  - aggregation and response path
+  - explicit cancellation/backpressure boundary.
+- expand benchmark suite from MVP to release-grade scenarios and reporting.
+
+Done criteria:
+
+- runnable example with docs and benchmark entry point.
+- linked from README as adoption blueprint.
+- expanded benchmark scenarios tracked in log and docs.
+
+Validation gate:
+
+- example integration test + benchmark smoke pass.
+
+## Update: Benchmark Review and Suite Refocus (2026-02-26)
+
+Reviewed benchmark outputs against current value proposition (`io_uring` + `msg_ring` coordination + work-stealing trajectory), then refocused the suite.
+
+### Latest quick benchmark sample (Criterion 50ms warmup / 50ms measure / 20 samples)
+
+From `ping_pong`:
+
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`340-360 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.33-1.45 ms`
+- `steady_ping_pong_rtt/spargio_queue`: ~`1.38-1.52 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`63-65 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`84-97 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_64`: ~`23-25 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_all`: ~`13-15 us`
+- `cold_start_ping_pong/spargio_io_uring`: ~`255-288 us`
+- `cold_start_ping_pong/tokio_two_worker`: ~`505-593 us`
+
+From `disk_io`:
+
+- `disk_read_rtt_4k/tokio_two_worker_pread`: ~`1.81-2.01 ms`
+- `disk_read_rtt_4k/io_uring_msg_ring_two_ring_pread`: ~`2.54-2.83 ms`
+
+### Interpretation
+
+- Current value is strongest in control-path/message-path microbenchmarks for `io_uring` backend (`steady_ping_pong_rtt`, unbatched `steady_one_way_send_drain`).
+- Batched Tokio one-way is still faster in that synthetic path, so batching-sensitive comparisons remain context, not headline.
+- Current serialized disk RTT harness does not yet demonstrate `spargio` advantage.
+
+### Benchmark taxonomy update
+
+Primary KPI direction (to add/expand next):
+
+- coordination-heavy fan-out/fan-in benchmarks with skew and tail-latency focus.
+
+Context / microbench (kept):
+
+- `steady_ping_pong_rtt`
+- `steady_one_way_send_drain`
+
+De-emphasized for value-prop claims:
+
+- `cold_start_ping_pong`
+- `tokio_two_worker_batched_*` (useful context, not primary proof)
+- current `disk_read_rtt_4k` harness (until reworked beyond strict serialized request/ack)
+
+### Glommio benchmark removal decision
+
+Decision:
+
+- remove Glommio comparison path for now.
+
+Reason:
+
+- not currently aligned with primary proof objective and adds maintenance noise.
+- current harness shape is not the target benchmark niche for `spargio`.
+
+Changes applied:
+
+- removed Glommio benchmark harness/code from `benches/ping_pong.rs`.
+- removed `glommio` dependency and `glommio-bench` feature from `Cargo.toml`.
+- removed `glommio-bench` mention from README feature list.
+
+Validation:
+
+- `cargo test` passes.
+- `cargo test --features uring-native` passes.
+- `cargo bench --no-run` passes.
+
+## Update: Tokio-Compat Removal + Fanout/Fan-in Benchmark MVP (2026-02-26)
+
+Applied the scope change to fully de-emphasize drop-in Tokio emulation and move proof work to coordination-heavy fan-out/fan-in benchmarks.
+
+### Tokio-compat removal (code + tests)
+
+Changes:
+
+- removed `tokio-compat` feature flag from `Cargo.toml`.
+- removed optional non-dev Tokio dependency from `[dependencies]`.
+- removed all `tokio-compat` lane and poll-emulation code from `src/lib.rs`:
+  - deleted `tokio_compat` module.
+  - deleted `RuntimeHandle::tokio_compat_lane(...)`.
+  - deleted `TokioCompatLane`, `CompatFd`, `CompatStreamFd`, and associated helpers.
+- removed compat-only TDD files:
+  - `tests/tokio_compat_fd_tdd.rs`
+  - `tests/tokio_compat_stream_tdd.rs`
+  - `tests/tokio_compat_stream_hardening_tdd.rs`
+  - `tests/tokio_poll_reactor_tdd.rs`
+  - `tests/tokio_poll_async_tdd.rs`
+  - `tests/tokio_runtime_lane_tdd.rs`
+  - `tests/tokio_runtime_wait_tdd.rs`
+- renamed remaining Tokio interoperability coverage from `tests/tokio_compat_tdd.rs` to `tests/tokio_interop_tdd.rs` for clearer intent.
+
+### New benchmark: fan-out/fan-in with skew
+
+Added `benches/fanout_fanin.rs` and registered it in `Cargo.toml`.
+
+Harness design:
+
+- Same worker width on both runtimes (`4` threads/shards).
+- Same workload model on both runtimes:
+  - per-request spawn fan-out (`16` branches), then fan-in on join.
+  - deterministic synthetic compute per branch.
+- Two scenarios:
+  - `fanout_fanin_balanced`: all branches equal work.
+  - `fanout_fanin_skewed`: one hot branch per request has much heavier work.
+- Bench variants:
+  - `tokio_mt_4`
+  - `spargio_queue`
+  - `spargio_io_uring` (Linux)
+
+### Quick MVP benchmark sample
+
+Command:
+
+- `cargo bench --bench fanout_fanin -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+Observed ranges:
+
+- `fanout_fanin_balanced/tokio_mt_4`: ~`1.41-1.51 ms`
+- `fanout_fanin_balanced/spargio_queue`: ~`10.7-18.1 ms`
+- `fanout_fanin_balanced/spargio_io_uring`: ~`0.782-0.813 ms`
+- `fanout_fanin_skewed/tokio_mt_4`: ~`2.34-2.40 ms`
+- `fanout_fanin_skewed/spargio_queue`: ~`54.0-54.4 ms`
+- `fanout_fanin_skewed/spargio_io_uring`: ~`1.882-1.889 ms`
+
+### Validation
+
+- `cargo fmt` passes.
+- `cargo test` passes.
+- `cargo test --features uring-native` passes.
+- `cargo bench --no-run` passes (includes `fanout_fanin`).
+
+## Direction Note: Full io_uring Runtime Scope (2026-02-26)
+
+Long-term direction:
+
+- evolve `spargio` toward a fuller `io_uring` runtime surface (disk + network I/O), comparable in scope to specialized runtimes.
+
+Near-term priority remains unchanged:
+
+- prove differentiated value first in `msg_ring`-coordinated cross-shard scheduling, placement, and work-stealing benchmarks.
+
+Implication for sequencing:
+
+- full disk/network API breadth is explicitly treated as a later expansion track after current scheduler/coordination milestones are validated.
+
+## Update: Slice Execution MVP (Placement, Stealing, Boundary, CI, Reference App) (2026-02-26)
+
+Executed the remaining planned slices in MVP form with red/green TDD coverage.
+
+### Red-phase tests added
+
+New failing suites introduced first:
+
+- `tests/slices_tdd.rs`
+  - placement policy routing (`Pinned`, `Sticky`)
+  - stealable execution on non-preferred shard under load
+  - runtime stats snapshot counters/shape
+- `tests/boundary_tdd.rs`
+  - bounded overload behavior (`Overloaded`)
+  - blocking timeout behavior (`Timeout`)
+  - cancellation-safe reply path (`Canceled`)
+  - deadline metadata propagation
+
+Then implementation was iterated until all tests passed.
+
+### Slice 3: Placement policy MVP
+
+Implemented:
+
+- `TaskPlacement` enum:
+  - `Pinned(ShardId)`
+  - `RoundRobin`
+  - `Sticky(u64)`
+  - `Stealable`
+  - `StealablePreferred(ShardId)`
+- `RuntimeHandle::spawn_with_placement(...)`
+- `RuntimeHandle::spawn_stealable_on(preferred_shard, ...)`
+
+Notes:
+
+- sticky placement uses stable key hashing to shard index.
+
+### Slice 4: True work-stealing MVP
+
+Implemented:
+
+- global stealable injector channel (`StealableTask`) shared across shard workers.
+- shard workers opportunistically drain stealable tasks and execute locally.
+- preferred-shard hint tracking with `stealable_stolen` counter when execution shard differs from preferred shard.
+
+Validation:
+
+- `stealable_preferred_tasks_can_run_on_another_shard_under_load` now passes.
+
+### Slice 5: Ring-affine native I/O enforcement
+
+Implemented:
+
+- native local commands now carry `origin_shard`.
+- backend validates `origin_shard == current_shard` before submitting native ops.
+- affinity violations increment `native_affinity_violations` and fail the operation.
+- pending native-op gauge (`pending_native_ops`) is tracked.
+
+### Slice 6: `msg_ring` transport hardening
+
+Implemented:
+
+- configurable `msg_ring_queue_capacity` on `RuntimeBuilder`.
+- io_uring payload queues enforce bounded capacity.
+- overload now reports `SendError::Backpressure` for saturated payload queues.
+- backpressure counter surfaced via `ring_msgs_backpressure`.
+
+### Slice 7: Mixed-runtime boundary API hardening
+
+Implemented `spargio::boundary` module:
+
+- bounded channel construction via `boundary::channel(capacity)`.
+- client API:
+  - `call(...)`
+  - `try_call(...)`
+  - `call_with_timeout(...)`
+- server API:
+  - `recv()`
+  - `recv_timeout(...)`
+- request API:
+  - `request()`
+  - `deadline()`
+  - `respond(...)` (cancellation-safe)
+- ticket API:
+  - `Future` implementation
+  - `wait_timeout_blocking(...)`
+
+Error model:
+
+- `BoundaryError::{Closed, Overloaded, Timeout, Canceled}`.
+
+### Slice 8: Observability and operator signals
+
+Implemented snapshot API:
+
+- `RuntimeHandle::stats_snapshot() -> RuntimeStats`
+
+Current signals:
+
+- per-shard command depth (`shard_command_depths`)
+- submitted pinned / stealable spawn counts
+- stealable executed / stolen counts
+- ring message submitted / completed / failed / backpressure counts
+- native affinity violation count
+- pending native-op gauge
+
+### Slice 9: CI regression gates
+
+Added:
+
+- `.github/workflows/ci.yml` with gates for:
+  - format check
+  - tests
+  - `uring-native` tests
+  - `cargo bench --no-run`
+  - fan-out benchmark smoke + guardrail scripts
+
+Added scripts:
+
+- `scripts/bench_fanout_smoke.sh`
+- `scripts/bench_fanout_guardrail.sh`
+
+### Slice 10: Reference mixed-mode service + benchmark expansion
+
+Added:
+
+- `examples/mixed_mode_service.rs`
+  - Tokio-hosted request fan-out to `spargio` via boundary channel
+  - stealable placement usage + aggregation response path
+  - timeout-aware boundary call path
+
+Benchmark update:
+
+- `benches/fanout_fanin.rs` now records throughput units per group (`Throughput::Elements`).
+
+### Validation
+
+- `cargo test` passes.
+- `cargo test --features uring-native` passes.
+- `cargo bench --no-run` remains green.
+
+## Update: Full Benchmark Snapshot Refresh (2026-02-26)
+
+Captured a fresh baseline across all active benchmark suites after slice MVP implementation.
+
+### Command profile
+
+- `cargo bench --bench ping_pong -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench fanout_fanin -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench disk_io -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Observed ranges
+
+From `ping_pong`:
+
+- `steady_ping_pong_rtt/spargio_queue`: ~`1.37-1.42 ms`
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`353-380 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.41-1.51 ms`
+- `steady_one_way_send_drain/spargio_queue`: ~`1.31-1.35 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`66.9-69.1 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`87.2-91.1 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_64`: ~`22.4-23.4 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_all`: ~`13.7-14.7 us`
+- `cold_start_ping_pong/spargio_queue`: ~`2.43-2.44 ms`
+- `cold_start_ping_pong/spargio_io_uring`: ~`242-264 us`
+- `cold_start_ping_pong/tokio_two_worker`: ~`511-560 us`
+
+From `fanout_fanin`:
+
+- `fanout_fanin_balanced/tokio_mt_4`: ~`1.35-1.38 ms`
+- `fanout_fanin_balanced/spargio_queue`: ~`3.80-4.10 ms`
+- `fanout_fanin_balanced/spargio_io_uring`: ~`1.61-1.65 ms`
+- `fanout_fanin_skewed/tokio_mt_4`: ~`2.39-2.59 ms`
+- `fanout_fanin_skewed/spargio_queue`: ~`3.44-3.73 ms`
+- `fanout_fanin_skewed/spargio_io_uring`: ~`1.99-2.00 ms`
+
+From `disk_io`:
+
+- `disk_read_rtt_4k/tokio_two_worker_pread`: ~`1.80-1.95 ms`
+- `disk_read_rtt_4k/io_uring_msg_ring_two_ring_pread`: ~`2.61-2.78 ms`
+
+### Readout
+
+- `spargio_io_uring` is strongest in control-path RTT and cold-start latency.
+- one-way unbatched send/drain favors `spargio_io_uring`, but batched Tokio remains significantly faster.
+- skewed fan-out/fan-in currently favors `spargio_io_uring`.
+- balanced fan-out/fan-in currently favors Tokio.
+- current disk RTT harness remains a loss for the io_uring+msg_ring path.
+
+## Update: msg_ring Stealable Dispatch + Benchmark Refresh (2026-02-26)
+
+Implemented work-stealing data-path changes to align with project premise:
+
+- replaced global stealable injector channel with per-shard stealable inboxes.
+- changed stealable submit path to:
+  1. choose target shard by inbox depth (submission-time decision),
+  2. enqueue task into target inbox,
+  3. wake target via `msg_ring` doorbell on `IoUring` backend.
+- added wake plumbing:
+  - `LocalCommand::SubmitStealableWake`
+  - `Command::StealableWake`
+  - backend `submit_stealable_wake(...)` path.
+- kept queue-backend fallback wake semantics for non-io_uring runs.
+
+TDD additions:
+
+- added Linux io_uring slice test proving stealable dispatch submits ring wake traffic:
+  - `tests/slices_tdd.rs::io_uring_stealable_dispatch_uses_msg_ring_wake`.
+
+Validation:
+
+- `cargo fmt`
+- `cargo test`
+- `cargo test --features uring-native`
+
+Benchmark profile:
+
+- `cargo bench --bench ping_pong -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench fanout_fanin -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench disk_io -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `./scripts/bench_fanout_guardrail.sh`
+
+Observed ranges:
+
+From `ping_pong`:
+
+- `steady_ping_pong_rtt/spargio_io_uring`: ~`352-370 us`
+- `steady_ping_pong_rtt/tokio_two_worker`: ~`1.30-1.42 ms`
+- `steady_one_way_send_drain/spargio_io_uring`: ~`66.6-68.3 us`
+- `steady_one_way_send_drain/tokio_two_worker`: ~`84.0-90.6 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_64`: ~`24.2-26.1 us`
+- `steady_one_way_send_drain/tokio_two_worker_batched_all`: ~`14.4-15.7 us`
+- `cold_start_ping_pong/spargio_io_uring`: ~`248-305 us`
+- `cold_start_ping_pong/tokio_two_worker`: ~`500-555 us`
+
+From `fanout_fanin`:
+
+- `fanout_fanin_balanced/tokio_mt_4`: ~`1.43-1.51 ms`
+- `fanout_fanin_balanced/spargio_io_uring`: ~`982-989 us`
+- `fanout_fanin_skewed/tokio_mt_4`: ~`2.35-2.42 ms`
+- `fanout_fanin_skewed/spargio_io_uring`: ~`1.92-1.93 ms`
+
+From `disk_io`:
+
+- `disk_read_rtt_4k/tokio_two_worker_pread`: ~`1.82-2.00 ms`
+- `disk_read_rtt_4k/io_uring_msg_ring_two_ring_pread`: ~`2.52-2.74 ms`
+
+Interpretation:
+
+- value proposition now shows up directly in coordination-heavy fan-out/fan-in:
+  - balanced and skewed scenarios both favor `spargio_io_uring`.
+- compared with earlier same-day snapshot, `fanout_fanin_balanced` flipped from loss to win after the stealable dispatch changes.
+- batched Tokio one-way throughput remains a known gap.
+- disk RTT benchmark remains a known gap.

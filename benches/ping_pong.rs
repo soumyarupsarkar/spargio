@@ -432,201 +432,6 @@ impl Drop for TokioHarness {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-enum GlommioWire {
-    Ping(u32),
-    OneWay(u32),
-    Flush,
-    Shutdown,
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-enum GlommioAck {
-    Ping(u32),
-    Flush(u32),
-    Shutdown,
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-enum GlommioCmd {
-    PingPong {
-        rounds: usize,
-        reply: std_mpsc::Sender<u64>,
-    },
-    OneWay {
-        rounds: usize,
-        reply: std_mpsc::Sender<u64>,
-    },
-    Shutdown {
-        reply: std_mpsc::Sender<()>,
-    },
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-struct GlommioHarness {
-    cmd_tx: flume::Sender<GlommioCmd>,
-    client_thread: Option<thread::JoinHandle<()>>,
-    responder_thread: Option<thread::JoinHandle<()>>,
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-impl GlommioHarness {
-    fn new() -> Self {
-        use glommio::{LocalExecutorBuilder, Placement};
-
-        let (wire_tx, wire_rx) = flume::unbounded::<GlommioWire>();
-        let (ack_tx, ack_rx) = flume::unbounded::<GlommioAck>();
-        let (cmd_tx, cmd_rx) = flume::unbounded::<GlommioCmd>();
-
-        let responder_thread = thread::Builder::new()
-            .name("bench-glommio-responder".to_owned())
-            .spawn(move || {
-                let executor = LocalExecutorBuilder::new(Placement::Unbound)
-                    .make()
-                    .expect("glommio responder executor");
-                executor.run(async move {
-                    let mut one_way_acc = 0u32;
-                    while let Ok(msg) = wire_rx.recv_async().await {
-                        match msg {
-                            GlommioWire::Ping(v) => {
-                                if ack_tx.send_async(GlommioAck::Ping(v)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            GlommioWire::OneWay(v) => {
-                                one_way_acc = one_way_acc.wrapping_add(v);
-                            }
-                            GlommioWire::Flush => {
-                                if ack_tx
-                                    .send_async(GlommioAck::Flush(one_way_acc))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                one_way_acc = 0;
-                            }
-                            GlommioWire::Shutdown => {
-                                let _ = ack_tx.send_async(GlommioAck::Shutdown).await;
-                                break;
-                            }
-                        }
-                    }
-                });
-            })
-            .expect("spawn glommio responder thread");
-
-        let client_thread = thread::Builder::new()
-            .name("bench-glommio-client".to_owned())
-            .spawn(move || {
-                let executor = LocalExecutorBuilder::new(Placement::Unbound)
-                    .make()
-                    .expect("glommio client executor");
-                executor.run(async move {
-                    while let Ok(cmd) = cmd_rx.recv_async().await {
-                        match cmd {
-                            GlommioCmd::PingPong { rounds, reply } => {
-                                let mut checksum = 0u64;
-                                for i in 0..(rounds as u32) {
-                                    wire_tx
-                                        .send_async(GlommioWire::Ping(i))
-                                        .await
-                                        .expect("send ping");
-                                    loop {
-                                        match ack_rx.recv_async().await {
-                                            Ok(GlommioAck::Ping(v)) => {
-                                                checksum += u64::from(v);
-                                                break;
-                                            }
-                                            Ok(GlommioAck::Flush(_)) => {}
-                                            Ok(GlommioAck::Shutdown) | Err(_) => break,
-                                        }
-                                    }
-                                }
-                                let _ = reply.send(checksum);
-                            }
-                            GlommioCmd::OneWay { rounds, reply } => {
-                                for i in 0..(rounds as u32) {
-                                    wire_tx
-                                        .send_async(GlommioWire::OneWay(i))
-                                        .await
-                                        .expect("send one-way");
-                                }
-                                wire_tx
-                                    .send_async(GlommioWire::Flush)
-                                    .await
-                                    .expect("send flush");
-                                let sum = loop {
-                                    match ack_rx.recv_async().await {
-                                        Ok(GlommioAck::Flush(v)) => {
-                                            break u64::from(v);
-                                        }
-                                        Ok(GlommioAck::Ping(_)) => {}
-                                        Ok(GlommioAck::Shutdown) | Err(_) => break 0,
-                                    }
-                                };
-                                let _ = reply.send(sum);
-                            }
-                            GlommioCmd::Shutdown { reply } => {
-                                let _ = wire_tx.send_async(GlommioWire::Shutdown).await;
-                                loop {
-                                    match ack_rx.recv_async().await {
-                                        Ok(GlommioAck::Shutdown) | Err(_) => break,
-                                        Ok(GlommioAck::Ping(_)) | Ok(GlommioAck::Flush(_)) => {}
-                                    }
-                                }
-                                let _ = reply.send(());
-                                break;
-                            }
-                        }
-                    }
-                });
-            })
-            .expect("spawn glommio client thread");
-
-        Self {
-            cmd_tx,
-            client_thread: Some(client_thread),
-            responder_thread: Some(responder_thread),
-        }
-    }
-
-    fn ping_pong(&mut self, rounds: usize) -> u64 {
-        let (tx, rx) = std_mpsc::channel();
-        self.cmd_tx
-            .send(GlommioCmd::PingPong { rounds, reply: tx })
-            .expect("send command");
-        rx.recv().expect("recv reply")
-    }
-
-    fn one_way(&mut self, rounds: usize) -> u64 {
-        let (tx, rx) = std_mpsc::channel();
-        self.cmd_tx
-            .send(GlommioCmd::OneWay { rounds, reply: tx })
-            .expect("send command");
-        rx.recv().expect("recv reply")
-    }
-
-    fn shutdown(&mut self) {
-        let (tx, rx) = std_mpsc::channel();
-        let _ = self.cmd_tx.send(GlommioCmd::Shutdown { reply: tx });
-        let _ = rx.recv();
-        if let Some(join) = self.client_thread.take() {
-            let _ = join.join();
-        }
-        if let Some(join) = self.responder_thread.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-impl Drop for GlommioHarness {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 fn run_spargio_cold(rounds: usize, backend: BackendKind) {
     let mut harness = MsgRingHarness::new(backend).expect("runtime harness");
     black_box(harness.ping_pong(rounds));
@@ -634,12 +439,6 @@ fn run_spargio_cold(rounds: usize, backend: BackendKind) {
 
 fn run_tokio_cold(rounds: usize) {
     let mut harness = TokioHarness::new();
-    black_box(harness.ping_pong(rounds));
-}
-
-#[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-fn run_glommio_cold(rounds: usize) {
-    let mut harness = GlommioHarness::new();
     black_box(harness.ping_pong(rounds));
 }
 
@@ -665,15 +464,6 @@ fn bench_steady_ping_pong(c: &mut Criterion) {
     group.bench_function("tokio_two_worker", |b| {
         b.iter(|| black_box(tokio.ping_pong(RTT_ROUNDS)))
     });
-
-    #[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-    {
-        let mut glommio = GlommioHarness::new();
-        black_box(glommio.ping_pong(16));
-        group.bench_function("glommio_two_executors", |b| {
-            b.iter(|| black_box(glommio.ping_pong(RTT_ROUNDS)))
-        });
-    }
 
     group.finish();
 }
@@ -714,15 +504,6 @@ fn bench_steady_one_way(c: &mut Criterion) {
         b.iter(|| black_box(tokio_batched_all.one_way_batched(ONE_WAY_ROUNDS, ONE_WAY_ROUNDS)))
     });
 
-    #[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-    {
-        let mut glommio = GlommioHarness::new();
-        black_box(glommio.one_way(64));
-        group.bench_function("glommio_two_executors", |b| {
-            b.iter(|| black_box(glommio.one_way(ONE_WAY_ROUNDS)))
-        });
-    }
-
     group.finish();
 }
 
@@ -742,11 +523,6 @@ fn bench_cold_start_ping_pong(c: &mut Criterion) {
 
     group.bench_function("tokio_two_worker", |b| {
         b.iter(|| run_tokio_cold(COLD_ROUNDS))
-    });
-
-    #[cfg(all(target_os = "linux", feature = "glommio-bench"))]
-    group.bench_function("glommio_two_executors", |b| {
-        b.iter(|| run_glommio_cold(COLD_ROUNDS))
     });
 
     group.finish();
