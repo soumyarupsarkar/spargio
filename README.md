@@ -157,3 +157,13 @@ Development style is red/green TDD:
 1. Add failing tests.
 2. Implement minimal passing behavior.
 3. Validate with full test and benchmark checks.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in `spargio` by you shall be licensed as MIT, without any
+additional terms or conditions.
