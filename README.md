@@ -1,6 +1,6 @@
 # spargio
 
-`spargio` is an experimental Rust `io_uring` runtime focused on `msg_ring`-based cross-shard coordination and work-stealing-friendly scheduling.
+`spargio` is an experimental asynchronous runtime for Rust based on `io_uring`, with cross-shard coordination and work-stealing based on `msg_ring`.
 
 Built with Codex.
 
