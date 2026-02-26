@@ -73,11 +73,7 @@ async fn tokio_handle_remote_send_from_tokio_task_delivers_event() {
         .expect("spawn receiver");
 
     let sender = tokio::spawn(async move {
-        remote
-            .send_raw(77, 9)
-            .expect("send")
-            .await
-            .expect("ticket");
+        remote.send_raw(77, 9).expect("send").await.expect("ticket");
     });
 
     sender.await.expect("tokio sender");

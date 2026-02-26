@@ -655,3 +655,93 @@ Validation:
 - `cargo test` passes.
 - `cargo bench --no-run` passes.
 - `cargo bench --no-run --features glommio-bench` passes.
+
+## Recap: Requested Slice Sequence and Status (2026-02-26)
+
+Per the requested "functional slices first" plan, the sequence and current status are:
+
+1. Compat ergonomics slice: `completed`.
+2. Native fast-lane MVP slice: `completed` (this update).
+3. Mixed-mode app slice: `partially completed` (compat + native lanes both exist; additional app-level helpers still pending).
+4. Submission-time placement policies: `not started`.
+5. True work-stealing scheduler: `not started`.
+6. Poll path re-home to shard driver + `msg_ring` wakeups: `not started`.
+7. Hardening + benchmark gate slice: `in progress` (coverage exists, full stress/benchmark gates pending).
+
+## Update: Compat Stream Wrappers (TDD)
+
+Extended compat ergonomics with Tokio `AsyncRead`/`AsyncWrite` wrappers for easier migration from socket-like code.
+
+### Red phase
+
+Added failing tests:
+
+- `tests/tokio_compat_stream_tdd.rs`
+  - `compat_stream_fd_reads_and_writes`
+  - `compat_stream_fd_pending_read_wakes_on_write`
+- `tests/tokio_compat_stream_hardening_tdd.rs`
+  - `compat_fd_into_stream_reads_bytes`
+  - `compat_stream_reads_eof_as_zero`
+  - `lane_compat_stream_helper_wraps_asrawfd`
+
+### Green phase
+
+Implemented in `src/lib.rs` (Linux + `tokio-compat`):
+
+- `CompatStreamFd` wrapper.
+- `TokioCompatLane::compat_stream_fd(fd)`.
+- `TokioCompatLane::compat_stream<T: AsRawFd>(&T)`.
+- `CompatFd::into_stream()`.
+- `AsyncRead`/`AsyncWrite` impls for `CompatStreamFd` using:
+  - nonblocking `libc::read`/`libc::write`
+  - lane readiness waits (`wait_readable`/`wait_writable`) on `WouldBlock`.
+- helper utilities:
+  - `set_nonblocking(fd)`
+  - poll-error -> `std::io::Error` mapping.
+
+Validation:
+
+- `cargo test --features tokio-compat` passes.
+- `cargo test` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.
+
+## Update: `uring-native` Fast-Lane MVP (TDD)
+
+Implemented first native lane API for direct `io_uring` read/write-at operations with pinned shard submission.
+
+### Red phase
+
+Added failing tests in `tests/uring_native_tdd.rs` (`cfg(all(feature = "uring-native", target_os = "linux"))`):
+
+- `uring_native_lane_requires_io_uring_backend`
+- `uring_native_lane_reads_file_at_offset`
+- `uring_native_lane_writes_file_at_offset`
+
+### Green phase
+
+Implemented in `src/lib.rs` (Linux + `uring-native`):
+
+- `RuntimeHandle::uring_native_lane(shard) -> Result<UringNativeLane, RuntimeError>`.
+- `UringNativeLane` API:
+  - `read_at(fd, offset, len).await -> io::Result<Vec<u8>>`
+  - `write_at(fd, offset, buf).await -> io::Result<usize>`
+  - `shard()`.
+- `TokioCompatLane::uring_native_lane(shard)` bridge (when both `tokio-compat` and `uring-native` features are enabled).
+- Native op command plumbing from shard tasks to backend.
+- `IoUringDriver` native op tracking/completion with `IORING_OP_READ` and `IORING_OP_WRITE`.
+- Completion demuxing for native op user-data and cleanup on shutdown/error paths.
+
+Notes:
+
+- Native lane currently uses pinned submission through shard-local command flow.
+- Queue backend intentionally returns `UnsupportedBackend` for native lane creation.
+
+Validation:
+
+- `cargo test` passes.
+- `cargo test --features tokio-compat` passes.
+- `cargo test --features uring-native` passes.
+- `cargo test --features "tokio-compat uring-native"` passes.
+- `cargo bench --no-run` passes.
+- `cargo bench --no-run --features glommio-bench` passes.

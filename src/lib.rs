@@ -34,6 +34,8 @@ const MSG_RING_CQE_FLAG: u32 = 1 << 8;
 const IOURING_SUBMIT_BATCH: usize = 64;
 #[cfg(target_os = "linux")]
 const DOORBELL_TAG: u16 = u16::MAX;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const NATIVE_OP_USER_BIT: u64 = 1 << 63;
 
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 pub mod tokio_compat {
@@ -200,9 +202,9 @@ pub mod tokio_compat {
                     return match result {
                         0 => Ok(()),
                         r if r == -libc::ENOENT => Err(PollReactorError::NotFound),
-                        r if r < 0 => Err(PollReactorError::Io(std::io::Error::from_raw_os_error(
-                            -r,
-                        ))),
+                        r if r < 0 => {
+                            Err(PollReactorError::Io(std::io::Error::from_raw_os_error(-r)))
+                        }
                         _ => Ok(()),
                     };
                 }
@@ -240,10 +242,7 @@ pub mod tokio_compat {
             Ok(internal_result)
         }
 
-        fn submit_entry(
-            &mut self,
-            entry: io_uring::squeue::Entry,
-        ) -> Result<(), PollReactorError> {
+        fn submit_entry(&mut self, entry: io_uring::squeue::Entry) -> Result<(), PollReactorError> {
             self.push_entry(entry)?;
             self.ring.submit().map_err(PollReactorError::Io)?;
             Ok(())
@@ -405,7 +404,10 @@ pub mod tokio_compat {
         }
 
         fn send_cmd(&self, cmd: ReactorCmd) -> Result<(), PollReactorError> {
-            self.inner.cmd_tx.send(cmd).map_err(|_| PollReactorError::Closed)
+            self.inner
+                .cmd_tx
+                .send(cmd)
+                .map_err(|_| PollReactorError::Closed)
         }
     }
 
@@ -929,6 +931,23 @@ impl RuntimeHandle {
         self.spawn_pinned(shard, fut)
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    pub fn uring_native_lane(&self, shard: ShardId) -> Result<UringNativeLane, RuntimeError> {
+        if self.backend() != BackendKind::IoUring {
+            return Err(RuntimeError::UnsupportedBackend(
+                "uring-native requires io_uring backend",
+            ));
+        }
+        if usize::from(shard) >= self.inner.remotes.len() {
+            return Err(RuntimeError::InvalidShard(shard));
+        }
+
+        Ok(UringNativeLane {
+            handle: self.clone(),
+            shard,
+        })
+    }
+
     #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
     pub fn tokio_compat_lane(
         &self,
@@ -953,6 +972,25 @@ pub struct TokioCompatLane {
 pub struct CompatFd {
     lane: TokioCompatLane,
     fd: RawFd,
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+pub struct CompatStreamFd {
+    lane: TokioCompatLane,
+    fd: RawFd,
+    read_wait: Option<
+        Pin<Box<dyn Future<Output = Result<(), tokio_compat::PollReactorError>> + Send + 'static>>,
+    >,
+    write_wait: Option<
+        Pin<Box<dyn Future<Output = Result<(), tokio_compat::PollReactorError>> + Send + 'static>>,
+    >,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone)]
+pub struct UringNativeLane {
+    handle: RuntimeHandle,
+    shard: ShardId,
 }
 
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
@@ -985,11 +1023,33 @@ impl TokioCompatLane {
         self.handle.spawn_stealable(fut)
     }
 
+    #[cfg(feature = "uring-native")]
+    pub fn uring_native_lane(&self, shard: ShardId) -> Result<UringNativeLane, RuntimeError> {
+        self.handle.uring_native_lane(shard)
+    }
+
     pub fn compat_fd(&self, fd: RawFd) -> CompatFd {
         CompatFd {
             lane: self.clone(),
             fd,
         }
+    }
+
+    pub fn compat_stream_fd(&self, fd: RawFd) -> Result<CompatStreamFd, std::io::Error> {
+        set_nonblocking(fd)?;
+        Ok(CompatStreamFd {
+            lane: self.clone(),
+            fd,
+            read_wait: None,
+            write_wait: None,
+        })
+    }
+
+    pub fn compat_stream<T>(&self, io: &T) -> Result<CompatStreamFd, std::io::Error>
+    where
+        T: std::os::fd::AsRawFd,
+    {
+        self.compat_stream_fd(io.as_raw_fd())
     }
 
     pub fn register(
@@ -1000,7 +1060,9 @@ impl TokioCompatLane {
         self.poll.register(fd, interest)
     }
 
-    pub async fn wait_one(&self) -> Result<tokio_compat::PollEvent, tokio_compat::PollReactorError> {
+    pub async fn wait_one(
+        &self,
+    ) -> Result<tokio_compat::PollEvent, tokio_compat::PollReactorError> {
         self.poll.wait_one().await
     }
 
@@ -1044,6 +1106,84 @@ impl TokioCompatLane {
     }
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl UringNativeLane {
+    pub fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeRead {
+                            fd,
+                            offset,
+                            len,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native read response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
+    }
+
+    pub async fn write_at(&self, fd: RawFd, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let payload = buf.to_vec();
+        let join = self
+            .handle
+            .spawn_pinned(self.shard, async move {
+                let reply_rx = {
+                    let ctx = ShardCtx::current().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "native lane task missing shard context",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    ctx.inner.local_commands.borrow_mut().push_back(
+                        LocalCommand::SubmitNativeWrite {
+                            fd,
+                            offset,
+                            buf: payload,
+                            reply: reply_tx,
+                        },
+                    );
+                    reply_rx
+                };
+
+                reply_rx.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native write response channel closed",
+                    ))
+                })
+            })
+            .map_err(runtime_error_to_io)?;
+
+        join.await.map_err(join_error_to_io)?
+    }
+}
+
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 impl CompatFd {
     pub fn fd(&self) -> RawFd {
@@ -1057,6 +1197,188 @@ impl CompatFd {
     pub async fn writable(&self) -> Result<(), tokio_compat::PollReactorError> {
         self.lane.wait_writable(self.fd).await
     }
+
+    pub fn into_stream(self) -> Result<CompatStreamFd, std::io::Error> {
+        self.lane.compat_stream_fd(self.fd)
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl CompatStreamFd {
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl tokio::io::AsyncRead for CompatStreamFd {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let dst = buf.initialize_unfilled();
+            let read = unsafe {
+                libc::read(
+                    self.fd,
+                    dst.as_mut_ptr() as *mut libc::c_void,
+                    dst.len() as libc::size_t,
+                )
+            };
+
+            if read >= 0 {
+                self.read_wait = None;
+                buf.advance(read as usize);
+                return Poll::Ready(Ok(()));
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                self.read_wait = None;
+                return Poll::Ready(Err(err));
+            }
+
+            if self.read_wait.is_none() {
+                let lane = self.lane.clone();
+                let fd = self.fd;
+                self.read_wait = Some(Box::pin(async move { lane.wait_readable(fd).await }));
+            }
+
+            let wait = self.read_wait.as_mut().expect("read wait present");
+            match wait.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.read_wait = None;
+                }
+                Poll::Ready(Err(err)) => {
+                    self.read_wait = None;
+                    return Poll::Ready(Err(poll_error_to_io(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+impl tokio::io::AsyncWrite for CompatStreamFd {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        loop {
+            let wrote = unsafe {
+                libc::write(
+                    self.fd,
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            };
+            if wrote >= 0 {
+                self.write_wait = None;
+                return Poll::Ready(Ok(wrote as usize));
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                self.write_wait = None;
+                return Poll::Ready(Err(err));
+            }
+
+            if self.write_wait.is_none() {
+                let lane = self.lane.clone();
+                let fd = self.fd;
+                self.write_wait = Some(Box::pin(async move { lane.wait_writable(fd).await }));
+            }
+
+            let wait = self.write_wait.as_mut().expect("write wait present");
+            match wait.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.write_wait = None;
+                }
+                Poll::Ready(Err(err)) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Err(poll_error_to_io(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+fn poll_error_to_io(err: tokio_compat::PollReactorError) -> std::io::Error {
+    match err {
+        tokio_compat::PollReactorError::Io(io) => io,
+        tokio_compat::PollReactorError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "poll token not found")
+        }
+        tokio_compat::PollReactorError::Closed => {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "poll reactor closed")
+        }
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn runtime_error_to_io(err: RuntimeError) -> std::io::Error {
+    match err {
+        RuntimeError::InvalidConfig(msg) => {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+        }
+        RuntimeError::ThreadSpawn(io) => io,
+        RuntimeError::InvalidShard(shard) => std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("invalid shard {shard}"),
+        ),
+        RuntimeError::Closed => {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "runtime closed")
+        }
+        RuntimeError::UnsupportedBackend(msg) => {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, msg)
+        }
+        #[cfg(target_os = "linux")]
+        RuntimeError::IoUringInit(io) => io,
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn join_error_to_io(_err: JoinError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "native lane task canceled before completion",
+    )
+}
+
+#[cfg(all(feature = "tokio-compat", target_os = "linux"))]
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if (flags & libc::O_NONBLOCK) != 0 {
+        return Ok(());
+    }
+
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
@@ -1352,6 +1674,58 @@ impl ShardCtx {
         Ok(SendTicket { rx: Some(ack_rx) })
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    pub async fn native_read_at(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitNativeRead {
+                fd,
+                offset,
+                len,
+                reply: reply_tx,
+            });
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native read response channel closed",
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    pub async fn native_write_at(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+    ) -> std::io::Result<usize> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitNativeWrite {
+                fd,
+                offset,
+                buf,
+                reply: reply_tx,
+            });
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native write response channel closed",
+            ))
+        })
+    }
+
     pub fn spawn_local<F, T>(&self, fut: F) -> LocalJoinHandle<T>
     where
         F: Future<Output = T> + 'static,
@@ -1505,6 +1879,20 @@ enum LocalCommand {
     Flush {
         ack: oneshot::Sender<Result<(), SendError>>,
     },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeRead {
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+        reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeWrite {
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<usize>>,
+    },
 }
 
 enum Command {
@@ -1625,6 +2013,48 @@ impl ShardBackend {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_read(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+        reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    ) {
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring read requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_read(fd, offset, len, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_write(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<usize>>,
+    ) {
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring write requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_write(fd, offset, buf, reply);
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         if let Self::IoUring(driver) = self {
@@ -1643,6 +2073,18 @@ struct DoorbellPayload {
 #[cfg(target_os = "linux")]
 type PayloadQueues = Arc<Vec<Vec<Mutex<VecDeque<DoorbellPayload>>>>>;
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+enum NativeIoOp {
+    Read {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    },
+    Write {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<usize>>,
+    },
+}
+
 #[cfg(target_os = "linux")]
 struct IoUringDriver {
     shard_id: ShardId,
@@ -1650,6 +2092,8 @@ struct IoUringDriver {
     ring_fds: Arc<Vec<RawFd>>,
     payload_queues: PayloadQueues,
     send_waiters: Slab<oneshot::Sender<Result<(), SendError>>>,
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    native_ops: Slab<NativeIoOp>,
     pending_submit: usize,
     submit_batch_limit: usize,
 }
@@ -1668,6 +2112,8 @@ impl IoUringDriver {
             ring_fds,
             payload_queues,
             send_waiters: Slab::new(),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            native_ops: Slab::new(),
             pending_submit: 0,
             submit_batch_limit: IOURING_SUBMIT_BATCH,
         }
@@ -1789,6 +2235,79 @@ impl IoUringDriver {
         self.mark_submission_pending()
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_read(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        len: usize,
+        reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
+    ) -> Result<(), SendError> {
+        let Ok(len_u32) = u32::try_from(len) else {
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native read length exceeds u32::MAX",
+            )));
+            return Ok(());
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::Read {
+            buf: vec![0; len],
+            reply,
+        });
+
+        let buf_ptr = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Read { buf, .. }) => buf.as_mut_ptr(),
+            _ => unreachable!("native read op kind mismatch"),
+        };
+
+        let entry = opcode::Read::new(types::Fd(fd), buf_ptr, len_u32)
+            .offset(offset)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_write(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<usize>>,
+    ) -> Result<(), SendError> {
+        let Ok(len_u32) = u32::try_from(buf.len()) else {
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native write length exceeds u32::MAX",
+            )));
+            return Ok(());
+        };
+
+        let native_index = self.native_ops.insert(NativeIoOp::Write { buf, reply });
+
+        let buf_ptr = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Write { buf, .. }) => buf.as_ptr(),
+            _ => unreachable!("native write op kind mismatch"),
+        };
+
+        let entry = opcode::Write::new(types::Fd(fd), buf_ptr, len_u32)
+            .offset(offset)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
     fn mark_submission_pending(&mut self) -> Result<(), SendError> {
         self.pending_submit += 1;
         if self.pending_submit >= self.submit_batch_limit {
@@ -1811,10 +2330,52 @@ impl IoUringDriver {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn fail_native_op(&mut self, index: usize) {
+        if self.native_ops.contains(index) {
+            let op = self.native_ops.remove(index);
+            match op {
+                NativeIoOp::Read { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring read failed",
+                    )));
+                }
+                NativeIoOp::Write { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring write failed",
+                    )));
+                }
+            }
+        }
+    }
+
     fn fail_all_waiters(&mut self) {
         let waiters = std::mem::take(&mut self.send_waiters);
         for (_, waiter) in waiters {
             let _ = waiter.send(Err(SendError::Closed));
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn fail_all_native_ops(&mut self) {
+        let ops = std::mem::take(&mut self.native_ops);
+        for (_, op) in ops {
+            match op {
+                NativeIoOp::Read { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring read canceled",
+                    )));
+                }
+                NativeIoOp::Write { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring write canceled",
+                    )));
+                }
+            }
         }
     }
 
@@ -1840,6 +2401,8 @@ impl IoUringDriver {
 
         if self.ring.submit().is_err() {
             self.fail_all_waiters();
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            self.fail_all_native_ops();
             return Err(SendError::Closed);
         }
 
@@ -1879,6 +2442,12 @@ impl IoUringDriver {
             event_state.push(Event::RingMsg { from, tag, val });
         }
         for (user_data, result) in waiter_completions {
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            if let Some(native_index) = native_from_userdata(user_data) {
+                self.complete_native_op(native_index, result);
+                continue;
+            }
+
             if let Some(waiter_index) = waiter_from_userdata(user_data) {
                 if self.send_waiters.contains(waiter_index) {
                     let waiter = self.send_waiters.remove(waiter_index);
@@ -1914,8 +2483,37 @@ impl IoUringDriver {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn complete_native_op(&mut self, index: usize, result: i32) {
+        if !self.native_ops.contains(index) {
+            return;
+        }
+
+        let op = self.native_ops.remove(index);
+        match op {
+            NativeIoOp::Read { mut buf, reply } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let read_len = result as usize;
+                buf.truncate(read_len);
+                let _ = reply.send(Ok(buf));
+            }
+            NativeIoOp::Write { reply, .. } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok(result as usize));
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         self.fail_all_waiters();
+        #[cfg(all(feature = "uring-native", target_os = "linux"))]
+        self.fail_all_native_ops();
     }
 }
 
@@ -1939,7 +2537,24 @@ fn waiter_to_userdata(waiter_index: usize) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn waiter_from_userdata(user_data: u64) -> Option<usize> {
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if (user_data & NATIVE_OP_USER_BIT) != 0 {
+        return None;
+    }
     usize::try_from(user_data.checked_sub(1)?).ok()
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn native_to_userdata(index: usize) -> u64 {
+    NATIVE_OP_USER_BIT | (index as u64 + 1)
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn native_from_userdata(user_data: u64) -> Option<usize> {
+    if (user_data & NATIVE_OP_USER_BIT) == 0 {
+        return None;
+    }
+    usize::try_from((user_data & !NATIVE_OP_USER_BIT).checked_sub(1)?).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -2100,6 +2715,20 @@ fn drain_local_commands(
                 }
             }
             LocalCommand::Flush { ack } => backend.flush(ack),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeRead {
+                fd,
+                offset,
+                len,
+                reply,
+            } => backend.submit_native_read(fd, offset, len, reply),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeWrite {
+                fd,
+                offset,
+                buf,
+                reply,
+            } => backend.submit_native_write(fd, offset, buf, reply),
         }
     }
 }

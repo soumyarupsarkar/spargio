@@ -1,7 +1,7 @@
 #[cfg(all(feature = "tokio-compat", target_os = "linux"))]
 mod linux_tokio_runtime_wait_tests {
-    use msg_ring_runtime::tokio_compat::PollReactorError;
     use msg_ring_runtime::Runtime;
+    use msg_ring_runtime::tokio_compat::PollReactorError;
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -55,7 +55,10 @@ mod linux_tokio_runtime_wait_tests {
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert!(saw_registration, "wait_readable never registered a poll token");
+        assert!(
+            saw_registration,
+            "wait_readable never registered a poll token"
+        );
 
         task.abort();
         let _ = task.await;
