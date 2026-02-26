@@ -1,96 +1,102 @@
 # spargio
 
-`spargio` is an experimental Rust async runtime exploring a `msg_ring`-first architecture on top of Linux `io_uring`.
+`spargio` is an experimental Rust `io_uring` runtime focused on `msg_ring`-based cross-shard coordination and work-stealing-friendly scheduling.
 
 Built with Codex.
 
 ## Inspirations
 
-This project is directly inspired by:
-
 - `ourio`: <https://github.com/rockorager/ourio>
 - `tokio-uring`: <https://github.com/tokio-rs/tokio-uring>
 
-## What We Are Trying To Build
+## Current Aim
 
-We are building a Tokio-compatible migration path with a native `io_uring` fast lane:
+The core value proposition is an `io_uring` runtime that supports work stealing through `msg_ring`-based cross-shard coordination.
 
-1. Compatibility lane:
-   - Tokio-like readiness behavior via `IORING_OP_POLL_ADD` / `POLL_REMOVE`.
-   - APIs that let existing Tokio-style code migrate incrementally.
-2. Native fast lane:
-   - Explicit `io_uring` operations (`READ`, `WRITE`, etc.) for hot paths.
-3. Cross-shard signaling:
-   - Use `IORING_OP_MSG_RING` for shard-to-shard wakeups/message delivery.
-4. Scheduler direction:
-   - Keep ring-affine I/O correctness while adding submission-time placement and work-stealing for stealable tasks.
+Primary goals:
 
-The target is a practical Tokio-interop runtime that can evolve into a high-performance `io_uring`-native execution model without a flag-day rewrite.
+1. Native `io_uring` operations for hot paths.
+2. Low-overhead shard-to-shard signaling via `IORING_OP_MSG_RING`.
+3. Submission-time placement and true work-stealing for stealable work.
+4. Ring-affine execution for in-flight native I/O.
 
-## Performance Reality (Current)
+Tokio-compatibility note:
 
-We expect runtimes such as `glommio`, `monoio`, and `compio` to be faster in many real workloads today. A major reason is structural: they are designed around strict thread-per-core, ring-affine execution paths that minimize cross-thread scheduling and synchronization overhead.
+1. Tokio-like readiness behavior can be simulated using `IORING_OP_POLL_ADD` / `IORING_OP_POLL_REMOVE`.
+2. We considered this as a route toward drop-in replacement behavior, but that path requires heavy ongoing investment to match runtime semantics and dependency expectations.
+3. For `spargio`, we are intentionally prioritizing native runtime capabilities and mixed-mode communication over building a full drop-in compatibility layer.
 
-This project currently carries more compatibility and mixed-mode goals, which introduces extra overhead. Maturity still matters too (scheduler, driver, and API-path optimization depth), but the thread-per-core-first design is a primary performance advantage.
+This strategy direction is recorded in ADR-0002.
 
-## Current Status
+## Why This Direction
 
-Implemented today:
+Broad Tokio compatibility without a full shim/fork does not transparently migrate dependencies that internally use Tokio runtime APIs.
 
-- Sharded runtime core with two backends:
-  - `Queue` backend (baseline/fallback).
-  - Linux `IoUring` backend.
-- Cross-shard messaging:
-  - typed/raw sends, no-wait sends, batched sends, explicit flush ticket.
-- Tokio interop handle:
-  - `Runtime::handle()`
-  - `spawn_pinned`, `spawn_stealable`, `remote`.
-- Tokio compat lane:
-  - poll reactor (`POLL_ADD`/`POLL_REMOVE`)
-  - readiness waits (`wait_readable`, `wait_writable`)
-  - wrappers: `CompatFd` and `CompatStreamFd` (`AsyncRead`/`AsyncWrite`).
-- Native lane MVP (`uring-native` feature):
-  - `RuntimeHandle::uring_native_lane(shard)`
-  - `read_at` / `write_at`.
-- Benchmarks:
-  - message RTT / one-way / cold-start
-  - first disk I/O RTT harness.
+Given that constraint, `spargio` focuses on differentiated runtime internals first:
 
-See [`IMPLEMENTATION_LOG.md`](./IMPLEMENTATION_LOG.md) for chronological detail.
+1. `msg_ring` coordination as a first-class primitive.
+2. placement and stealing policies tuned for shard-aware execution.
+3. benchmarked wins on coordination-heavy fan-out/fan-in workloads.
 
-## What Is Not Done Yet
+The runtime can still be deployed in mixed mode with Tokio where that is practical, but mixed mode is a deployment option, not the project premise.
+
+## Status Snapshot
+
+Implemented:
+
+- Sharded runtime core with `Queue` and Linux `IoUring` backends.
+- Cross-shard typed/raw messaging, no-wait sends, batched sends, and flush tickets.
+- Runtime handle APIs (`spawn_pinned`, `spawn_stealable`, `remote`).
+- Native lane MVP (`uring-native`) with `read_at` and `write_at`.
+- Bench suites for ping/pong, one-way drain, cold start, and first disk I/O RTT harness.
+
+In progress / remaining:
 
 - True deque/injector work-stealing scheduler.
-- Submission-time placement policies beyond current basic behavior.
-- Re-homing poll compatibility processing into shard driver path.
-- Full stress/race hardening suite and benchmark regression gates.
+- Richer submission-time placement policies.
+- Boundary hardening for mixed-mode usage and benchmark gates for target fan-out/fan-in workloads.
 
-## Platform / Features
+## Engineering Process
+
+Development is TDD-first using red/green cycles:
+
+1. Add or update failing tests (red).
+2. Implement the smallest viable change to pass (green).
+3. Run full validation and benchmark build checks.
+
+Project records:
+
+- Implementation log: [`IMPLEMENTATION_LOG.md`](./IMPLEMENTATION_LOG.md)
+- ADRs: [`architecture_decision_records/`](./architecture_decision_records/)
+
+## Platform and Features
 
 - Core crate builds cross-platform.
-- Linux-only capabilities (`io_uring`, `msg_ring`, poll-compat, native lane) are feature/target gated.
+- Linux-only capabilities (`io_uring`, `msg_ring`, native lane) are target/feature gated.
 
 Main cargo features:
 
-- `tokio-compat`
 - `uring-native`
-- `glommio-bench` (bench comparison path)
+- `glommio-bench`
 
 ## Quick Start
 
 ```bash
 cargo test
-cargo test --features tokio-compat
 cargo test --features uring-native
-cargo test --features "tokio-compat uring-native"
 cargo bench --no-run
 ```
+
+## Compatibility Note
+
+`spargio` can interoperate with Tokio and other runtimes via explicit mixed-mode boundaries and message passing.
+
+Building a dependency-transparent drop-in compatibility layer is possible in theory (for example via readiness emulation using `IORING_OP_POLL_ADD`), but it is a large maintenance commitment. We are not treating that as the primary direction for this project.
 
 ## Repository Layout
 
 - `src/lib.rs`: runtime and backend implementation.
-- `tests/`: TDD behavior tests for runtime, compat lane, and native lane.
-- `benches/`: Criterion benchmarks (`ping_pong`, `disk_io`).
-- `architecture_decision_records/`: ADRs for integration strategy.
-- `DESIGN_OPTIONS.md`: earlier interface/architecture options.
-- `IMPLEMENTATION_LOG.md`: running implementation history.
+- `tests/`: behavior and TDD coverage.
+- `benches/`: criterion benchmarks (`ping_pong`, `disk_io`).
+- `architecture_decision_records/`: design decisions and pivots.
+- `IMPLEMENTATION_LOG.md`: chronological implementation and benchmark notes.

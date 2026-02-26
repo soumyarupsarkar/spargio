@@ -1,6 +1,6 @@
 # ADR-0001: Tokio Compatibility-First Integration with Native io_uring Fast Lane
 
-- Status: Proposed
+- Status: Superseded by ADR-0002
 - Date: 2026-02-26
 
 ## Context
