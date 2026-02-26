@@ -1609,3 +1609,116 @@ Interpretation:
 
 - RTT is now clearly in Spargio’s favor for this harness.
 - Stream throughput gap versus Tokio is substantially reduced (from ~2.6x slower to ~1.2x slower), but still present.
+
+## Next optimization batch (committed plan before implementation)
+
+Based on current net throughput gap, the next batch is:
+
+1. Introduce provided-buffer multishot receive path (`IORING_OP_RECV_MULTISHOT` + `IORING_OP_PROVIDE_BUFFERS`) for stream receive-heavy benchmarks.
+2. Expand reusable-buffer APIs (`recv_into`/owned-buffer reuse) so stream loops avoid per-op allocation churn.
+3. Add batch-oriented stream APIs (`send_batch`, `recv_batch`/multishot helpers) to reduce per-message control overhead.
+4. Increase pipelining depth in throughput paths by issuing batched/native operations with configurable in-flight windows.
+5. Add an io_uring throughput preset (`single_issuer`, `coop_taskrun`, optional `sqpoll`) and use it in benchmark harnesses with fallback when unsupported.
+
+Execution approach remains red/green TDD: add failing tests for each new API/behavior, then implement minimal passing behavior, then re-benchmark.
+
+## Implementation: proposal batch (multishot/batching/tuning) completed
+
+Implemented all items from the prior optimization proposal set.
+
+### 1) Provided-buffer multishot receive path
+
+Runtime additions (`src/lib.rs`):
+
+- new local command: `SubmitNativeRecvMultishot`
+- new native op state: `NativeIoOp::RecvMulti` (buffer group, target bytes, collected chunks)
+- new driver path:
+  - `submit_native_recv_multishot(...)`
+  - submits `IORING_OP_PROVIDE_BUFFERS` + `IORING_OP_RECV_MULTISHOT`
+  - collects CQEs until target bytes reached or stream ends
+  - issues `IORING_OP_ASYNC_CANCEL` when target reached while CQE `MORE` continues
+  - removes provided buffers via `IORING_OP_REMOVE_BUFFERS` on completion/failure
+- completion path updated to process multishot/native housekeeping CQEs safely.
+
+### 2) Reusable-buffer API expansion
+
+Added:
+
+- `UringNativeLane::recv_into(fd, Vec<u8>)`
+- `UringBoundFd::recv_into(Vec<u8>)`
+
+These preserve caller-owned buffers and avoid per-op allocation churn.
+
+### 3) Batch-oriented stream APIs
+
+Added:
+
+- `UringNativeLane::send_batch(fd, Vec<Vec<u8>>, window)`
+- `UringNativeLane::recv_batch_into(fd, Vec<Vec<u8>>, window)`
+- `UringBoundFd::send_batch(...)`
+- `UringBoundFd::recv_batch_into(...)`
+- `UringNativeLane::recv_multishot(...)`
+- `UringBoundFd::recv_multishot(...)`
+
+### 4) Pipelining depth in throughput path
+
+Benchmark harness updates (`benches/net_api.rs`):
+
+- throughput send path now uses `send_batch` with reusable buffer pool.
+- throughput receive path attempts `recv_multishot` first, then falls back to `recv_owned` if unsupported.
+- this increases in-flight native work while keeping a fallback for older kernels.
+
+### 5) io_uring throughput preset + harness usage
+
+Runtime builder addition:
+
+- `RuntimeBuilder::io_uring_throughput_mode(sqpoll_idle_ms)`
+  - enables `coop_taskrun`
+  - optional sqpoll setting through argument
+
+Harness usage:
+
+- `benches/fs_api.rs` and `benches/net_api.rs` now try throughput mode and fall back to plain io_uring runtime build if unavailable.
+
+### Additional hardening done while implementing
+
+- `flush_submissions()` now treats transient submit errors (`EAGAIN`/`EBUSY`/`Interrupted`) as retry/defer instead of immediate fatal teardown.
+- this removed runtime cancellation failures seen under benchmark pressure.
+
+### TDD additions
+
+`tests/uring_native_tdd.rs` now includes:
+
+- `uring_bound_tcp_stream_supports_recv_into_and_send_batch`
+- `uring_bound_tcp_stream_supports_recv_multishot` (with unsupported-kernel fallback)
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -q`
+- `cargo test -q --features uring-native`
+- `cargo bench --no-run`
+- `cargo bench --no-run --features uring-native`
+- `cargo bench --bench fs_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --bench net_api --features uring-native -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+### Latest benchmark readout after this implementation batch
+
+From `fs_api`:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: ~`1.64-1.71 ms`
+- `fs_read_rtt_4k/spargio_uring_bound_file_qd1`: ~`1.98-2.28 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: ~`8.57-8.97 ms`
+- `fs_read_throughput_4k_qd32/spargio_uring_bound_file_qd32`: ~`6.73-7.42 ms`
+
+From `net_api`:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: ~`7.92-8.35 ms`
+- `net_echo_rtt_256b/spargio_uring_bound_tcp_qd1`: ~`5.57-5.88 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: ~`10.93-11.85 ms`
+- `net_stream_throughput_4k_window32/spargio_uring_bound_tcp_window32`: ~`11.92-12.28 ms`
+
+Interpretation:
+
+- proposal batch is functionally implemented end-to-end (APIs + runtime + tests + benches).
+- stream throughput gap versus Tokio narrowed further while preserving RTT advantage.

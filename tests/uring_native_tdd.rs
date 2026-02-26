@@ -1,5 +1,6 @@
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 mod linux_uring_native_tests {
+    use libc;
     use spargio::{BackendKind, Runtime, RuntimeError};
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -194,6 +195,84 @@ mod linux_uring_native_tests {
 
         let echoed = sender.join().expect("join sender");
         assert_eq!(&echoed, b"pong");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_bound_tcp_stream_supports_recv_into_and_send_batch() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept");
+
+        let lane = rt.handle().uring_native_lane(0).expect("native lane");
+        let bound = lane.bind_tcp_stream(server);
+
+        let mut client_rx = client.try_clone().expect("clone");
+        let mut client_tx = client;
+        let sender = std::thread::spawn(move || {
+            client_tx.write_all(b"ping").expect("client write");
+            let mut out = [0u8; 4];
+            client_rx.read_exact(&mut out).expect("client read");
+            out
+        });
+
+        let (received, recv_buf) = bound.recv_into(vec![0u8; 4]).await.expect("recv_into");
+        assert_eq!(received, 4);
+        assert_eq!(&recv_buf[..4], b"ping");
+
+        let send_bufs = vec![b"po".to_vec(), b"ng".to_vec()];
+        let (sent, returned) = bound.send_batch(send_bufs, 2).await.expect("send_batch");
+        assert_eq!(sent, 4);
+        assert_eq!(returned.len(), 2);
+
+        let echoed = sender.join().expect("join sender");
+        assert_eq!(&echoed, b"pong");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_bound_tcp_stream_supports_recv_multishot() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect client");
+        let (server, _) = listener.accept().expect("accept");
+
+        let lane = rt.handle().uring_native_lane(0).expect("native lane");
+        let bound = lane.bind_tcp_stream(server);
+
+        let sender = std::thread::spawn(move || {
+            client.write_all(b"pingpong").expect("client write");
+        });
+
+        let chunks = match bound.recv_multishot(1024, 8, 8).await {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                let raw = err.raw_os_error().unwrap_or_default();
+                if raw == libc::EINVAL || raw == libc::ENOSYS || raw == libc::EOPNOTSUPP {
+                    let _ = sender.join();
+                    return;
+                }
+                panic!("recv_multishot failed unexpectedly: {err}");
+            }
+        };
+        let _ = sender.join();
+
+        let mut total = Vec::new();
+        for chunk in chunks {
+            total.extend_from_slice(&chunk);
+        }
+        assert!(
+            total.starts_with(b"pingpong"),
+            "got total bytes: {:?}",
+            total
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

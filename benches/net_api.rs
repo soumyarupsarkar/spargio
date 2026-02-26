@@ -7,6 +7,8 @@ use futures::channel::mpsc;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use futures::executor::block_on;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+use libc;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 use spargio::{BackendKind, Runtime, RuntimeError};
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -285,10 +287,19 @@ impl SpargioNetHarness {
         let runtime = match Runtime::builder()
             .backend(BackendKind::IoUring)
             .shards(2)
+            .io_uring_throughput_mode(None)
             .build()
         {
             Ok(rt) => rt,
-            Err(RuntimeError::IoUringInit(_)) => return None,
+            Err(RuntimeError::IoUringInit(_)) => match Runtime::builder()
+                .backend(BackendKind::IoUring)
+                .shards(2)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(RuntimeError::IoUringInit(_)) => return None,
+                Err(err) => panic!("unexpected runtime init error: {err:?}"),
+            },
             Err(err) => panic!("unexpected runtime init error: {err:?}"),
         };
 
@@ -406,19 +417,55 @@ async fn spargio_echo_windowed(
     payload_len: usize,
     window: usize,
 ) -> u64 {
-    let mut payload = vec![0u8; payload_len.max(1)];
     let mut recv = vec![0u8; THROUGHPUT_RECV_SCRATCH];
+    let mut tx_pool = (0..window.max(1))
+        .map(|_| vec![0u8; payload_len.max(1)])
+        .collect::<Vec<_>>();
     let mut checksum = 0u64;
     let mut next = 0usize;
     let window = window.max(1);
 
     while next < frames {
         let batch = (frames - next).min(window);
+        let mut send_batch = Vec::with_capacity(batch);
         for idx in 0..batch {
-            payload[0] = (next + idx) as u8;
-            payload = uring_send_all_owned(bound, payload).await.expect("send");
+            let mut buf = tx_pool
+                .pop()
+                .unwrap_or_else(|| vec![0u8; payload_len.max(1)]);
+            buf[0] = (next + idx) as u8;
+            send_batch.push(buf);
         }
+        let (_sent, mut returned) = bound
+            .send_batch(send_batch, batch)
+            .await
+            .expect("send_batch");
+        tx_pool.append(&mut returned);
+
         let mut remaining = batch * payload_len;
+        let buffer_count = ((batch * 2).max(4)).min(u16::MAX as usize) as u16;
+        let multishot = bound
+            .recv_multishot(payload_len.max(1), buffer_count, remaining)
+            .await;
+        match multishot {
+            Ok(chunks) => {
+                for chunk in chunks {
+                    if !chunk.is_empty() {
+                        checksum = checksum.wrapping_add(u64::from(chunk[0]));
+                    }
+                    remaining = remaining.saturating_sub(chunk.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                let raw = err.raw_os_error().unwrap_or_default();
+                if raw != libc::EINVAL && raw != libc::ENOSYS && raw != libc::EOPNOTSUPP {
+                    panic!("recv_multishot failed unexpectedly: {err}");
+                }
+            }
+        }
+
         while remaining > 0 {
             let (got, returned) = bound.recv_owned(recv).await.expect("recv");
             recv = returned;

@@ -225,10 +225,19 @@ impl SpargioFsHarness {
         let runtime = match Runtime::builder()
             .shards(2)
             .backend(BackendKind::IoUring)
+            .io_uring_throughput_mode(None)
             .build()
         {
             Ok(rt) => rt,
-            Err(RuntimeError::IoUringInit(_)) => return None,
+            Err(RuntimeError::IoUringInit(_)) => match Runtime::builder()
+                .shards(2)
+                .backend(BackendKind::IoUring)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(RuntimeError::IoUringInit(_)) => return None,
+                Err(err) => panic!("unexpected runtime init error: {err:?}"),
+            },
             Err(err) => panic!("unexpected runtime init error: {err:?}"),
         };
         let lane = runtime.handle().uring_native_lane(1).ok()?;
