@@ -2,11 +2,15 @@
 
 `spargio` is a work-stealing async runtime for Rust built around `io_uring` and `msg_ring`.
 
-Instead of a strict thread-per-core execution model, Spargio uses submission-time steering plus stealable tasks across shards. For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
+Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), Spargio uses submission-time steering of stealable tasks across shards.
+
+For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
+
+The benchmarks below demonstrate where this helps. In short, as expected, unlike compio and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`.
 
 ## Disclaimer
 
-This is a proof-of-concept project built with Codex. Do not use in production.
+This began as a proof of concept built with Codex to see if the idea is worth pursuing. I have not reviewed all the code yet, and it's not complete. Do not use it in production.
 
 ## Benchmark Results
 
@@ -38,14 +42,6 @@ Compio is not listed in this coordination-only table because it is share-nothing
 | `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `14.058-14.331 ms` | `13.300-13.734 ms` | `12.174-12.499 ms` | `1.1x` | `0.9x` |
 | `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.7249-8.7700 ms` | `11.499-11.600 ms` | `16.637-16.766 ms` | `0.8x` | `1.4x` |
 | `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.075-26.308 ms` | `32.686-33.156 ms` | `50.496-51.812 ms` | `0.8x` | `1.5x` |
-
-## Connection Placement Best Practices
-
-- Use `spargio::net::TcpStream::connect(...)` for simple or latency-first paths (few streams, short-lived connections).
-- Use `spargio::net::TcpStream::connect_many_round_robin(...)` (or `connect_with_session_policy(..., RoundRobin)`) for sustained multi-stream throughput workloads.
-- For per-stream hot I/O loops, pair round-robin stream setup with `stream.spawn_on_session(...)` to keep execution aligned with the stream session shard.
-- Use stealable task placement when post-I/O CPU work is dominant and can benefit from migration.
-- As a practical starting heuristic: if active stream count is at least `2x` shard count and streams are long-lived, prefer round-robin/distributed mode.
 
 ## Why Spargio Is Faster
 
@@ -131,13 +127,21 @@ Recommended model today:
 
 A Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible, but building a dependency-transparent drop-in lane is a large investment.
 
-## Inspirations
+## Connection Placement Best Practices
 
-- `ourio`: <https://github.com/rockorager/ourio>
-- `tokio-uring`: <https://github.com/tokio-rs/tokio-uring>
-- `compio`: <https://github.com/compio-rs/compio>
+- Use `spargio::net::TcpStream::connect(...)` for simple or latency-first paths (few streams, short-lived connections).
+- Use `spargio::net::TcpStream::connect_many_round_robin(...)` (or `connect_with_session_policy(..., RoundRobin)`) for sustained multi-stream throughput workloads.
+- For per-stream hot I/O loops, pair round-robin stream setup with `stream.spawn_on_session(...)` to keep execution aligned with the stream session shard.
+- Use stealable task placement when post-I/O CPU work is dominant and can benefit from migration.
+- As a practical starting heuristic: if active stream count is at least `2x` shard count and streams are long-lived, prefer round-robin/distributed mode.
 
-Related thread-per-core runtimes (`glommio`, `monoio`, `compio`) can be faster on some workload shapes because that design is their primary optimization target.
+## Inspirations and Further Reading
+
+Using `msg_ring` for coordination is heavily inspired by [`ourio`](https://github.com/rockorager/ourio). We extend that idea to work-stealing.
+
+Asking whether to build a work-stealing pool using `io_uring` at all was inspired by the following (excellent) blog posts:
+- https://emschwartz.me/async-rust-can-be-a-pleasure-to-work-with-without-send-sync-static/
+- https://without.boats/blog/thread-per-core/
 
 ## Engineering Method
 
