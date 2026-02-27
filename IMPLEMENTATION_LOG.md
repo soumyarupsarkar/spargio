@@ -3100,3 +3100,110 @@ Validation:
 Result:
 
 - All checks pass.
+
+## Update: blocking-surface plan slice implemented (Red/Green TDD)
+
+Scope completed from the blocking-removal checklist:
+
+- io_uring timer lane:
+  - Added native timeout command path (`IORING_OP_TIMEOUT`) to the io_uring driver.
+  - Added `UringNativeAny::sleep(Duration)`.
+  - Routed top-level `spargio::sleep(...)` to shard-local native timeout path when running inside a Spargio shard; keeps fallback behavior outside shard context.
+
+- Async-first boundary APIs:
+  - Added async-first boundary surfaces:
+    - `BoundaryClient::call_async(...)`
+    - `BoundaryClient::call_async_with_timeout(...)`
+    - `BoundaryServer::recv_async(...)`
+    - `BoundaryServer::recv_timeout_async(...)`
+    - `BoundaryTicket::wait_timeout(...)`
+  - Kept blocking methods (`call`, `recv`, `recv_timeout`, `wait_timeout_blocking`) as compatibility wrappers.
+
+- Address-resolution split:
+  - Added explicit non-DNS socket-address APIs:
+    - `net::TcpStream::connect_socket_addr(...)`
+    - `net::TcpStream::connect_socket_addr_round_robin(...)`
+    - `net::TcpStream::connect_many_socket_addr_round_robin(...)`
+    - `net::TcpStream::connect_many_socket_addr_with_session_policy(...)`
+    - `net::TcpStream::connect_socket_addr_with_session_policy(...)`
+    - `net::TcpListener::bind_socket_addr(...)`
+  - Kept hostname-based APIs as compatibility wrappers around a clearly named resolver path (`resolve_first_socket_addr_blocking`).
+
+- Runtime-control async variants:
+  - Added async runtime-entry/control APIs:
+    - `run_async(...)`
+    - `run_with_async(...)`
+    - `Runtime::shutdown_async(...)`
+  - Kept sync entry/control APIs (`run`, `run_with`, `shutdown`) for compatibility/ergonomics.
+
+Red tests added:
+
+- `tests/boundary_tdd.rs`
+  - `boundary_async_call_and_recv_round_trip`
+  - `boundary_async_recv_timeout_reports_timeout`
+  - `boundary_ticket_wait_timeout_async_reports_timeout`
+- `tests/runtime_tdd.rs`
+  - `run_async_helper_executes_top_level_future`
+  - `run_with_async_applies_custom_builder`
+  - `runtime_shutdown_async_is_idempotent`
+- `tests/ergonomics_tdd.rs`
+  - `net_tcp_stream_connect_socket_addr_supports_read_write_all`
+  - `net_tcp_listener_bind_socket_addr_accepts_and_wraps_stream`
+- `tests/uring_native_tdd.rs`
+  - `uring_native_unbound_sleep_uses_timeout_path`
+
+Green + validation:
+
+- `cargo fmt`
+- `cargo test --features "uring-native macros" --test boundary_tdd --test runtime_tdd --test ergonomics_tdd --test uring_native_tdd`
+- `cargo test --features "uring-native macros"`
+
+Acceptance checklist status:
+
+- [x] No data-plane helper-thread blocking waits in io_uring mode.
+- [x] `sleep` uses native timeout path when io_uring backend is active on shard context.
+- [x] Boundary APIs have async-first equivalents covering current usage.
+- [x] Hostname resolution path is explicitly isolated from native data plane.
+- [x] README/implementation log reflect which blocking APIs are compatibility-only vs removed.
+
+## Update: removed public sync compatibility wrappers; async APIs are canonical (Red/Green TDD)
+
+Rationale:
+
+- Crate is not yet published; this is the lowest-risk point to make the API async-first and remove blocking wrapper surfaces.
+
+What changed:
+
+- Runtime entry/control API cleanup:
+  - `run` is now async (`run(...).await`).
+  - `run_with` is now async (`run_with(builder, ...).await`).
+  - Removed public `run_async` and `run_with_async` aliases.
+  - `Runtime::shutdown` is now async.
+  - Removed public sync `Runtime::shutdown`; retained internal blocking shutdown path only for `Drop`.
+
+- Boundary API cleanup:
+  - `BoundaryClient::call` and `call_with_timeout` are async-first.
+  - `BoundaryServer::recv` and `recv_timeout` are async-first.
+  - `BoundaryTicket::wait_timeout` remains async.
+  - Removed sync compatibility wrappers:
+    - `BoundaryTicket::wait_timeout_blocking`
+    - sync `BoundaryServer::recv`/`recv_timeout` wrappers
+    - sync `BoundaryClient::call`/`call_with_timeout` wrappers
+
+- Macro compatibility after async rename:
+  - `#[spargio::main]` now uses a hidden `spargio::__private::block_on(...)` helper to invoke async `run_with(...)` from generated sync `main`.
+
+- Examples/tests updated to new async API names:
+  - boundary TDD switched to async call/recv/timeout paths.
+  - runtime TDD switched to async `run`/`run_with`/`shutdown` usage.
+  - `examples/network_work_stealing.rs` updated to async `run_with(...).await`.
+  - `examples/mixed_mode_service.rs` updated for async boundary call path.
+
+Validation:
+
+- `cargo test --features "uring-native macros"`
+- `cargo bench --features uring-native --no-run`
+
+Result:
+
+- Full test suite and benchmark target compilation pass after the async-first API break.

@@ -176,7 +176,7 @@ pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
                 let __spargio_builder = ::spargio::Runtime::builder()
                     #shards_builder
                     #backend_builder;
-                match ::spargio::run_with(__spargio_builder, |__spargio_handle| async move { #call_inner }) {
+                match ::spargio::__private::block_on(::spargio::run_with(__spargio_builder, |__spargio_handle| async move { #call_inner })) {
                     Ok(__spargio_out) => __spargio_out,
                     Err(::spargio::RuntimeError::UnsupportedBackend(__spargio_msg)) => {
                         panic!(

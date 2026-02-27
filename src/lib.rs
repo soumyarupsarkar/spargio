@@ -42,6 +42,18 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "macros")]
 pub use spargio_macros::main;
 
+#[doc(hidden)]
+pub mod __private {
+    use core::future::Future;
+
+    pub fn block_on<F>(fut: F) -> F::Output
+    where
+        F: Future,
+    {
+        futures::executor::block_on(fut)
+    }
+}
+
 #[cfg(target_os = "linux")]
 const MSG_RING_CQE_FLAG: u32 = 1 << 8;
 #[cfg(target_os = "linux")]
@@ -156,10 +168,11 @@ pub mod boundary {
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll};
-    use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+    use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
     use futures::channel::oneshot;
-    use std::thread;
     use std::time::{Duration, Instant};
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BoundaryError {
@@ -228,33 +241,10 @@ pub mod boundary {
     }
 
     impl<Response> BoundaryTicket<Response> {
-        pub fn wait_timeout_blocking(
-            mut self,
-            timeout: Duration,
-        ) -> Result<Response, BoundaryError> {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let Some(rx) = self.rx.as_mut() else {
-                    return Err(BoundaryError::Canceled);
-                };
-
-                match rx.try_recv() {
-                    Ok(Some(value)) => {
-                        self.rx = None;
-                        return value;
-                    }
-                    Ok(None) => {
-                        if Instant::now() >= deadline {
-                            self.rx = None;
-                            return Err(BoundaryError::Timeout);
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(_) => {
-                        self.rx = None;
-                        return Err(BoundaryError::Canceled);
-                    }
-                }
+        pub async fn wait_timeout(self, timeout: Duration) -> Result<Response, BoundaryError> {
+            match super::timeout(timeout, self).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(BoundaryError::Timeout),
             }
         }
     }
@@ -282,71 +272,103 @@ pub mod boundary {
     }
 
     impl<Request, Response> BoundaryClient<Request, Response> {
-        pub fn call(&self, request: Request) -> Result<BoundaryTicket<Response>, BoundaryError> {
-            self.enqueue(request, None, false)
+        pub async fn call(
+            &self,
+            request: Request,
+        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            self.enqueue_async(request, None).await
         }
 
-        pub fn call_with_timeout(
+        pub async fn call_with_timeout(
             &self,
             request: Request,
             timeout: Duration,
         ) -> Result<BoundaryTicket<Response>, BoundaryError> {
-            self.enqueue(request, Some(Instant::now() + timeout), false)
+            self.enqueue_async(request, Some(Instant::now() + timeout))
+                .await
         }
 
         pub fn try_call(
             &self,
             request: Request,
         ) -> Result<BoundaryTicket<Response>, BoundaryError> {
-            self.enqueue(request, None, true)
-        }
-
-        fn enqueue(
-            &self,
-            request: Request,
-            deadline: Option<Instant>,
-            nonblocking: bool,
-        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
             let (reply_tx, reply_rx) = oneshot::channel();
             let msg = BoundaryEnvelope {
                 request,
-                deadline,
+                deadline: None,
                 reply: reply_tx,
             };
 
-            if nonblocking {
-                match self.tx.try_send(msg) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => return Err(BoundaryError::Overloaded),
+            match self.tx.try_send(msg) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err(BoundaryError::Overloaded),
+                Err(TrySendError::Disconnected(_)) => return Err(BoundaryError::Closed),
+            }
+            Ok(BoundaryTicket { rx: Some(reply_rx) })
+        }
+
+        async fn enqueue_async(
+            &self,
+            request: Request,
+            deadline: Option<Instant>,
+        ) -> Result<BoundaryTicket<Response>, BoundaryError> {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let mut msg = Some(BoundaryEnvelope {
+                request,
+                deadline,
+                reply: reply_tx,
+            });
+
+            loop {
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        return Err(BoundaryError::Timeout);
+                    }
+                }
+
+                let next = msg.take().expect("boundary request envelope missing");
+                match self.tx.try_send(next) {
+                    Ok(()) => return Ok(BoundaryTicket { rx: Some(reply_rx) }),
+                    Err(TrySendError::Full(returned)) => {
+                        msg = Some(returned);
+                        super::sleep(POLL_INTERVAL).await;
+                    }
                     Err(TrySendError::Disconnected(_)) => return Err(BoundaryError::Closed),
                 }
-            } else {
-                self.tx.send(msg).map_err(|_| BoundaryError::Closed)?;
             }
-
-            Ok(BoundaryTicket { rx: Some(reply_rx) })
         }
     }
 
     impl<Request, Response> BoundaryServer<Request, Response> {
-        pub fn recv(&self) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
-            self.rx
-                .recv()
-                .map(boundary_request)
-                .map_err(|_| BoundaryError::Closed)
+        pub async fn recv(&self) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
+            loop {
+                match self.rx.try_recv() {
+                    Ok(msg) => return Ok(boundary_request(msg)),
+                    Err(TryRecvError::Empty) => super::sleep(POLL_INTERVAL).await,
+                    Err(TryRecvError::Disconnected) => return Err(BoundaryError::Closed),
+                }
+            }
         }
 
-        pub fn recv_timeout(
+        pub async fn recv_timeout(
             &self,
             timeout: Duration,
         ) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
-            self.rx
-                .recv_timeout(timeout)
-                .map(boundary_request)
-                .map_err(|err| match err {
-                    crossbeam_channel::RecvTimeoutError::Timeout => BoundaryError::Timeout,
-                    crossbeam_channel::RecvTimeoutError::Disconnected => BoundaryError::Closed,
-                })
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.rx.try_recv() {
+                    Ok(msg) => return Ok(boundary_request(msg)),
+                    Err(TryRecvError::Empty) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(BoundaryError::Timeout);
+                        }
+                        let sleep_for = deadline.saturating_duration_since(now).min(POLL_INTERVAL);
+                        super::sleep(sleep_for).await;
+                    }
+                    Err(TryRecvError::Disconnected) => return Err(BoundaryError::Closed),
+                }
+            }
         }
     }
 
@@ -375,6 +397,13 @@ pub mod boundary {
 pub struct TimeoutError;
 
 pub async fn sleep(duration: Duration) {
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(reply_rx) = ShardCtx::current().map(|ctx| ctx.enqueue_native_sleep(duration)) {
+        if matches!(reply_rx.await, Ok(Ok(()))) {
+            return;
+        }
+    }
+
     let (tx, rx) = oneshot::channel();
     thread::spawn(move || {
         thread::sleep(duration);
@@ -398,13 +427,13 @@ where
 /// Runs a top-level async job on a freshly constructed runtime using default builder settings.
 ///
 /// The provided closure receives a [`RuntimeHandle`] so the job can spawn additional work.
-pub fn run<F, Fut, T>(entry: F) -> Result<T, RuntimeError>
+pub async fn run<F, Fut, T>(entry: F) -> Result<T, RuntimeError>
 where
     F: FnOnce(RuntimeHandle) -> Fut,
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    run_with(Runtime::builder(), entry)
+    run_with(Runtime::builder(), entry).await
 }
 
 /// Runs a top-level async job on a freshly constructed runtime built from `builder`.
@@ -413,17 +442,19 @@ where
 /// 1) `builder.build()`
 /// 2) `handle.spawn_stealable(...)`
 /// 3) waiting for the returned join handle.
-pub fn run_with<F, Fut, T>(builder: RuntimeBuilder, entry: F) -> Result<T, RuntimeError>
+pub async fn run_with<F, Fut, T>(builder: RuntimeBuilder, entry: F) -> Result<T, RuntimeError>
 where
     F: FnOnce(RuntimeHandle) -> Fut,
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let runtime = builder.build()?;
+    let mut runtime = builder.build()?;
     let handle = runtime.handle();
     let job = entry(handle.clone());
     let join = handle.spawn_stealable(job)?;
-    futures::executor::block_on(join).map_err(|_| RuntimeError::Closed)
+    let outcome = join.await.map_err(|_| RuntimeError::Closed);
+    runtime.shutdown().await;
+    outcome
 }
 
 #[derive(Clone, Default)]
@@ -906,7 +937,35 @@ impl Runtime {
         spawn_on_shared(&self.shared, shard, fut)
     }
 
-    pub fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
+        if self.is_shutdown {
+            return;
+        }
+        self.is_shutdown = true;
+
+        for (idx, tx) in self.shared.command_txs.iter().enumerate() {
+            self.shared.stats.increment_command_depth(idx as ShardId);
+            let _ = tx.send(Command::Shutdown);
+        }
+
+        while !self.joins.is_empty() {
+            let mut idx = 0usize;
+            while idx < self.joins.len() {
+                if self.joins[idx].is_finished() {
+                    let join = self.joins.swap_remove(idx);
+                    let _ = join.join();
+                } else {
+                    idx += 1;
+                }
+            }
+
+            if !self.joins.is_empty() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    fn shutdown_blocking(&mut self) {
         if self.is_shutdown {
             return;
         }
@@ -925,7 +984,7 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.shutdown();
+        self.shutdown_blocking();
     }
 }
 
@@ -1348,6 +1407,16 @@ impl UringNativeAny {
             false,
             |reply| NativeAnyCommand::Fsync { fd, reply },
             "native unbound fsync response channel closed",
+        )
+        .await
+    }
+
+    pub async fn sleep(&self, duration: Duration) -> std::io::Result<()> {
+        let shard = self.selector.select(self.effective_preferred_shard());
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::Timeout { duration, reply },
+            "native unbound timeout response channel closed",
         )
         .await
     }
@@ -2125,6 +2194,30 @@ pub mod net {
             Self::connect_with_session_policy(handle, addr, StreamSessionPolicy::RoundRobin).await
         }
 
+        pub async fn connect_socket_addr(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+        ) -> io::Result<Self> {
+            Self::connect_socket_addr_with_session_policy(
+                handle,
+                socket_addr,
+                StreamSessionPolicy::ContextPreferred,
+            )
+            .await
+        }
+
+        pub async fn connect_socket_addr_round_robin(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+        ) -> io::Result<Self> {
+            Self::connect_socket_addr_with_session_policy(
+                handle,
+                socket_addr,
+                StreamSessionPolicy::RoundRobin,
+            )
+            .await
+        }
+
         pub async fn connect_with_session_policy<A>(
             handle: RuntimeHandle,
             addr: A,
@@ -2133,7 +2226,7 @@ pub mod net {
         where
             A: ToSocketAddrs,
         {
-            let socket_addr = first_socket_addr(addr)?;
+            let socket_addr = resolve_first_socket_addr_blocking(addr)?;
             Self::connect_socket_addr_with_session_policy(handle, socket_addr, policy).await
         }
 
@@ -2154,6 +2247,20 @@ pub mod net {
             .await
         }
 
+        pub async fn connect_many_socket_addr_round_robin(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+            count: usize,
+        ) -> io::Result<Vec<Self>> {
+            Self::connect_many_socket_addr_with_session_policy(
+                handle,
+                socket_addr,
+                count,
+                StreamSessionPolicy::RoundRobin,
+            )
+            .await
+        }
+
         pub async fn connect_many_with_session_policy<A>(
             handle: RuntimeHandle,
             addr: A,
@@ -2163,7 +2270,17 @@ pub mod net {
         where
             A: ToSocketAddrs,
         {
-            let socket_addr = first_socket_addr(addr)?;
+            let socket_addr = resolve_first_socket_addr_blocking(addr)?;
+            Self::connect_many_socket_addr_with_session_policy(handle, socket_addr, count, policy)
+                .await
+        }
+
+        pub async fn connect_many_socket_addr_with_session_policy(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+            count: usize,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Vec<Self>> {
             let mut streams = Vec::with_capacity(count);
             for _ in 0..count {
                 streams.push(
@@ -2201,7 +2318,7 @@ pub mod net {
             })
         }
 
-        async fn connect_socket_addr_with_session_policy(
+        pub async fn connect_socket_addr_with_session_policy(
             handle: RuntimeHandle,
             socket_addr: SocketAddr,
             policy: StreamSessionPolicy,
@@ -2385,7 +2502,14 @@ pub mod net {
         where
             A: ToSocketAddrs,
         {
-            let socket_addr = first_socket_addr(addr)?;
+            let socket_addr = resolve_first_socket_addr_blocking(addr)?;
+            Self::bind_socket_addr(handle, socket_addr).await
+        }
+
+        pub async fn bind_socket_addr(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+        ) -> io::Result<Self> {
             let listener = bind_std_listener(socket_addr)?;
             Ok(Self {
                 handle,
@@ -2463,10 +2587,11 @@ pub mod net {
         }
     }
 
-    fn first_socket_addr<A>(addr: A) -> io::Result<SocketAddr>
+    fn resolve_first_socket_addr_blocking<A>(addr: A) -> io::Result<SocketAddr>
     where
         A: ToSocketAddrs,
     {
+        // NOTE: hostname resolution via `ToSocketAddrs` may block for DNS.
         addr.to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3066,6 +3191,31 @@ impl ShardCtx {
         })
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    pub async fn native_sleep(&self, duration: Duration) -> std::io::Result<()> {
+        let reply_rx = self.enqueue_native_sleep(duration);
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native timeout response channel closed",
+            ))
+        })
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn enqueue_native_sleep(&self, duration: Duration) -> oneshot::Receiver<std::io::Result<()>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitNativeTimeout {
+                origin_shard: self.inner.shard_id,
+                duration,
+                reply: reply_tx,
+            });
+        reply_rx
+    }
+
     pub fn spawn_local<F, T>(&self, fut: F) -> LocalJoinHandle<T>
     where
         F: Future<Output = T> + 'static,
@@ -3286,6 +3436,12 @@ enum LocalCommand {
         reply: oneshot::Sender<std::io::Result<()>>,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeTimeout {
+        origin_shard: ShardId,
+        duration: Duration,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeOpenAt {
         origin_shard: ShardId,
         path: CString,
@@ -3354,6 +3510,10 @@ enum NativeAnyCommand {
     },
     Fsync {
         fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
+    Timeout {
+        duration: Duration,
         reply: oneshot::Sender<std::io::Result<()>>,
     },
     OpenAt {
@@ -3457,6 +3617,11 @@ impl NativeAnyCommand {
                 fd,
                 reply,
             },
+            Self::Timeout { duration, reply } => LocalCommand::SubmitNativeTimeout {
+                origin_shard,
+                duration,
+                reply,
+            },
             Self::OpenAt {
                 path,
                 flags,
@@ -3537,6 +3702,12 @@ impl NativeAnyCommand {
                 let _ = reply.send(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "native unbound fsync command channel closed",
+                )));
+            }
+            Self::Timeout { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound timeout command channel closed",
                 )));
             }
             Self::OpenAt { reply, .. } => {
@@ -3926,6 +4097,29 @@ impl ShardBackend {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_timeout(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        duration: Duration,
+        reply: oneshot::Sender<std::io::Result<()>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring timeout violated ring affinity",
+            )));
+            return;
+        }
+
+        let _ = self.driver_mut().submit_native_timeout(duration, reply);
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_native_openat(
         &mut self,
         current_shard: ShardId,
@@ -4068,6 +4262,10 @@ enum NativeIoOp {
         reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
     },
     Fsync {
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
+    Timeout {
+        timespec: Box<types::Timespec>,
         reply: oneshot::Sender<std::io::Result<()>>,
     },
 }
@@ -4923,6 +5121,36 @@ impl IoUringDriver {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_timeout(
+        &mut self,
+        duration: Duration,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    ) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::Timeout {
+            timespec: Box::new(duration.into()),
+            reply,
+        });
+        self.on_native_submit();
+
+        let ts_ptr = match self.native_ops.get(native_index) {
+            Some(NativeIoOp::Timeout { timespec, .. }) => {
+                timespec.as_ref() as *const types::Timespec
+            }
+            _ => unreachable!("native timeout op kind mismatch"),
+        };
+
+        let entry = opcode::Timeout::new(ts_ptr)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     fn submit_more_send_batch_parts(&mut self, batch_index: usize) -> Result<(), SendError> {
         loop {
             let submit = {
@@ -5170,6 +5398,12 @@ impl IoUringDriver {
                         "native io_uring fsync failed",
                     )));
                 }
+                NativeIoOp::Timeout { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring timeout failed",
+                    )));
+                }
             }
         }
     }
@@ -5252,6 +5486,12 @@ impl IoUringDriver {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring fsync canceled",
+                    )));
+                }
+                NativeIoOp::Timeout { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring timeout canceled",
                     )));
                 }
             }
@@ -5642,6 +5882,13 @@ impl IoUringDriver {
             NativeIoOp::RecvMulti { .. } => {}
             NativeIoOp::Fsync { reply } => {
                 if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok(()));
+            }
+            NativeIoOp::Timeout { reply, .. } => {
+                if result < 0 && -result != libc::ETIME {
                     let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
                     return;
                 }
@@ -6150,6 +6397,12 @@ fn drain_local_commands(
                 fd,
                 reply,
             } => backend.submit_native_fsync(shard_id, origin_shard, fd, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeTimeout {
+                origin_shard,
+                duration,
+                reply,
+            } => backend.submit_native_timeout(shard_id, origin_shard, duration, reply, stats),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeOpenAt {
                 origin_shard,

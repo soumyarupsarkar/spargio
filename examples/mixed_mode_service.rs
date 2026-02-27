@@ -40,7 +40,7 @@ fn main() {
         let handle = handle.clone();
         std::thread::spawn(move || {
             loop {
-                let req = match server.recv_timeout(Duration::from_millis(200)) {
+                let req = match block_on(server.recv_timeout(Duration::from_millis(200))) {
                     Ok(req) => req,
                     Err(boundary::BoundaryError::Timeout) => continue,
                     Err(boundary::BoundaryError::Closed) => break,
@@ -112,6 +112,7 @@ fn main() {
                 let request = Request { id, fanout: 8 };
                 let ticket = client
                     .call_with_timeout(request, Duration::from_secs(2))
+                    .await
                     .expect("enqueue request");
                 ticket.await
             }));

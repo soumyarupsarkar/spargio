@@ -1,6 +1,6 @@
 # spargio
 
-`spargio` is a work-stealing `io_uring`-based async runtime for Rust, using `msg_ring` for cross-shared coordination.
+`spargio` is a **work-stealing `io_uring`-based async runtime** for Rust, using `msg_ring` for cross-shared coordination.
 
 Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across shards.
 
@@ -113,10 +113,13 @@ For performance, different workload shapes favor different runtimes.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
 - Work-stealing scheduler MVP with backpressure and runtime stats.
 - Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
-- Runtime entry ergonomics: `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
+- Runtime entry ergonomics: async-first `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
 - Unbound native API: `RuntimeHandle::uring_native_unbound() -> UringNativeAny` with file ops (`read_at`, `read_at_into`, `write_at`, `fsync`) and stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`), plus submission-time shard selector, FD affinity leases, and active op route tracking.
 - Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` and `spargio::net::{TcpListener, TcpStream}`.
 - Native setup path on Linux io_uring lane: `open/connect/accept` are nonblocking and routed through native setup ops (no helper-thread `run_blocking` wrappers in public fs/net setup APIs).
+- Native timeout path on io_uring lane: `UringNativeAny::sleep(...)` and shard-context `spargio::sleep(...)` route through `IORING_OP_TIMEOUT`.
+- Async-first boundary APIs: `call`, `call_with_timeout`, `recv`, `recv_timeout`, and `BoundaryTicket::wait_timeout`.
+- Explicit socket-address APIs that bypass DNS resolution: `connect_socket_addr*` and `bind_socket_addr`.
 - Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
 - Mixed-runtime boundary API: `spargio::boundary`.
 - Reference mixed-mode service example.
@@ -124,6 +127,7 @@ For performance, different workload shapes favor different runtimes.
 ## What's Not Done Yet
 
 - Broader filesystem and network native-op surface (beyond current MVP set, including richer open/metadata/fs management and broader socket operations).
+- Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
 - Deeper documentation (`spargio` book / guides for API selection, placement strategy, and benchmark methodology).
@@ -158,11 +162,13 @@ cargo run --example mixed_mode_service
 Helper-based entry:
 
 ```rust
-fn main() -> Result<(), spargio::RuntimeError> {
+#[tokio::main]
+async fn main() -> Result<(), spargio::RuntimeError> {
     spargio::run(|handle| async move {
         let job = handle.spawn_stealable(async { 42usize }).expect("spawn");
         assert_eq!(job.await.expect("join"), 42);
     })
+    .await
 }
 ```
 

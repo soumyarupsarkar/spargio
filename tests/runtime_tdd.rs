@@ -224,18 +224,19 @@ fn flush_completes_without_messages() {
     block_on(send).expect("sender join");
 }
 
-#[test]
-fn run_helper_executes_top_level_future() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_helper_executes_top_level_future() {
     let out = run(|handle| async move {
         let join = handle.spawn_stealable(async { 41usize }).expect("spawn");
         join.await.expect("join") + 1
     })
+    .await
     .expect("run");
     assert_eq!(out, 42);
 }
 
-#[test]
-fn run_with_applies_custom_builder() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_applies_custom_builder() {
     let out = match run_with(
         Runtime::builder().shards(1).backend(BackendKind::IoUring),
         |handle| async move {
@@ -246,7 +247,9 @@ fn run_with_applies_custom_builder() {
                 .expect("spawn");
             join.await.expect("join")
         },
-    ) {
+    )
+    .await
+    {
         Ok(out) => out,
         #[cfg(target_os = "linux")]
         Err(RuntimeError::IoUringInit(_)) | Err(RuntimeError::UnsupportedBackend(_)) => return,
@@ -255,9 +258,10 @@ fn run_with_applies_custom_builder() {
     assert_eq!(out, 0);
 }
 
-#[test]
-fn run_with_propagates_builder_errors() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_propagates_builder_errors() {
     let err = run_with(Runtime::builder().shards(0), |_| async { 1usize })
+        .await
         .expect_err("invalid runtime config");
     assert!(matches!(err, RuntimeError::InvalidConfig(_)));
 }
@@ -381,4 +385,24 @@ fn io_uring_send_many_nowait_delivers_messages() {
             }
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_shutdown_is_idempotent() {
+    let mut rt = match Runtime::builder()
+        .shards(1)
+        .backend(BackendKind::IoUring)
+        .build()
+    {
+        Ok(rt) => rt,
+        #[cfg(target_os = "linux")]
+        Err(RuntimeError::IoUringInit(_)) | Err(RuntimeError::UnsupportedBackend(_)) => return,
+        Err(err) => panic!("unexpected build error: {err:?}"),
+    };
+
+    let join = rt.spawn_on(0, async { 1usize }).expect("spawn");
+    assert_eq!(join.await.expect("join"), 1);
+
+    rt.shutdown().await;
+    rt.shutdown().await;
 }

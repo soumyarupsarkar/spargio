@@ -7,7 +7,7 @@ mod linux_uring_native_tests {
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -49,6 +49,21 @@ mod linux_uring_native_tests {
             return;
         };
         let _ = rt.handle().uring_native_unbound().expect("native any");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_sleep_uses_timeout_path() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let start = Instant::now();
+        any.sleep(Duration::from_millis(12)).await.expect("sleep");
+        assert!(
+            start.elapsed() >= Duration::from_millis(8),
+            "native sleep returned too early: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

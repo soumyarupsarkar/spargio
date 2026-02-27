@@ -139,6 +139,33 @@ mod ergonomics_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net_tcp_stream_connect_socket_addr_supports_read_write_all() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4];
+            socket.read_exact(&mut buf).expect("read_exact");
+            assert_eq!(&buf, b"ping");
+            socket.write_all(b"pong").expect("write_all");
+        });
+
+        let stream = spargio::net::TcpStream::connect_socket_addr(rt.handle(), addr)
+            .await
+            .expect("connect");
+        stream.write_all(b"ping").await.expect("write_all");
+        let mut recv = [0u8; 4];
+        stream.read_exact(&mut recv).await.expect("read_exact");
+        assert_eq!(&recv, b"pong");
+
+        let _ = server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn net_tcp_stream_owned_buffers_support_read_write_all() {
         let Some(rt) = try_build_io_uring_runtime() else {
             return;
@@ -199,6 +226,38 @@ mod ergonomics_tests {
             is_nonblocking(stream.as_raw_fd()),
             "accepted spargio tcp stream should be nonblocking"
         );
+        let mut recv = [0u8; 3];
+        stream.read_exact(&mut recv).await.expect("server read");
+        assert_eq!(&recv, b"abc");
+        stream.write_all(b"xyz").await.expect("server write");
+
+        let echoed = client.join().expect("join client");
+        assert_eq!(&echoed, b"xyz");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net_tcp_listener_bind_socket_addr_accepts_and_wraps_stream() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let listener = spargio::net::TcpListener::bind_socket_addr(
+            rt.handle(),
+            "127.0.0.1:0".parse().expect("socket addr"),
+        )
+        .await
+        .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(addr).expect("client connect");
+            stream.write_all(b"abc").expect("client write");
+            let mut out = [0u8; 3];
+            stream.read_exact(&mut out).expect("client read");
+            out
+        });
+
+        let (stream, _addr) = listener.accept().await.expect("accept");
         let mut recv = [0u8; 3];
         stream.read_exact(&mut recv).await.expect("server read");
         assert_eq!(&recv, b"abc");

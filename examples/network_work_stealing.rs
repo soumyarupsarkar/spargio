@@ -56,7 +56,7 @@ mod linux_example {
         })
     }
 
-    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server = spawn_echo_server(listener, STREAMS);
@@ -118,6 +118,7 @@ mod linux_example {
                 (session_shards, execution_shards, combined_checksum)
             },
         )
+        .await
         .map_err(|err| io::Error::other(format!("runtime startup failed: {err:?}")))?;
 
         println!("session shards from round-robin connect: {session_shards:?}");
@@ -131,7 +132,7 @@ mod linux_example {
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    linux_example::run()
+    futures::executor::block_on(linux_example::run())
 }
 
 #[cfg(not(all(feature = "uring-native", target_os = "linux")))]
