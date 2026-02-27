@@ -46,8 +46,6 @@ async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
 }
 ```
 
-In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a local run/command queue. Internally within spargio, we pass work between one shard to another by enqueueing work and injecting CQEs across shards, waking up a recipient worker thread to drain pending work from its queue.
-
 ## Tokio Integration
 
 Recommended model today:
@@ -65,6 +63,10 @@ Using `msg_ring` for coordination is heavily inspired by [`ourio`](https://githu
 Wondering whether to build a work-stealing pool using `io_uring` at all was inspired by the following (excellent) blog posts:
 - https://emschwartz.me/async-rust-can-be-a-pleasure-to-work-with-without-send-sync-static/
 - https://without.boats/blog/thread-per-core/
+
+## Terminology: Shards
+
+In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a local run/command queue. Internally within Spargio, we pass work from one shard to another by enqueueing work and injecting CQEs across shards, waking up a recipient worker thread to drain pending work from its queue.
 
 ## Benchmark Results
 
