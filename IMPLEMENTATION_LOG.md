@@ -3336,3 +3336,117 @@ Net effect vs prior `net_api` snapshots:
 - Stream rotating-hotspot: Spargio improved materially (about 14-16% faster) and moved closer to Tokio.
 - Pipeline rotating-hotspot: Spargio improved materially (about 8-11% faster) and moved closer to Tokio.
 - Both workloads still trail Tokio, but the remaining gap is substantially smaller than before.
+
+## Update: implemented next hotspot optimizations (Red/Green TDD)
+
+Follow-up optimizations implemented from the latest hotspot analysis:
+
+1. Remove extra owned-buffer read/write overhead in stream loops.
+2. Add a tighter same-shard native-op fast path for session-stream ops.
+
+### Red phase
+
+Added failing test in `tests/ergonomics_tdd.rs`:
+
+- `net_tcp_stream_spawn_on_session_uses_local_direct_native_fastpath`
+
+Initial failure:
+
+- compile-time red because `RuntimeStats` had no `native_any_local_direct_submitted` field.
+
+### Green phase
+
+Implemented:
+
+- New runtime stat:
+  - `RuntimeStats::native_any_local_direct_submitted`
+  - tracked in `RuntimeStatsInner` and surfaced via `stats_snapshot()`.
+
+- Session-stream local direct path:
+  - in `UringNativeAny::{recv_owned_at_on_shard, send_owned_at_on_shard}`, when running on the same runtime+shard context:
+    - enqueue `LocalCommand::SubmitNative{Recv,Send}Owned` directly
+    - increment `native_any_local_direct_submitted`
+    - avoid `NativeAnyCommand -> LocalCommand` conversion path
+
+- Offset-based native send/recv plumbing:
+  - added `offset` to `NativeAnyCommand::{RecvOwned, SendOwned}`
+  - added `offset` to `LocalCommand::{SubmitNativeRecvOwned, SubmitNativeSendOwned}`
+  - io_uring driver now submits `Recv/Send` against `buf[offset..]` without cloning/splitting buffers.
+
+- Stream owned I/O loop rewrites:
+  - `TcpStream::write_all_owned` now advances using `send_owned_from(buf, offset)` (no fallback `send(&buf[sent..])` cloning path).
+  - `TcpStream::read_exact_owned` now advances using `recv_owned_from(dst, offset)` (no `read_exact` scratch/copy path).
+
+Validation:
+
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo test --features uring-native --tests`
+
+### Post-change benchmark snapshot
+
+Commands:
+
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 12`
+
+Results:
+
+- `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.7900-8.8664 ms`
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `9.3389-9.4787 ms`
+- `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.661-16.845 ms`
+
+- `net_pipeline_hotspot_rotation_4k_window32/tokio_tcp_pipeline_hotspot`: `26.322-26.549 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`: `28.933-29.121 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/compio_tcp_pipeline_hotspot`: `51.323-52.073 ms`
+
+Effect:
+
+- Additional improvement in both rotating-hotspot benchmarks.
+- Remaining gap to Tokio narrowed again (now roughly ~5-10% depending on exact bound pair).
+
+## Update: local direct native replies now avoid oneshot allocation (Red/Green TDD)
+
+Completed the in-progress local fast-path refactor so same-runtime same-shard
+`recv_owned/send_owned` submissions do not allocate/use a oneshot channel.
+
+### Green implementation details
+
+- Added `NativeBufReply::{Oneshot, Local}` and `NativeBufReply::complete(...)`.
+- Added local waiter pair:
+  - `NativeBufReply::local_pair()`
+  - `NativeLocalBufReplySlot` + `NativeLocalBufReplyFuture`
+- Wired local-direct branch in:
+  - `UringNativeAny::recv_owned_at_on_shard`
+  - `UringNativeAny::send_owned_at_on_shard`
+  to use the local waiter/future instead of oneshot.
+- Updated io_uring native recv/send submit/completion paths to use
+  `NativeBufReply` uniformly.
+
+Validation:
+
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo test --features uring-native --tests`
+
+### Post-change hotspot benchmark snapshot
+
+Commands:
+
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 12`
+
+Results:
+
+- `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.6940-8.8212 ms`
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `9.3020-9.4073 ms`
+- `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.681-16.812 ms`
+
+- `net_pipeline_hotspot_rotation_4k_window32/tokio_tcp_pipeline_hotspot`: `26.286-26.560 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`: `29.025-29.574 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/compio_tcp_pipeline_hotspot`: `50.614-50.986 ms`
+
+Effect:
+
+- Refactor is functionally complete and fully green.
+- This specific change is mostly neutral on these two benchmark shapes
+  (small movement within run-to-run noise).

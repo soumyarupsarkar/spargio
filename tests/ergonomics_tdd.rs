@@ -371,4 +371,58 @@ mod ergonomics_tests {
         let observed = join.await.expect("join");
         assert_eq!(observed, expected);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn net_tcp_stream_spawn_on_session_uses_local_direct_native_fastpath() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(addr).expect("client connect");
+            stream.write_all(b"ping").expect("client write");
+            let mut out = [0u8; 4];
+            stream.read_exact(&mut out).expect("client read");
+            out
+        });
+        let (server, _) = listener.accept().expect("accept");
+
+        let stream =
+            spargio::net::TcpStream::from_std(rt.handle(), server).expect("wrap std tcp stream");
+        let handle = rt.handle();
+        let before = handle.stats_snapshot();
+
+        let task_stream = stream.clone();
+        let join = stream
+            .spawn_on_session(&handle, async move {
+                let recv = task_stream
+                    .read_exact_owned(vec![0u8; 4])
+                    .await
+                    .expect("read_exact_owned");
+                assert_eq!(&recv, b"ping");
+
+                let sent = task_stream
+                    .write_all_owned(b"pong".to_vec())
+                    .await
+                    .expect("write_all_owned");
+                assert_eq!(&sent, b"pong");
+            })
+            .expect("spawn_on_session");
+
+        join.await.expect("join");
+        let echoed = client.join().expect("join client");
+        assert_eq!(&echoed, b"pong");
+
+        let after = handle.stats_snapshot();
+        assert!(
+            after.native_any_local_direct_submitted > before.native_any_local_direct_submitted,
+            "expected local direct native fastpath submissions to increase"
+        );
+        assert_eq!(
+            after.native_any_envelope_submitted, before.native_any_envelope_submitted,
+            "session-pinned local stream ops should not use cross-shard native envelopes"
+        );
+    }
 }

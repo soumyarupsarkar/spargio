@@ -9,7 +9,7 @@ use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use futures::future::join_all;
 use futures::future::{Either, select};
-use futures::task::LocalSpawnExt;
+use futures::task::{AtomicWaker, LocalSpawnExt};
 use std::cell::RefCell;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use std::collections::HashMap;
@@ -72,6 +72,87 @@ const NATIVE_WEAK_AFFINITY_TTL: Duration = Duration::from_millis(0);
 const NATIVE_STRONG_AFFINITY_TTL: Duration = Duration::from_millis(200);
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_HARD_AFFINITY_TTL: Duration = Duration::from_secs(5);
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeLocalBufReplySlot {
+    result: Mutex<Option<std::io::Result<(usize, Vec<u8>)>>>,
+    waker: AtomicWaker,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl NativeLocalBufReplySlot {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn complete(&self, out: std::io::Result<(usize, Vec<u8>)>) {
+        *self
+            .result
+            .lock()
+            .expect("native local buf reply lock poisoned") = Some(out);
+        self.waker.wake();
+    }
+
+    fn take(&self) -> Option<std::io::Result<(usize, Vec<u8>)>> {
+        self.result
+            .lock()
+            .expect("native local buf reply lock poisoned")
+            .take()
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeLocalBufReplyFuture {
+    slot: Arc<NativeLocalBufReplySlot>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl Future for NativeLocalBufReplyFuture {
+    type Output = std::io::Result<(usize, Vec<u8>)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(out) = self.slot.take() {
+            return Poll::Ready(out);
+        }
+        self.slot.waker.register(cx.waker());
+        if let Some(out) = self.slot.take() {
+            Poll::Ready(out)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+enum NativeBufReply {
+    Oneshot(oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>),
+    Local(Arc<NativeLocalBufReplySlot>),
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl NativeBufReply {
+    fn oneshot(tx: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>) -> Self {
+        Self::Oneshot(tx)
+    }
+
+    fn local_pair() -> (Self, NativeLocalBufReplyFuture) {
+        let slot = Arc::new(NativeLocalBufReplySlot::new());
+        let fut = NativeLocalBufReplyFuture { slot: slot.clone() };
+        (Self::Local(slot), fut)
+    }
+
+    fn complete(self, out: std::io::Result<(usize, Vec<u8>)>) {
+        match self {
+            Self::Oneshot(reply) => {
+                let _ = reply.send(out);
+            }
+            Self::Local(slot) => slot.complete(out),
+        }
+    }
+}
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 fn socket_addr_to_storage(addr: SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t, i32) {
@@ -610,6 +691,7 @@ pub struct RuntimeStats {
     pub pending_native_ops_by_shard: Vec<usize>,
     pub native_any_envelope_submitted: u64,
     pub native_any_local_fastpath_submitted: u64,
+    pub native_any_local_direct_submitted: u64,
     pub spawn_pinned_submitted: u64,
     pub spawn_stealable_submitted: u64,
     pub stealable_executed: u64,
@@ -1498,7 +1580,12 @@ impl UringNativeAny {
             fd,
             NativeAffinityStrength::Strong,
             false,
-            |reply| NativeAnyCommand::RecvOwned { fd, buf, reply },
+            |reply| NativeAnyCommand::RecvOwned {
+                fd,
+                buf,
+                offset: 0,
+                reply,
+            },
             "native unbound recv response channel closed",
         )
         .await
@@ -1519,7 +1606,12 @@ impl UringNativeAny {
             fd,
             NativeAffinityStrength::Strong,
             false,
-            |reply| NativeAnyCommand::SendOwned { fd, buf, reply },
+            |reply| NativeAnyCommand::SendOwned {
+                fd,
+                buf,
+                offset: 0,
+                reply,
+            },
             "native unbound send response channel closed",
         )
         .await
@@ -1634,29 +1726,121 @@ impl UringNativeAny {
         self.selector.select(self.effective_preferred_shard())
     }
 
-    pub(crate) async fn recv_owned_on_shard(
+    pub(crate) async fn recv_owned_at_on_shard(
         &self,
         shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
+        offset: usize,
     ) -> std::io::Result<(usize, Vec<u8>)> {
+        let mut maybe_buf = Some(buf);
+        if let Some(reply_rx) = ShardCtx::current()
+            .filter(|ctx| ctx.runtime_id() == self.handle.inner.shared.runtime_id)
+            .filter(|ctx| ctx.shard_id() == shard)
+            .map(|ctx| {
+                let buf = maybe_buf
+                    .take()
+                    .expect("recv_owned_at_on_shard local branch already consumed buffer");
+                self.handle
+                    .inner
+                    .shared
+                    .stats
+                    .native_any_local_fastpath_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                self.handle
+                    .inner
+                    .shared
+                    .stats
+                    .native_any_local_direct_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                let (reply, reply_rx) = NativeBufReply::local_pair();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeRecvOwned {
+                        origin_shard: shard,
+                        fd,
+                        buf,
+                        offset,
+                        reply,
+                    },
+                );
+                reply_rx
+            })
+        {
+            return reply_rx.await;
+        }
+
+        let buf = maybe_buf
+            .take()
+            .expect("recv_owned_at_on_shard remote branch missing buffer");
+
         self.submit_direct(
             shard,
-            |reply| NativeAnyCommand::RecvOwned { fd, buf, reply },
+            |reply| NativeAnyCommand::RecvOwned {
+                fd,
+                buf,
+                offset,
+                reply,
+            },
             "native stream-session recv response channel closed",
         )
         .await
     }
 
-    pub(crate) async fn send_owned_on_shard(
+    pub(crate) async fn send_owned_at_on_shard(
         &self,
         shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
+        offset: usize,
     ) -> std::io::Result<(usize, Vec<u8>)> {
+        let mut maybe_buf = Some(buf);
+        if let Some(reply_rx) = ShardCtx::current()
+            .filter(|ctx| ctx.runtime_id() == self.handle.inner.shared.runtime_id)
+            .filter(|ctx| ctx.shard_id() == shard)
+            .map(|ctx| {
+                let buf = maybe_buf
+                    .take()
+                    .expect("send_owned_at_on_shard local branch already consumed buffer");
+                self.handle
+                    .inner
+                    .shared
+                    .stats
+                    .native_any_local_fastpath_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                self.handle
+                    .inner
+                    .shared
+                    .stats
+                    .native_any_local_direct_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                let (reply, reply_rx) = NativeBufReply::local_pair();
+                ctx.inner.local_commands.borrow_mut().push_back(
+                    LocalCommand::SubmitNativeSendOwned {
+                        origin_shard: shard,
+                        fd,
+                        buf,
+                        offset,
+                        reply,
+                    },
+                );
+                reply_rx
+            })
+        {
+            return reply_rx.await;
+        }
+
+        let buf = maybe_buf
+            .take()
+            .expect("send_owned_at_on_shard remote branch missing buffer");
+
         self.submit_direct(
             shard,
-            |reply| NativeAnyCommand::SendOwned { fd, buf, reply },
+            |reply| NativeAnyCommand::SendOwned {
+                fd,
+                buf,
+                offset,
+                reply,
+            },
             "native stream-session send response channel closed",
         )
         .await
@@ -2379,14 +2563,30 @@ pub mod net {
         }
 
         pub async fn send_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.send_owned_from(buf, 0).await
+        }
+
+        async fn send_owned_from(
+            &self,
+            buf: Vec<u8>,
+            offset: usize,
+        ) -> io::Result<(usize, Vec<u8>)> {
             self.native
-                .send_owned_on_shard(self.session_shard, self.as_raw_fd(), buf)
+                .send_owned_at_on_shard(self.session_shard, self.as_raw_fd(), buf, offset)
                 .await
         }
 
         pub async fn recv_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.recv_owned_from(buf, 0).await
+        }
+
+        async fn recv_owned_from(
+            &self,
+            buf: Vec<u8>,
+            offset: usize,
+        ) -> io::Result<(usize, Vec<u8>)> {
             self.native
-                .recv_owned_on_shard(self.session_shard, self.as_raw_fd(), buf)
+                .recv_owned_at_on_shard(self.session_shard, self.as_raw_fd(), buf, offset)
                 .await
         }
 
@@ -2434,27 +2634,16 @@ pub mod net {
         pub async fn write_all_owned(&self, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
             let mut sent = 0usize;
             while sent < buf.len() {
-                if sent == 0 {
-                    let (wrote, returned) = self.send_owned(buf).await?;
-                    if wrote == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "send returned zero",
-                        ));
-                    }
-                    sent = sent.saturating_add(wrote);
-                    buf = returned;
-                    continue;
-                }
-
-                let wrote = self.send(&buf[sent..]).await?;
+                let remaining = buf.len().saturating_sub(sent);
+                let (wrote, returned) = self.send_owned_from(buf, sent).await?;
+                buf = returned;
                 if wrote == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "send returned zero",
                     ));
                 }
-                sent = sent.saturating_add(wrote);
+                sent = sent.saturating_add(wrote.min(remaining));
             }
 
             Ok(buf)
@@ -2486,7 +2675,19 @@ pub mod net {
         }
 
         pub async fn read_exact_owned(&self, mut dst: Vec<u8>) -> io::Result<Vec<u8>> {
-            self.read_exact(dst.as_mut_slice()).await?;
+            let mut received = 0usize;
+            while received < dst.len() {
+                let remaining = dst.len().saturating_sub(received);
+                let (got, returned) = self.recv_owned_from(dst, received).await?;
+                dst = returned;
+                if got == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ));
+                }
+                received = received.saturating_add(got.min(remaining));
+            }
             Ok(dst)
         }
     }
@@ -2752,6 +2953,7 @@ struct RuntimeStatsInner {
     pending_native_ops_by_shard: Vec<AtomicUsize>,
     native_any_envelope_submitted: AtomicU64,
     native_any_local_fastpath_submitted: AtomicU64,
+    native_any_local_direct_submitted: AtomicU64,
     spawn_pinned_submitted: AtomicU64,
     spawn_stealable_submitted: AtomicU64,
     stealable_executed: AtomicU64,
@@ -2781,6 +2983,7 @@ impl RuntimeStatsInner {
             pending_native_ops_by_shard,
             native_any_envelope_submitted: AtomicU64::new(0),
             native_any_local_fastpath_submitted: AtomicU64::new(0),
+            native_any_local_direct_submitted: AtomicU64::new(0),
             spawn_pinned_submitted: AtomicU64::new(0),
             spawn_stealable_submitted: AtomicU64::new(0),
             stealable_executed: AtomicU64::new(0),
@@ -2814,6 +3017,9 @@ impl RuntimeStatsInner {
                 .load(Ordering::Relaxed),
             native_any_local_fastpath_submitted: self
                 .native_any_local_fastpath_submitted
+                .load(Ordering::Relaxed),
+            native_any_local_direct_submitted: self
+                .native_any_local_direct_submitted
                 .load(Ordering::Relaxed),
             spawn_pinned_submitted: self.spawn_pinned_submitted.load(Ordering::Relaxed),
             spawn_stealable_submitted: self.spawn_stealable_submitted.load(Ordering::Relaxed),
@@ -3403,14 +3609,16 @@ enum LocalCommand {
         origin_shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeSendOwned {
         origin_shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     },
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     SubmitNativeSendBatchOwned {
@@ -3488,11 +3696,13 @@ enum NativeAnyCommand {
     RecvOwned {
         fd: RawFd,
         buf: Vec<u8>,
+        offset: usize,
         reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
     },
     SendOwned {
         fd: RawFd,
         buf: Vec<u8>,
+        offset: usize,
         reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
     },
     SendBatchOwned {
@@ -3574,17 +3784,29 @@ impl NativeAnyCommand {
                 buf,
                 reply,
             },
-            Self::RecvOwned { fd, buf, reply } => LocalCommand::SubmitNativeRecvOwned {
+            Self::RecvOwned {
+                fd,
+                buf,
+                offset,
+                reply,
+            } => LocalCommand::SubmitNativeRecvOwned {
                 origin_shard,
                 fd,
                 buf,
-                reply,
+                offset,
+                reply: NativeBufReply::oneshot(reply),
             },
-            Self::SendOwned { fd, buf, reply } => LocalCommand::SubmitNativeSendOwned {
+            Self::SendOwned {
+                fd,
+                buf,
+                offset,
+                reply,
+            } => LocalCommand::SubmitNativeSendOwned {
                 origin_shard,
                 fd,
                 buf,
-                reply,
+                offset,
+                reply: NativeBufReply::oneshot(reply),
             },
             Self::SendBatchOwned {
                 fd,
@@ -3973,21 +4195,22 @@ impl ShardBackend {
         origin_shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
         stats: &RuntimeStatsInner,
     ) {
         if current_shard != origin_shard {
             stats
                 .native_affinity_violations
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = reply.send(Err(std::io::Error::new(
+            reply.complete(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "native io_uring recv violated ring affinity",
             )));
             return;
         }
 
-        let _ = self.driver_mut().submit_native_recv(fd, buf, reply);
+        let _ = self.driver_mut().submit_native_recv(fd, buf, offset, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3997,21 +4220,22 @@ impl ShardBackend {
         origin_shard: ShardId,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
         stats: &RuntimeStatsInner,
     ) {
         if current_shard != origin_shard {
             stats
                 .native_affinity_violations
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = reply.send(Err(std::io::Error::new(
+            reply.complete(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "native io_uring send violated ring affinity",
             )));
             return;
         }
 
-        let _ = self.driver_mut().submit_native_send(fd, buf, reply);
+        let _ = self.driver_mut().submit_native_send(fd, buf, offset, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4245,11 +4469,13 @@ enum NativeIoOp {
     },
     Recv {
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     },
     Send {
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     },
     RecvMulti {
         pool_key: NativeRecvPoolKey,
@@ -4733,21 +4959,37 @@ impl IoUringDriver {
         &mut self,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     ) -> Result<(), SendError> {
-        let Ok(len_u32) = u32::try_from(buf.len()) else {
-            let _ = reply.send(Err(std::io::Error::new(
+        if offset > buf.len() {
+            reply.complete(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native recv offset exceeds buffer length",
+            )));
+            return Ok(());
+        }
+        let len = buf.len().saturating_sub(offset);
+        let Ok(len_u32) = u32::try_from(len) else {
+            reply.complete(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "native recv length exceeds u32::MAX",
             )));
             return Ok(());
         };
 
-        let native_index = self.native_ops.insert(NativeIoOp::Recv { buf, reply });
+        if len == 0 {
+            reply.complete(Ok((0, buf)));
+            return Ok(());
+        }
+
+        let native_index = self
+            .native_ops
+            .insert(NativeIoOp::Recv { buf, offset, reply });
         self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
-            Some(NativeIoOp::Recv { buf, .. }) => buf.as_mut_ptr(),
+            Some(NativeIoOp::Recv { buf, offset, .. }) => buf.as_mut_ptr().wrapping_add(*offset),
             _ => unreachable!("native recv op kind mismatch"),
         };
 
@@ -4767,21 +5009,37 @@ impl IoUringDriver {
         &mut self,
         fd: RawFd,
         buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
+        offset: usize,
+        reply: NativeBufReply,
     ) -> Result<(), SendError> {
-        let Ok(len_u32) = u32::try_from(buf.len()) else {
-            let _ = reply.send(Err(std::io::Error::new(
+        if offset > buf.len() {
+            reply.complete(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native send offset exceeds buffer length",
+            )));
+            return Ok(());
+        }
+        let len = buf.len().saturating_sub(offset);
+        let Ok(len_u32) = u32::try_from(len) else {
+            reply.complete(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "native send length exceeds u32::MAX",
             )));
             return Ok(());
         };
 
-        let native_index = self.native_ops.insert(NativeIoOp::Send { buf, reply });
+        if len == 0 {
+            reply.complete(Ok((0, buf)));
+            return Ok(());
+        }
+
+        let native_index = self
+            .native_ops
+            .insert(NativeIoOp::Send { buf, offset, reply });
         self.on_native_submit();
 
         let buf_ptr = match self.native_ops.get_mut(native_index) {
-            Some(NativeIoOp::Send { buf, .. }) => buf.as_ptr(),
+            Some(NativeIoOp::Send { buf, offset, .. }) => buf.as_ptr().wrapping_add(*offset),
             _ => unreachable!("native send op kind mismatch"),
         };
 
@@ -5368,13 +5626,13 @@ impl IoUringDriver {
                     )));
                 }
                 NativeIoOp::Recv { reply, .. } => {
-                    let _ = reply.send(Err(std::io::Error::new(
+                    reply.complete(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring recv failed",
                     )));
                 }
                 NativeIoOp::Send { reply, .. } => {
-                    let _ = reply.send(Err(std::io::Error::new(
+                    reply.complete(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring send failed",
                     )));
@@ -5458,13 +5716,13 @@ impl IoUringDriver {
                     )));
                 }
                 NativeIoOp::Recv { reply, .. } => {
-                    let _ = reply.send(Err(std::io::Error::new(
+                    reply.complete(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring recv canceled",
                     )));
                 }
                 NativeIoOp::Send { reply, .. } => {
-                    let _ = reply.send(Err(std::io::Error::new(
+                    reply.complete(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring send canceled",
                     )));
@@ -5865,19 +6123,19 @@ impl IoUringDriver {
                 }
                 let _ = reply.send(Ok(result as usize));
             }
-            NativeIoOp::Recv { buf, reply } => {
+            NativeIoOp::Recv { buf, reply, .. } => {
                 if result < 0 {
-                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    reply.complete(Err(std::io::Error::from_raw_os_error(-result)));
                     return;
                 }
-                let _ = reply.send(Ok((result as usize, buf)));
+                reply.complete(Ok((result as usize, buf)));
             }
-            NativeIoOp::Send { buf, reply } => {
+            NativeIoOp::Send { buf, reply, .. } => {
                 if result < 0 {
-                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    reply.complete(Err(std::io::Error::from_raw_os_error(-result)));
                     return;
                 }
-                let _ = reply.send(Ok((result as usize, buf)));
+                reply.complete(Ok((result as usize, buf)));
             }
             NativeIoOp::RecvMulti { .. } => {}
             NativeIoOp::Fsync { reply } => {
@@ -6348,15 +6606,17 @@ fn drain_local_commands(
                 origin_shard,
                 fd,
                 buf,
+                offset,
                 reply,
-            } => backend.submit_native_recv(shard_id, origin_shard, fd, buf, reply, stats),
+            } => backend.submit_native_recv(shard_id, origin_shard, fd, buf, offset, reply, stats),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeSendOwned {
                 origin_shard,
                 fd,
                 buf,
+                offset,
                 reply,
-            } => backend.submit_native_send(shard_id, origin_shard, fd, buf, reply, stats),
+            } => backend.submit_native_send(shard_id, origin_shard, fd, buf, offset, reply, stats),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             LocalCommand::SubmitNativeSendBatchOwned {
                 origin_shard,
