@@ -87,7 +87,7 @@ Compio is not listed in this coordination-only table because it is share-nothing
 
 ## Benchmark Interpretation
 
-TL;DR: Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput; Tokio is currently better optimized for some rotating-hotspot network shapes.
+TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput. Somewhat surprisingly, Tokio is currently better optimized for some rotating-hotspot network shapes.
 
 - Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `cold_start_ping_pong`, `fanout_fanin_*`).
 - Spargio leads in low-depth fs/net latency (`fs_read_rtt_4k`, `net_echo_rtt_256b`) versus both Tokio and Compio.
