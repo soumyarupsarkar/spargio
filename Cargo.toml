@@ -3,11 +3,15 @@ name = "spargio"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Work-stealing async runtime for Rust built on io_uring and msg_ring"
+repository = "https://github.com/soumyarupsarkar/spargio"
+homepage = "https://github.com/soumyarupsarkar/spargio"
+documentation = "https://docs.rs/spargio"
 
 [dependencies]
 crossbeam-channel = "0.5"
 futures = "0.3"
-spargio-macros = { path = "spargio-macros", optional = true }
+spargio-macros = { version = "0.1.0", path = "spargio-macros", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

@@ -3,6 +3,10 @@ name = "spargio-macros"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Procedural macros for spargio runtime entrypoints"
+repository = "https://github.com/soumyarupsarkar/spargio"
+homepage = "https://github.com/soumyarupsarkar/spargio"
+documentation = "https://docs.rs/spargio-macros"
 
 [lib]
 proc-macro = true
