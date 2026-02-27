@@ -12,6 +12,48 @@ The benchmarks below demonstrate where this helps. In short, as expected, unlike
 
 This began as a proof of concept built with Codex to see if the idea is worth pursuing. I have not reviewed all the code yet, and it's not complete. Do not use it in production.
 
+## Quick start
+
+Pre-requisites: Linux 6.0+ recommended (5.18+ for core io_uring + msg_ring paths)
+
+Add `spargio` as a dependency:
+```bash
+cargo add spargio --features macros,uring-native
+```
+
+Then use it for `io_uring` IO operations and stealable task spawning:
+```rust
+use spargio::{fs::File, net::TcpListener, RuntimeHandle};
+
+#[spargio::main(backend = "io_uring", shards = 4)]
+async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
+    std::fs::create_dir_all("ingest-out")?;
+    let listener = TcpListener::bind(handle.clone(), "127.0.0.1:7001").await?;
+    let mut id = 0u64;
+
+    loop {
+	let (stream, _) = listener.accept_round_robin().await?;
+	let (h, s, path) = (handle.clone(), stream.clone(), format!("ingest-out/{id}.bin"));
+	id += 1;
+
+	stream.spawn_stealable_on_session(&handle, async move {
+	    let file = File::create(h, path).await.unwrap();
+	    let (n, buf) = s.recv_owned(vec![0; 64 * 1024]).await.unwrap();
+	    file.write_all_at(0, &buf[..n]).await.unwrap();
+	    file.fsync().await.unwrap();
+	}).expect("spawn");
+    }
+}
+```
+
+## Inspirations and Further Reading
+
+Using `msg_ring` for coordination is heavily inspired by [`ourio`](https://github.com/rockorager/ourio). We extend that idea to work-stealing.
+
+Wondering whether to build a work-stealing pool using `io_uring` at all was inspired by the following (excellent) blog posts:
+- https://emschwartz.me/async-rust-can-be-a-pleasure-to-work-with-without-send-sync-static/
+- https://without.boats/blog/thread-per-core/
+
 ## Benchmark Results
 
 ### Coordination-focused workloads (Tokio vs Spargio)
@@ -87,7 +129,7 @@ In pure sustained stream-throughput cases, thread-per-core runtimes such as Comp
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
 
-## Quick Start
+## Contributor Quick Start
 
 ```bash
 cargo test
@@ -161,14 +203,6 @@ A Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible, but bui
 - For per-stream hot I/O loops, pair round-robin stream setup with `stream.spawn_on_session(...)` to keep execution aligned with the stream session shard.
 - Use stealable task placement when post-I/O CPU work is dominant and can benefit from migration.
 - As a practical starting heuristic: if active stream count is at least `2x` shard count and streams are long-lived, prefer round-robin/distributed mode.
-
-## Inspirations and Further Reading
-
-Using `msg_ring` for coordination is heavily inspired by [`ourio`](https://github.com/rockorager/ourio). We extend that idea to work-stealing.
-
-Asking whether to build a work-stealing pool using `io_uring` at all was inspired by the following (excellent) blog posts:
-- https://emschwartz.me/async-rust-can-be-a-pleasure-to-work-with-without-send-sync-static/
-- https://without.boats/blog/thread-per-core/
 
 ## Engineering Method
 

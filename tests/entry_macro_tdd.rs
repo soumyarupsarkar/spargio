@@ -12,6 +12,11 @@ async fn macro_entry_single_shard() -> spargio::ShardId {
         .shard_id()
 }
 
+#[spargio::main(shards = 1, backend = "queue")]
+async fn macro_entry_receives_handle(handle: spargio::RuntimeHandle) -> usize {
+    handle.shard_count()
+}
+
 #[spargio::main(shards = 0)]
 async fn macro_entry_invalid_builder() {}
 
@@ -23,6 +28,11 @@ fn main_macro_executes_async_body() {
 #[test]
 fn main_macro_applies_builder_overrides() {
     assert_eq!(macro_entry_single_shard(), 0);
+}
+
+#[test]
+fn main_macro_can_inject_runtime_handle_argument() {
+    assert_eq!(macro_entry_receives_handle(), 1);
 }
 
 #[test]
