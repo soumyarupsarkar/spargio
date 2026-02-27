@@ -44,10 +44,90 @@ const IMBALANCED_TOTAL_FRAMES: usize =
     IMBALANCED_HEAVY_FRAMES + ((IMBALANCED_STREAMS - 1) * IMBALANCED_LIGHT_FRAMES);
 #[cfg(unix)]
 const IMBALANCED_BALANCED_FRAMES: usize = IMBALANCED_TOTAL_FRAMES / IMBALANCED_STREAMS;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_STEPS: usize = 64;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_HEAVY_FRAMES: usize = 32;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_LIGHT_FRAMES: usize = 2;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_FRAME_BYTES: usize = 4096;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_WINDOW: usize = 32;
+#[cfg(unix)]
+const HOTSPOT_ROTATION_TOTAL_FRAMES: usize = HOTSPOT_ROTATION_STEPS
+    * (HOTSPOT_ROTATION_HEAVY_FRAMES + ((IMBALANCED_STREAMS - 1) * HOTSPOT_ROTATION_LIGHT_FRAMES));
+#[cfg(unix)]
+const PIPELINE_STREAMS: usize = IMBALANCED_STREAMS;
+#[cfg(unix)]
+const PIPELINE_FRAMES_PER_STREAM: usize = 1024;
+#[cfg(unix)]
+const PIPELINE_FRAME_BYTES: usize = 4096;
+#[cfg(unix)]
+const PIPELINE_WINDOW: usize = 32;
+#[cfg(unix)]
+const PIPELINE_ROTATE_EVERY: usize = 64;
+#[cfg(unix)]
+const PIPELINE_HEAVY_CPU_ITERS: usize = 4000;
+#[cfg(unix)]
+const PIPELINE_LIGHT_CPU_ITERS: usize = 150;
+#[cfg(unix)]
+const PIPELINE_TOTAL_FRAMES: usize = PIPELINE_STREAMS * PIPELINE_FRAMES_PER_STREAM;
 
 #[cfg(unix)]
 fn imbalanced_frames_for_stream(idx: usize, heavy_frames: usize, light_frames: usize) -> usize {
     if idx == 0 { heavy_frames } else { light_frames }
+}
+
+#[cfg(unix)]
+fn hotspot_rotation_frames_for_step(
+    stream_idx: usize,
+    step_idx: usize,
+    stream_count: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+) -> usize {
+    let stream_count = stream_count.max(1);
+    let hotspot_stream = step_idx % stream_count;
+    if stream_idx == hotspot_stream {
+        heavy_frames
+    } else {
+        light_frames
+    }
+}
+
+#[cfg(unix)]
+fn hotspot_iters_for_frame(
+    stream_idx: usize,
+    frame_idx: usize,
+    stream_count: usize,
+    rotate_every: usize,
+    heavy_iters: usize,
+    light_iters: usize,
+) -> usize {
+    let stream_count = stream_count.max(1);
+    let rotate_every = rotate_every.max(1);
+    let hotspot_stream = (frame_idx / rotate_every) % stream_count;
+    if stream_idx == hotspot_stream {
+        heavy_iters
+    } else {
+        light_iters
+    }
+}
+
+#[cfg(unix)]
+fn pipeline_cpu_stage(seed: u8, stream_idx: usize, frame_idx: usize, iters: usize) -> u64 {
+    let mut x = ((seed as u64) << 40)
+        ^ ((stream_idx as u64) << 17)
+        ^ ((frame_idx as u64) << 3)
+        ^ 0x9E37_79B9_7F4A_7C15;
+    for i in 0..iters {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x = x.wrapping_add((i as u64).wrapping_mul(0x27D4_EB2D));
+    }
+    std::hint::black_box(x)
 }
 
 #[cfg(unix)]
@@ -123,6 +203,23 @@ enum TokioNetCmd {
         light_frames: usize,
         payload: usize,
         window: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    EchoHotspotRotation {
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    EchoPipelineHotspot {
+        frames_per_stream: usize,
+        payload: usize,
+        window: usize,
+        rotate_every: usize,
+        heavy_iters: usize,
+        light_iters: usize,
         reply: std_mpsc::Sender<u64>,
     },
     Shutdown {
@@ -202,6 +299,46 @@ impl TokioNetHarness {
                                 .await;
                                 let _ = reply.send(value);
                             }
+                            TokioNetCmd::EchoHotspotRotation {
+                                steps,
+                                heavy_frames,
+                                light_frames,
+                                payload,
+                                window,
+                                reply,
+                            } => {
+                                let value = tokio_echo_hotspot_rotation(
+                                    &mut streams,
+                                    steps,
+                                    heavy_frames,
+                                    light_frames,
+                                    payload,
+                                    window,
+                                )
+                                .await;
+                                let _ = reply.send(value);
+                            }
+                            TokioNetCmd::EchoPipelineHotspot {
+                                frames_per_stream,
+                                payload,
+                                window,
+                                rotate_every,
+                                heavy_iters,
+                                light_iters,
+                                reply,
+                            } => {
+                                let value = tokio_echo_pipeline_hotspot(
+                                    &mut streams,
+                                    frames_per_stream,
+                                    payload,
+                                    window,
+                                    rotate_every,
+                                    heavy_iters,
+                                    light_iters,
+                                )
+                                .await;
+                                let _ = reply.send(value);
+                            }
                             TokioNetCmd::Shutdown { reply } => {
                                 let _ = reply.send(());
                                 break;
@@ -262,6 +399,52 @@ impl TokioNetHarness {
             })
             .expect("send echo imbalanced cmd");
         rx.recv().expect("echo imbalanced reply")
+    }
+
+    fn echo_hotspot_rotation(
+        &mut self,
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(TokioNetCmd::EchoHotspotRotation {
+                steps,
+                heavy_frames,
+                light_frames,
+                payload,
+                window,
+                reply: tx,
+            })
+            .expect("send echo hotspot rotation cmd");
+        rx.recv().expect("echo hotspot rotation reply")
+    }
+
+    fn echo_pipeline_hotspot(
+        &mut self,
+        frames_per_stream: usize,
+        payload: usize,
+        window: usize,
+        rotate_every: usize,
+        heavy_iters: usize,
+        light_iters: usize,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(TokioNetCmd::EchoPipelineHotspot {
+                frames_per_stream,
+                payload,
+                window,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+                reply: tx,
+            })
+            .expect("send echo pipeline hotspot cmd");
+        rx.recv().expect("echo pipeline hotspot reply")
     }
 
     fn shutdown(&mut self) {
@@ -370,6 +553,165 @@ async fn tokio_echo_imbalanced(
     checksum
 }
 
+#[cfg(unix)]
+async fn tokio_echo_hotspot_rotation_stream(
+    stream: &mut tokio::net::TcpStream,
+    stream_idx: usize,
+    stream_count: usize,
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+) -> u64 {
+    let mut checksum = 0u64;
+    for step in 0..steps {
+        let frames = hotspot_rotation_frames_for_step(
+            stream_idx,
+            step,
+            stream_count,
+            heavy_frames,
+            light_frames,
+        );
+        if frames == 0 {
+            continue;
+        }
+        checksum =
+            checksum.wrapping_add(tokio_echo_windowed(stream, frames, payload_len, window).await);
+    }
+    checksum
+}
+
+#[cfg(unix)]
+async fn tokio_echo_hotspot_rotation(
+    streams: &mut Vec<tokio::net::TcpStream>,
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+) -> u64 {
+    let mut joins = tokio::task::JoinSet::new();
+    let moved = std::mem::take(streams);
+    let stream_count = moved.len();
+    for (idx, mut stream) in moved.into_iter().enumerate() {
+        joins.spawn(async move {
+            let value = tokio_echo_hotspot_rotation_stream(
+                &mut stream,
+                idx,
+                stream_count,
+                steps,
+                heavy_frames,
+                light_frames,
+                payload_len,
+                window,
+            )
+            .await;
+            (stream, value)
+        });
+    }
+
+    let mut checksum = 0u64;
+    let mut restored = Vec::with_capacity(stream_count);
+    while let Some(outcome) = joins.join_next().await {
+        let (stream, value) = outcome.expect("tokio hotspot rotation stream join");
+        restored.push(stream);
+        checksum = checksum.wrapping_add(value);
+    }
+    *streams = restored;
+    checksum
+}
+
+#[cfg(unix)]
+async fn tokio_echo_pipeline_stream(
+    stream: &mut tokio::net::TcpStream,
+    stream_idx: usize,
+    stream_count: usize,
+    frames: usize,
+    payload_len: usize,
+    window: usize,
+    rotate_every: usize,
+    heavy_iters: usize,
+    light_iters: usize,
+) -> u64 {
+    let mut payload = vec![0u8; payload_len.max(1)];
+    let mut recv = vec![0u8; payload_len.max(1)];
+    let mut checksum = 0u64;
+    let mut next = 0usize;
+    let window = window.max(1);
+
+    while next < frames {
+        let batch = (frames - next).min(window);
+        for idx in 0..batch {
+            payload[0] = (next + idx) as u8;
+            stream.write_all(&payload).await.expect("tokio write_all");
+        }
+        for idx in 0..batch {
+            stream
+                .read_exact(&mut recv)
+                .await
+                .expect("tokio read_exact");
+            let frame_idx = next + idx;
+            let cpu_iters = hotspot_iters_for_frame(
+                stream_idx,
+                frame_idx,
+                stream_count,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+            );
+            checksum = checksum.wrapping_add(pipeline_cpu_stage(
+                recv[0], stream_idx, frame_idx, cpu_iters,
+            ));
+        }
+        next += batch;
+    }
+
+    checksum
+}
+
+#[cfg(unix)]
+async fn tokio_echo_pipeline_hotspot(
+    streams: &mut Vec<tokio::net::TcpStream>,
+    frames_per_stream: usize,
+    payload_len: usize,
+    window: usize,
+    rotate_every: usize,
+    heavy_iters: usize,
+    light_iters: usize,
+) -> u64 {
+    let mut joins = tokio::task::JoinSet::new();
+    let moved = std::mem::take(streams);
+    let stream_count = moved.len();
+    for (idx, mut stream) in moved.into_iter().enumerate() {
+        joins.spawn(async move {
+            let value = tokio_echo_pipeline_stream(
+                &mut stream,
+                idx,
+                stream_count,
+                frames_per_stream,
+                payload_len,
+                window,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+            )
+            .await;
+            (stream, value)
+        });
+    }
+
+    let mut checksum = 0u64;
+    let mut restored = Vec::with_capacity(stream_count);
+    while let Some(outcome) = joins.join_next().await {
+        let (stream, value) = outcome.expect("tokio pipeline stream join");
+        restored.push(stream);
+        checksum = checksum.wrapping_add(value);
+    }
+    *streams = restored;
+    checksum
+}
+
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 #[derive(Clone, Copy)]
 enum SpargioStreamInitMode {
@@ -381,6 +723,7 @@ enum SpargioStreamInitMode {
 #[derive(Clone, Copy)]
 enum SpargioTaskPlacement {
     Stealable,
+    StealableSessionPreferred,
     PinnedSession,
 }
 
@@ -389,6 +732,13 @@ enum SpargioTaskPlacement {
 enum SpargioRecvMode {
     Multishot,
     ReadExact,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum SpargioPipelineIoMode {
+    Owned,
+    Borrowed,
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -417,6 +767,27 @@ enum SpargioNetCmd {
         window: usize,
         placement: SpargioTaskPlacement,
         recv_mode: SpargioRecvMode,
+        reply: std_mpsc::Sender<u64>,
+    },
+    EchoHotspotRotation {
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        placement: SpargioTaskPlacement,
+        recv_mode: SpargioRecvMode,
+        reply: std_mpsc::Sender<u64>,
+    },
+    EchoPipelineHotspot {
+        frames_per_stream: usize,
+        payload: usize,
+        window: usize,
+        rotate_every: usize,
+        heavy_iters: usize,
+        light_iters: usize,
+        placement: SpargioTaskPlacement,
+        io_mode: SpargioPipelineIoMode,
         reply: std_mpsc::Sender<u64>,
     },
     Shutdown {
@@ -543,6 +914,56 @@ impl SpargioNetHarness {
                             .await;
                             let _ = reply.send(value);
                         }
+                        SpargioNetCmd::EchoHotspotRotation {
+                            steps,
+                            heavy_frames,
+                            light_frames,
+                            payload,
+                            window,
+                            placement,
+                            recv_mode,
+                            reply,
+                        } => {
+                            let value = spargio_echo_hotspot_rotation(
+                                worker_handle.clone(),
+                                &streams,
+                                steps,
+                                heavy_frames,
+                                light_frames,
+                                payload,
+                                window,
+                                placement,
+                                recv_mode,
+                            )
+                            .await;
+                            let _ = reply.send(value);
+                        }
+                        SpargioNetCmd::EchoPipelineHotspot {
+                            frames_per_stream,
+                            payload,
+                            window,
+                            rotate_every,
+                            heavy_iters,
+                            light_iters,
+                            placement,
+                            io_mode,
+                            reply,
+                        } => {
+                            let value = spargio_echo_pipeline_hotspot(
+                                worker_handle.clone(),
+                                &streams,
+                                frames_per_stream,
+                                payload,
+                                window,
+                                rotate_every,
+                                heavy_iters,
+                                light_iters,
+                                placement,
+                                io_mode,
+                            )
+                            .await;
+                            let _ = reply.send(value);
+                        }
                         SpargioNetCmd::Shutdown { reply } => {
                             let _ = reply.send(());
                             break;
@@ -624,6 +1045,60 @@ impl SpargioNetHarness {
             })
             .expect("send spargio imbalanced cmd");
         rx.recv().expect("spargio imbalanced reply")
+    }
+
+    fn echo_hotspot_rotation_with(
+        &mut self,
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload_len: usize,
+        window: usize,
+        placement: SpargioTaskPlacement,
+        recv_mode: SpargioRecvMode,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioNetCmd::EchoHotspotRotation {
+                steps,
+                heavy_frames,
+                light_frames,
+                payload: payload_len,
+                window,
+                placement,
+                recv_mode,
+                reply: tx,
+            })
+            .expect("send spargio hotspot rotation cmd");
+        rx.recv().expect("spargio hotspot rotation reply")
+    }
+
+    fn echo_pipeline_hotspot_with(
+        &mut self,
+        frames_per_stream: usize,
+        payload_len: usize,
+        window: usize,
+        rotate_every: usize,
+        heavy_iters: usize,
+        light_iters: usize,
+        placement: SpargioTaskPlacement,
+        io_mode: SpargioPipelineIoMode,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioNetCmd::EchoPipelineHotspot {
+                frames_per_stream,
+                payload: payload_len,
+                window,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+                placement,
+                io_mode,
+                reply: tx,
+            })
+            .expect("send spargio pipeline hotspot cmd");
+        rx.recv().expect("spargio pipeline hotspot reply")
     }
 
     fn shutdown(&mut self) {
@@ -776,6 +1251,9 @@ async fn spargio_echo_imbalanced(
             SpargioTaskPlacement::Stealable => handle
                 .spawn_stealable(fut)
                 .expect("spawn spargio imbalanced stream (stealable)"),
+            SpargioTaskPlacement::StealableSessionPreferred => stream_for_spawn
+                .spawn_stealable_on_session(&handle, fut)
+                .expect("spawn spargio imbalanced stream (stealable preferred)"),
             SpargioTaskPlacement::PinnedSession => stream_for_spawn
                 .spawn_on_session(&handle, fut)
                 .expect("spawn spargio imbalanced stream (pinned)"),
@@ -786,6 +1264,214 @@ async fn spargio_echo_imbalanced(
     let mut checksum = 0u64;
     for join in joins {
         let value = join.await.expect("spargio imbalanced stream join");
+        checksum = checksum.wrapping_add(value);
+    }
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_hotspot_rotation_stream(
+    stream: &spargio::net::TcpStream,
+    stream_idx: usize,
+    stream_count: usize,
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+    recv_mode: SpargioRecvMode,
+) -> u64 {
+    let mut checksum = 0u64;
+    for step in 0..steps {
+        let frames = hotspot_rotation_frames_for_step(
+            stream_idx,
+            step,
+            stream_count,
+            heavy_frames,
+            light_frames,
+        );
+        if frames == 0 {
+            continue;
+        }
+        checksum = checksum.wrapping_add(
+            spargio_echo_windowed(stream, frames, payload_len, window, recv_mode).await,
+        );
+    }
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_hotspot_rotation(
+    handle: RuntimeHandle,
+    streams: &[SpargioBenchStream],
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+    placement: SpargioTaskPlacement,
+    recv_mode: SpargioRecvMode,
+) -> u64 {
+    let stream_count = streams.len();
+    let mut joins = Vec::with_capacity(stream_count);
+    for (idx, bench_stream) in streams.iter().cloned().enumerate() {
+        let stream = bench_stream.stream;
+        let stream_for_spawn = stream.clone();
+        let fut = async move {
+            spargio_echo_hotspot_rotation_stream(
+                &stream,
+                idx,
+                stream_count,
+                steps,
+                heavy_frames,
+                light_frames,
+                payload_len,
+                window,
+                recv_mode,
+            )
+            .await
+        };
+        let join = match placement {
+            SpargioTaskPlacement::Stealable => handle
+                .spawn_stealable(fut)
+                .expect("spawn spargio hotspot stream (stealable)"),
+            SpargioTaskPlacement::StealableSessionPreferred => stream_for_spawn
+                .spawn_stealable_on_session(&handle, fut)
+                .expect("spawn spargio hotspot stream (stealable preferred)"),
+            SpargioTaskPlacement::PinnedSession => stream_for_spawn
+                .spawn_on_session(&handle, fut)
+                .expect("spawn spargio hotspot stream (pinned)"),
+        };
+        joins.push(join);
+    }
+
+    let mut checksum = 0u64;
+    for join in joins {
+        let value = join.await.expect("spargio hotspot stream join");
+        checksum = checksum.wrapping_add(value);
+    }
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_pipeline_stream(
+    stream: &spargio::net::TcpStream,
+    stream_idx: usize,
+    stream_count: usize,
+    frames: usize,
+    payload_len: usize,
+    window: usize,
+    rotate_every: usize,
+    heavy_iters: usize,
+    light_iters: usize,
+    io_mode: SpargioPipelineIoMode,
+) -> u64 {
+    let mut payload = vec![0u8; payload_len.max(1)];
+    let mut recv = vec![0u8; payload_len.max(1)];
+    let mut checksum = 0u64;
+    let mut next = 0usize;
+    let window = window.max(1);
+
+    while next < frames {
+        let batch = (frames - next).min(window);
+        for idx in 0..batch {
+            payload[0] = (next + idx) as u8;
+            match io_mode {
+                SpargioPipelineIoMode::Owned => {
+                    payload = stream
+                        .write_all_owned(payload)
+                        .await
+                        .expect("write_all_owned");
+                }
+                SpargioPipelineIoMode::Borrowed => {
+                    stream.write_all(&payload).await.expect("write_all");
+                }
+            }
+        }
+        for idx in 0..batch {
+            match io_mode {
+                SpargioPipelineIoMode::Owned => {
+                    recv = stream
+                        .read_exact_owned(recv)
+                        .await
+                        .expect("read_exact_owned");
+                }
+                SpargioPipelineIoMode::Borrowed => {
+                    stream
+                        .read_exact(recv.as_mut_slice())
+                        .await
+                        .expect("read_exact");
+                }
+            }
+            let frame_idx = next + idx;
+            let cpu_iters = hotspot_iters_for_frame(
+                stream_idx,
+                frame_idx,
+                stream_count,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+            );
+            checksum = checksum.wrapping_add(pipeline_cpu_stage(
+                recv[0], stream_idx, frame_idx, cpu_iters,
+            ));
+        }
+        next += batch;
+    }
+
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_pipeline_hotspot(
+    handle: RuntimeHandle,
+    streams: &[SpargioBenchStream],
+    frames_per_stream: usize,
+    payload_len: usize,
+    window: usize,
+    rotate_every: usize,
+    heavy_iters: usize,
+    light_iters: usize,
+    placement: SpargioTaskPlacement,
+    io_mode: SpargioPipelineIoMode,
+) -> u64 {
+    let stream_count = streams.len();
+    let mut joins = Vec::with_capacity(stream_count);
+    for (idx, bench_stream) in streams.iter().cloned().enumerate() {
+        let stream = bench_stream.stream;
+        let stream_for_spawn = stream.clone();
+        let fut = async move {
+            spargio_echo_pipeline_stream(
+                &stream,
+                idx,
+                stream_count,
+                frames_per_stream,
+                payload_len,
+                window,
+                rotate_every,
+                heavy_iters,
+                light_iters,
+                io_mode,
+            )
+            .await
+        };
+        let join = match placement {
+            SpargioTaskPlacement::Stealable => handle
+                .spawn_stealable(fut)
+                .expect("spawn spargio pipeline stream (stealable)"),
+            SpargioTaskPlacement::StealableSessionPreferred => stream_for_spawn
+                .spawn_stealable_on_session(&handle, fut)
+                .expect("spawn spargio pipeline stream (stealable preferred)"),
+            SpargioTaskPlacement::PinnedSession => stream_for_spawn
+                .spawn_on_session(&handle, fut)
+                .expect("spawn spargio pipeline stream (pinned)"),
+        };
+        joins.push(join);
+    }
+
+    let mut checksum = 0u64;
+    for join in joins {
+        let value = join.await.expect("spargio pipeline stream join");
         checksum = checksum.wrapping_add(value);
     }
     checksum
@@ -1454,7 +2140,280 @@ fn bench_net_stream_imbalanced_ab(c: &mut Criterion) {
 }
 
 #[cfg(unix)]
-criterion_group!(benches, bench_net_stream_imbalanced_ab);
+fn bench_net_stream_hotspot_rotation_ab(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exp_net_stream_hotspot_rotation_ab_4k");
+    group.throughput(Throughput::Bytes(
+        (HOTSPOT_ROTATION_TOTAL_FRAMES * HOTSPOT_ROTATION_FRAME_BYTES) as u64,
+    ));
+
+    let warmup_steps = (HOTSPOT_ROTATION_STEPS / 8).max(1);
+    let warmup_heavy = (HOTSPOT_ROTATION_HEAVY_FRAMES / 4).max(1);
+    let warmup_light = HOTSPOT_ROTATION_LIGHT_FRAMES.max(1);
+
+    let mut tokio = TokioNetHarness::new();
+    black_box(tokio.echo_hotspot_rotation(
+        warmup_steps,
+        warmup_heavy,
+        warmup_light,
+        HOTSPOT_ROTATION_FRAME_BYTES,
+        HOTSPOT_ROTATION_WINDOW,
+    ));
+    group.bench_function("tokio_hotspot_rotation", |b| {
+        b.iter(|| {
+            black_box(tokio.echo_hotspot_rotation(
+                HOTSPOT_ROTATION_STEPS,
+                HOTSPOT_ROTATION_HEAVY_FRAMES,
+                HOTSPOT_ROTATION_LIGHT_FRAMES,
+                HOTSPOT_ROTATION_FRAME_BYTES,
+                HOTSPOT_ROTATION_WINDOW,
+            ))
+        })
+    });
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioNetHarness::new_distributed() {
+        black_box(spargio.echo_hotspot_rotation_with(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            HOTSPOT_ROTATION_FRAME_BYTES,
+            HOTSPOT_ROTATION_WINDOW,
+            SpargioTaskPlacement::Stealable,
+            SpargioRecvMode::Multishot,
+        ));
+        group.bench_function("spargio_hotspot_stealable_multishot", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_hotspot_rotation_with(
+                    HOTSPOT_ROTATION_STEPS,
+                    HOTSPOT_ROTATION_HEAVY_FRAMES,
+                    HOTSPOT_ROTATION_LIGHT_FRAMES,
+                    HOTSPOT_ROTATION_FRAME_BYTES,
+                    HOTSPOT_ROTATION_WINDOW,
+                    SpargioTaskPlacement::Stealable,
+                    SpargioRecvMode::Multishot,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_hotspot_rotation_with(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            HOTSPOT_ROTATION_FRAME_BYTES,
+            HOTSPOT_ROTATION_WINDOW,
+            SpargioTaskPlacement::StealableSessionPreferred,
+            SpargioRecvMode::Multishot,
+        ));
+        group.bench_function("spargio_hotspot_stealable_session_multishot", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_hotspot_rotation_with(
+                    HOTSPOT_ROTATION_STEPS,
+                    HOTSPOT_ROTATION_HEAVY_FRAMES,
+                    HOTSPOT_ROTATION_LIGHT_FRAMES,
+                    HOTSPOT_ROTATION_FRAME_BYTES,
+                    HOTSPOT_ROTATION_WINDOW,
+                    SpargioTaskPlacement::StealableSessionPreferred,
+                    SpargioRecvMode::Multishot,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_hotspot_rotation_with(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            HOTSPOT_ROTATION_FRAME_BYTES,
+            HOTSPOT_ROTATION_WINDOW,
+            SpargioTaskPlacement::PinnedSession,
+            SpargioRecvMode::Multishot,
+        ));
+        group.bench_function("spargio_hotspot_pinned_multishot", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_hotspot_rotation_with(
+                    HOTSPOT_ROTATION_STEPS,
+                    HOTSPOT_ROTATION_HEAVY_FRAMES,
+                    HOTSPOT_ROTATION_LIGHT_FRAMES,
+                    HOTSPOT_ROTATION_FRAME_BYTES,
+                    HOTSPOT_ROTATION_WINDOW,
+                    SpargioTaskPlacement::PinnedSession,
+                    SpargioRecvMode::Multishot,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_hotspot_rotation_with(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            HOTSPOT_ROTATION_FRAME_BYTES,
+            HOTSPOT_ROTATION_WINDOW,
+            SpargioTaskPlacement::PinnedSession,
+            SpargioRecvMode::ReadExact,
+        ));
+        group.bench_function("spargio_hotspot_pinned_readexact", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_hotspot_rotation_with(
+                    HOTSPOT_ROTATION_STEPS,
+                    HOTSPOT_ROTATION_HEAVY_FRAMES,
+                    HOTSPOT_ROTATION_LIGHT_FRAMES,
+                    HOTSPOT_ROTATION_FRAME_BYTES,
+                    HOTSPOT_ROTATION_WINDOW,
+                    SpargioTaskPlacement::PinnedSession,
+                    SpargioRecvMode::ReadExact,
+                ))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(unix)]
+fn bench_net_pipeline_hotspot_rotation_ab(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exp_net_pipeline_hotspot_rotation_ab_4k_window32");
+    group.throughput(Throughput::Bytes(
+        (PIPELINE_TOTAL_FRAMES * PIPELINE_FRAME_BYTES) as u64,
+    ));
+
+    let warmup_frames = (PIPELINE_FRAMES_PER_STREAM / 8).max(1);
+    let warmup_heavy = (PIPELINE_HEAVY_CPU_ITERS / 4).max(1);
+    let warmup_light = (PIPELINE_LIGHT_CPU_ITERS / 2).max(1);
+
+    let mut tokio = TokioNetHarness::new();
+    black_box(tokio.echo_pipeline_hotspot(
+        warmup_frames,
+        PIPELINE_FRAME_BYTES,
+        PIPELINE_WINDOW,
+        PIPELINE_ROTATE_EVERY,
+        warmup_heavy,
+        warmup_light,
+    ));
+    group.bench_function("tokio_pipeline_hotspot", |b| {
+        b.iter(|| {
+            black_box(tokio.echo_pipeline_hotspot(
+                PIPELINE_FRAMES_PER_STREAM,
+                PIPELINE_FRAME_BYTES,
+                PIPELINE_WINDOW,
+                PIPELINE_ROTATE_EVERY,
+                PIPELINE_HEAVY_CPU_ITERS,
+                PIPELINE_LIGHT_CPU_ITERS,
+            ))
+        })
+    });
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioNetHarness::new_distributed() {
+        black_box(spargio.echo_pipeline_hotspot_with(
+            warmup_frames,
+            PIPELINE_FRAME_BYTES,
+            PIPELINE_WINDOW,
+            PIPELINE_ROTATE_EVERY,
+            warmup_heavy,
+            warmup_light,
+            SpargioTaskPlacement::Stealable,
+            SpargioPipelineIoMode::Owned,
+        ));
+        group.bench_function("spargio_pipeline_stealable_owned", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_pipeline_hotspot_with(
+                    PIPELINE_FRAMES_PER_STREAM,
+                    PIPELINE_FRAME_BYTES,
+                    PIPELINE_WINDOW,
+                    PIPELINE_ROTATE_EVERY,
+                    PIPELINE_HEAVY_CPU_ITERS,
+                    PIPELINE_LIGHT_CPU_ITERS,
+                    SpargioTaskPlacement::Stealable,
+                    SpargioPipelineIoMode::Owned,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_pipeline_hotspot_with(
+            warmup_frames,
+            PIPELINE_FRAME_BYTES,
+            PIPELINE_WINDOW,
+            PIPELINE_ROTATE_EVERY,
+            warmup_heavy,
+            warmup_light,
+            SpargioTaskPlacement::StealableSessionPreferred,
+            SpargioPipelineIoMode::Owned,
+        ));
+        group.bench_function("spargio_pipeline_stealable_session_owned", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_pipeline_hotspot_with(
+                    PIPELINE_FRAMES_PER_STREAM,
+                    PIPELINE_FRAME_BYTES,
+                    PIPELINE_WINDOW,
+                    PIPELINE_ROTATE_EVERY,
+                    PIPELINE_HEAVY_CPU_ITERS,
+                    PIPELINE_LIGHT_CPU_ITERS,
+                    SpargioTaskPlacement::StealableSessionPreferred,
+                    SpargioPipelineIoMode::Owned,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_pipeline_hotspot_with(
+            warmup_frames,
+            PIPELINE_FRAME_BYTES,
+            PIPELINE_WINDOW,
+            PIPELINE_ROTATE_EVERY,
+            warmup_heavy,
+            warmup_light,
+            SpargioTaskPlacement::PinnedSession,
+            SpargioPipelineIoMode::Owned,
+        ));
+        group.bench_function("spargio_pipeline_pinned_owned", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_pipeline_hotspot_with(
+                    PIPELINE_FRAMES_PER_STREAM,
+                    PIPELINE_FRAME_BYTES,
+                    PIPELINE_WINDOW,
+                    PIPELINE_ROTATE_EVERY,
+                    PIPELINE_HEAVY_CPU_ITERS,
+                    PIPELINE_LIGHT_CPU_ITERS,
+                    SpargioTaskPlacement::PinnedSession,
+                    SpargioPipelineIoMode::Owned,
+                ))
+            })
+        });
+
+        black_box(spargio.echo_pipeline_hotspot_with(
+            warmup_frames,
+            PIPELINE_FRAME_BYTES,
+            PIPELINE_WINDOW,
+            PIPELINE_ROTATE_EVERY,
+            warmup_heavy,
+            warmup_light,
+            SpargioTaskPlacement::PinnedSession,
+            SpargioPipelineIoMode::Borrowed,
+        ));
+        group.bench_function("spargio_pipeline_pinned_borrowed", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_pipeline_hotspot_with(
+                    PIPELINE_FRAMES_PER_STREAM,
+                    PIPELINE_FRAME_BYTES,
+                    PIPELINE_WINDOW,
+                    PIPELINE_ROTATE_EVERY,
+                    PIPELINE_HEAVY_CPU_ITERS,
+                    PIPELINE_LIGHT_CPU_ITERS,
+                    SpargioTaskPlacement::PinnedSession,
+                    SpargioPipelineIoMode::Borrowed,
+                ))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(unix)]
+criterion_group!(
+    benches,
+    bench_net_stream_imbalanced_ab,
+    bench_net_stream_hotspot_rotation_ab,
+    bench_net_pipeline_hotspot_rotation_ab
+);
 #[cfg(unix)]
 criterion_main!(benches);
 

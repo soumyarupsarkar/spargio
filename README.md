@@ -92,8 +92,8 @@ Compio is not listed in this coordination-only table because it is share-nothing
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
 | `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `13.426-14.098 ms` | `13.510-13.911 ms` | `12.221-12.479 ms` | `1.0x` | `0.9x` |
-| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.6480-8.7488 ms` | `11.285-11.811 ms` | `16.346-16.702 ms` | `0.8x` | `1.4x` |
-| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.383-26.937 ms` | `34.962-35.935 ms` | `50.764-51.179 ms` | `0.8x` | `1.4x` |
+| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.6989-8.7937 ms` | `9.5875-9.8201 ms` | `16.782-17.053 ms` | `0.9x` | `1.7x` |
+| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.328-26.504 ms` | `29.411-29.919 ms` | `50.787-51.425 ms` | `0.9x` | `1.7x` |
 
 ## Benchmark Interpretation
 

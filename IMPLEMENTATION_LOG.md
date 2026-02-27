@@ -3207,3 +3207,132 @@ Validation:
 Result:
 
 - Full test suite and benchmark target compilation pass after the async-first API break.
+
+## Update: rotating-hotspot slowdown investigation plan (Tokio vs Spargio)
+
+Question captured:
+
+- Why are `net_stream_hotspot_rotation_4k` and `net_pipeline_hotspot_rotation_4k_window32` still faster on Tokio?
+
+Current code-path findings:
+
+- Both hotspot groups already use distributed stream setup in Spargio (`SpargioNetHarness::new_distributed()`), so this is not the earlier single-context concentration issue.
+- Spargio hotspot stream path uses `send_all_batch + recv_multishot_segments (+ fallback read_exact_owned)`; Tokio uses simpler `write_all + read_exact` loops.
+- Spargio pipeline hotspot path currently uses `write_all_owned/read_exact_owned` per frame and spawns per-stream jobs with generic `spawn_stealable`, not session-aligned placement.
+- Native op submission still pays envelope/oneshot/tracking overhead per op when execution is off the stream session shard.
+
+Working hypotheses for the current gap:
+
+1. Placement mismatch in rotating-hotspot loops:
+- per-stream tasks can execute off-session-shard (`spawn_stealable`), adding submit/reply overhead without enough skew persistence to amortize stealing wins.
+
+2. Pipeline I/O method overhead:
+- `write_all_owned/read_exact_owned` path has extra owned-buffer/method overhead in tight per-frame loops.
+
+3. Multishot path may be suboptimal for this specific rotating shape:
+- for short rotating bursts, multishot setup/segment handling may underperform simple exact-read loops.
+
+4. Benchmark harness overhead differences:
+- Tokio path uses a very lean inner loop and may currently benefit from less per-op user-space bookkeeping in this shape.
+
+### Planned A/B matrix
+
+A/B-1: task placement (both hotspot benchmarks)
+- A: current `spawn_stealable`.
+- B: `stream.spawn_stealable_on_session(...)`.
+- C: `stream.spawn_on_session(...)`.
+
+A/B-2: pipeline I/O method
+- A: current `write_all_owned/read_exact_owned`.
+- B: borrowed `write_all/read_exact` with reusable buffers.
+
+A/B-3: stream-hotspot receive mode
+- A: current multishot-first path.
+- B: force read-exact path.
+
+Execution plan:
+
+1. Add experimental A/B benchmark lanes (net experiments target), no product-table changes yet.
+2. Run targeted A/B for both hotspot benchmarks.
+3. Implement only the winning changes into the main benchmark/runtime paths.
+4. Keep TDD discipline: add failing tests for any API/runtime behavior changes, then implement to green.
+
+## Update: rotating-hotspot A/B results + adopted optimizations
+
+Executed the planned A/B matrix in `benches/net_experiments.rs`:
+
+- `exp_net_stream_hotspot_rotation_ab_4k`
+- `exp_net_pipeline_hotspot_rotation_ab_4k_window32`
+
+Command set:
+
+- `cargo bench --features uring-native --bench net_experiments -- exp_net_stream_hotspot_rotation_ab_4k --sample-size 12`
+- `cargo bench --features uring-native --bench net_experiments -- exp_net_pipeline_hotspot_rotation_ab_4k_window32 --sample-size 12`
+
+### A/B findings
+
+`exp_net_stream_hotspot_rotation_ab_4k`:
+
+- `tokio_hotspot_rotation`: `8.7424-8.8669 ms`
+- `spargio_hotspot_stealable_multishot`: `11.667-11.801 ms`
+- `spargio_hotspot_stealable_session_multishot`: `11.705-11.967 ms`
+- `spargio_hotspot_pinned_multishot`: `9.8044-9.9619 ms`
+- `spargio_hotspot_pinned_readexact`: `9.5227-9.5928 ms`
+
+Interpretation:
+
+- Session-pinned placement is the main gain for this shape.
+- For rotating hotspot stream-only traffic, read-exact outperforms multishot.
+- Stealable-session-preferred did not beat pinned here.
+
+`exp_net_pipeline_hotspot_rotation_ab_4k_window32`:
+
+- `tokio_pipeline_hotspot`: `26.473-26.678 ms`
+- `spargio_pipeline_stealable_owned`: `32.167-32.563 ms`
+- `spargio_pipeline_stealable_session_owned`: `32.356-32.844 ms`
+- `spargio_pipeline_pinned_owned`: `29.618-30.016 ms`
+- `spargio_pipeline_pinned_borrowed`: `30.080-30.247 ms`
+
+Interpretation:
+
+- Session-pinned placement is again the primary improvement.
+- Owned I/O loop stays slightly better than borrowed mode in this pipeline shape.
+
+### Optimizations implemented from A/B
+
+Applied to product benchmark path (`benches/net_api.rs`):
+
+1. `net_stream_hotspot_rotation_4k`:
+- per-stream work now runs with `stream.spawn_on_session(...)` (session-pinned placement).
+- receive mode switched to read-exact for this rotating stream-hotspot workload.
+
+2. `net_pipeline_hotspot_rotation_4k_window32`:
+- per-stream work now runs with `stream.spawn_on_session(...)` (session-pinned placement).
+- kept owned I/O loop (`write_all_owned/read_exact_owned`) as the better A/B mode.
+
+3. Kept existing defaults unchanged where A/B did not indicate improvement:
+- throughput/imbalanced hot path remains multishot-first.
+- generic stealable placement remains for non-hotspot benchmark paths.
+
+### Post-optimization benchmark snapshots (`net_api`)
+
+Commands:
+
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 12`
+
+Results:
+
+- `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.6989-8.7937 ms`
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `9.5875-9.8201 ms`
+- `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.782-17.053 ms`
+
+- `net_pipeline_hotspot_rotation_4k_window32/tokio_tcp_pipeline_hotspot`: `26.328-26.504 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`: `29.411-29.919 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/compio_tcp_pipeline_hotspot`: `50.787-51.425 ms`
+
+Net effect vs prior `net_api` snapshots:
+
+- Stream rotating-hotspot: Spargio improved materially (about 14-16% faster) and moved closer to Tokio.
+- Pipeline rotating-hotspot: Spargio improved materially (about 8-11% faster) and moved closer to Tokio.
+- Both workloads still trail Tokio, but the remaining gap is substantially smaller than before.

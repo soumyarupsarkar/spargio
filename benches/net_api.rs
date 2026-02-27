@@ -722,6 +722,13 @@ struct SpargioBenchStream {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum SpargioRecvMode {
+    Multishot,
+    ReadExact,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 enum SpargioNetCmd {
     EchoRtt {
         rounds: usize,
@@ -850,8 +857,14 @@ impl SpargioNetHarness {
                             reply,
                         } => {
                             let stream = &streams.first().expect("spargio primary stream").stream;
-                            let value =
-                                spargio_echo_windowed(stream, frames, payload, window).await;
+                            let value = spargio_echo_windowed(
+                                stream,
+                                frames,
+                                payload,
+                                window,
+                                SpargioRecvMode::Multishot,
+                            )
+                            .await;
                             let _ = reply.send(value);
                         }
                         SpargioNetCmd::EchoImbalanced {
@@ -1077,11 +1090,12 @@ async fn spargio_echo_windowed(
     frames: usize,
     payload_len: usize,
     window: usize,
+    recv_mode: SpargioRecvMode,
 ) -> u64 {
     let payload_len = payload_len.max(1);
     let mut recv = vec![0u8; payload_len];
     let mut tx_pool: Vec<Vec<u8>> = (0..window.max(1)).map(|_| vec![0u8; payload_len]).collect();
-    let mut multishot_supported = true;
+    let mut multishot_supported = matches!(recv_mode, SpargioRecvMode::Multishot);
     let mut checksum = 0u64;
     let mut next = 0usize;
     let window = window.max(1);
@@ -1161,7 +1175,16 @@ async fn spargio_echo_imbalanced(
     for (idx, bench_stream) in streams.iter().cloned().enumerate() {
         let stream = bench_stream.stream;
         let frames = imbalanced_frames_for_stream(idx, heavy_frames, light_frames);
-        let fut = async move { spargio_echo_windowed(&stream, frames, payload_len, window).await };
+        let fut = async move {
+            spargio_echo_windowed(
+                &stream,
+                frames,
+                payload_len,
+                window,
+                SpargioRecvMode::Multishot,
+            )
+            .await
+        };
         let join = handle
             .spawn_stealable(fut)
             .expect("spawn spargio imbalanced stream (stealable)");
@@ -1186,6 +1209,7 @@ async fn spargio_echo_hotspot_rotation_stream(
     light_frames: usize,
     payload_len: usize,
     window: usize,
+    recv_mode: SpargioRecvMode,
 ) -> u64 {
     let mut checksum = 0u64;
     for step in 0..steps {
@@ -1199,8 +1223,9 @@ async fn spargio_echo_hotspot_rotation_stream(
         if frames == 0 {
             continue;
         }
-        checksum =
-            checksum.wrapping_add(spargio_echo_windowed(stream, frames, payload_len, window).await);
+        checksum = checksum.wrapping_add(
+            spargio_echo_windowed(stream, frames, payload_len, window, recv_mode).await,
+        );
     }
     checksum
 }
@@ -1219,6 +1244,7 @@ async fn spargio_echo_hotspot_rotation(
     let mut joins = Vec::with_capacity(stream_count);
     for (idx, bench_stream) in streams.iter().cloned().enumerate() {
         let stream = bench_stream.stream;
+        let stream_for_spawn = stream.clone();
         let fut = async move {
             spargio_echo_hotspot_rotation_stream(
                 &stream,
@@ -1229,11 +1255,12 @@ async fn spargio_echo_hotspot_rotation(
                 light_frames,
                 payload_len,
                 window,
+                SpargioRecvMode::ReadExact,
             )
             .await
         };
-        let join = handle
-            .spawn_stealable(fut)
+        let join = stream_for_spawn
+            .spawn_on_session(&handle, fut)
             .expect("spawn spargio hotspot rotation stream");
         joins.push(join);
     }
@@ -1312,6 +1339,7 @@ async fn spargio_echo_pipeline_hotspot(
     let mut joins = Vec::with_capacity(stream_count);
     for (idx, bench_stream) in streams.iter().cloned().enumerate() {
         let stream = bench_stream.stream;
+        let stream_for_spawn = stream.clone();
         let fut = async move {
             spargio_echo_pipeline_stream(
                 &stream,
@@ -1326,8 +1354,8 @@ async fn spargio_echo_pipeline_hotspot(
             )
             .await
         };
-        let join = handle
-            .spawn_stealable(fut)
+        let join = stream_for_spawn
+            .spawn_on_session(&handle, fut)
             .expect("spawn spargio pipeline hotspot stream");
         joins.push(join);
     }
