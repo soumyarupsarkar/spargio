@@ -2190,3 +2190,43 @@ Interpretation:
 
 - unbound `net_echo_rtt_256b` improved materially after removing per-op spawn overhead.
 - unbound fs remains competitive and generally close to bound.
+
+## Roadmap Revision: ergonomics-first sequence (requested)
+
+No implementation in this update; this section revises priority order only.
+
+### New priority order
+
+1. Scope simplification first: remove bound APIs to keep the codebase manageable.
+   - deprecate/remove `UringNativeLane`/`UringBoundFd`-centric public paths in favor of unbound-first APIs.
+   - remove bound-only benchmark variants and docs references once replacement coverage exists.
+2. Ergonomics project (highest priority after simplification):
+   - deliver a high-level API layer targeting parity with Compio-style filesystem and network ergonomics.
+   - target outcome: common file/network flows can be written without manual lane/FD plumbing boilerplate.
+3. After ergonomics parity milestone is complete:
+   - add benchmark suites against Compio for filesystem and network APIs, with matched workload shapes.
+   - prioritize broader native I/O surface expansion.
+4. Then continue with remaining milestones:
+   - production-grade work-stealing policy (fairness/starvation/adaptive heuristics),
+   - tail-latency perf program (longer windows + p95/p99 gates),
+   - production hardening (stress/soak/failure injection/observability),
+   - optional Tokio-compat readiness shim as a separate large-investment track.
+
+### Ergonomics parity target (Compio-like)
+
+At completion of the ergonomics project, Spargio should provide equivalent day-to-day usability for core filesystem/network tasks:
+
+- filesystem:
+  - high-level async file open/create/read/write helpers,
+  - convenience methods equivalent to common `read_to_end_at`/buffer-reuse workflows.
+- network:
+  - high-level async TCP/UDP connect/accept/send/recv helpers,
+  - convenience traits/wrappers for common read/write loops and batching patterns.
+- runtime entry ergonomics:
+  - straightforward app entry patterns (macro or helper-based) with minimal setup boilerplate.
+
+### Notes
+
+- This roadmap change intentionally favors API usability and adoption surface before deeper policy/perf-hardening tracks.
+- Bound APIs are treated as temporary complexity and are planned for removal ahead of the ergonomics phase.
+- Post-ergonomics benchmarking will include explicit Spargio-vs-Compio fs/net comparisons.
