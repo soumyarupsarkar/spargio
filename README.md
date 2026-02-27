@@ -1,111 +1,98 @@
 # spargio
 
-`spargio` is a work-stealing async runtime for Rust built around `io_uring`.
+`spargio` is a work-stealing async runtime for Rust built around `io_uring` and `msg_ring`.
 
-Traditionally, runtimes using `io_uring` (glommio/monoio/compio) have a thread-per-core model. `spargio` doesn't. We use `msg_ring` for cross-shard coordination and submission-time task placement. Interestingly this gives us more "work stealing" opportunities than tokio's epoll-based model.
-
-Unlike Tokio’s default runtime model, Spargio can steer native disk and network I/O operations to another shard before submission, placing SQEs on a chosen `io_uring` queue. This adds a pre-submission dispatch lever (in addition to task stealing), which can reduce queue imbalance and tail latency in coordination-heavy or bursty workloads.
-
-The benchmark results below show where this helps in practice.
+Instead of a strict thread-per-core execution model, Spargio uses submission-time steering plus stealable tasks across shards. For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
 
 ## Disclaimer
 
-This is a proof of concept built with Codex to see if the idea is worth pursuing; I have not reviewed all the code yet. Do not use in production.
+This is a proof-of-concept project built with Codex. Do not use in production.
 
 ## Benchmark Results
 
-| Benchmark | Description | Tokio | spargio | Speedup |
+### Coordination-focused workloads (Tokio vs Spargio)
+
+| Benchmark | Description | Tokio | Spargio | Speedup |
 | --- | --- | --- | --- | --- |
 | `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.434-1.553 ms` | `366-381 us` | `4.0x` |
 | `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `68.8-76.2 us` | `70.5-71.7 us` | `1.0x` |
 | `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `561-610 us` | `249-267 us` | `2.3x` |
 | `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.473-1.621 ms` | `1.387-1.404 ms` | `1.1x` |
 | `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.366-2.437 ms` | `1.993-2.003 ms` | `1.2x` |
-| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.754-1.867 ms` | `1.003-1.028 ms` | `1.8x` |
-| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `8.732-9.015 ms` | `6.085-6.866 ms` | `1.4x` |
-| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.918-8.187 ms` | `5.539-5.812 ms` | `1.4x` |
-| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `10.544-10.656 ms` | `10.996-11.408 ms` | `0.9x` |
 
-Spargio leads most clearly in coordination-heavy and latency-sensitive paths, while some pure throughput cases (for example `steady_one_way_send_drain` and `net_stream_throughput_4k_window32`) are currently near parity.
+Compio is not listed in this coordination-only table because it is share-nothing (thread-per-core), while these cases are focused on cross-shard coordination behavior.
 
-For CPU/coordination-heavy suites, this `spargio` value is the same runtime message path regardless of bound/unbound native-I/O mode. For native-I/O suites, this column reflects the unbound `UringNativeAny` path.
+### Native API workloads (Tokio vs Spargio vs Compio)
 
-Bench suites in this repo:
+| Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
+| --- | --- | --- | --- | --- | --- | --- |
+| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.601-1.641 ms` | `1.012-1.026 ms` | `1.388-1.421 ms` | `1.6x` | `1.4x` |
+| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `7.680-7.767 ms` | `5.971-6.054 ms` | `5.983-6.119 ms` | `1.3x` | `1.0x` |
+| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.923-8.118 ms` | `5.410-5.516 ms` | `6.447-6.530 ms` | `1.5x` | `1.2x` |
+| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `10.902-11.155 ms` | `11.225-11.441 ms` | `7.007-7.118 ms` | `1.0x` | `0.6x` |
 
-- `benches/ping_pong.rs`
-- `benches/fanout_fanin.rs`
-- `benches/fs_api.rs`
-- `benches/net_api.rs`
+### Imbalanced Native API workloads (Tokio vs Spargio vs Compio)
 
-## Why Spargio is faster
+| Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
+| --- | --- | --- | --- | --- | --- | --- |
+| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `14.058-14.331 ms` | `13.300-13.734 ms` | `12.174-12.499 ms` | `1.1x` | `0.9x` |
+| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.7249-8.7700 ms` | `11.499-11.600 ms` | `16.637-16.766 ms` | `0.8x` | `1.4x` |
+| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.075-26.308 ms` | `32.686-33.156 ms` | `50.496-51.812 ms` | `0.8x` | `1.5x` |
 
-- `spargio` is built around `io_uring` + `msg_ring`, so cross-shard signaling and completion flow stay on ring paths instead of readiness/event-loop wakeup paths.
-- Cross-shard coordination uses `IORING_OP_MSG_RING`, which provides low-latency doorbells and direct ring-to-ring messaging.
-- Shard-local runtime loops plus stealable compute tasks reduce coordination contention under fanout/fanin pressure.
-- Native APIs include reusable/persistent paths (`send_all_batch`, `recv_multishot_segments`, `read_at_into`, file sessions), which reduce allocation churn and per-op control overhead.
-- It performs particularly well in coordination-heavy scenarios (fanout/fanin, frequent cross-shard wakeups, and short control-path-dominated operations).
+## Connection Placement Best Practices
 
-These mechanisms are where Spargio’s measured wins come from in the benchmark suite.
+- Use `spargio::net::TcpStream::connect(...)` for simple or latency-first paths (few streams, short-lived connections).
+- Use `spargio::net::TcpStream::connect_many_round_robin(...)` (or `connect_with_session_policy(..., RoundRobin)`) for sustained multi-stream throughput workloads.
+- For per-stream hot I/O loops, pair round-robin stream setup with `stream.spawn_on_session(...)` to keep execution aligned with the stream session shard.
+- Use stealable task placement when post-I/O CPU work is dominant and can benefit from migration.
+- As a practical starting heuristic: if active stream count is at least `2x` shard count and streams are long-lived, prefer round-robin/distributed mode.
+
+## Why Spargio Is Faster
+
+- Cross-shard coordination uses `IORING_OP_MSG_RING` directly, which keeps hot signaling paths inside ring-to-ring messaging.
+- Submission-time steering and stealable execution help absorb shard imbalance in fanout/fanin-style workloads.
+- Unbound native I/O (`UringNativeAny`) allows dispatch decisions at submission time rather than pinning all work to a pre-bound lane.
+- Throughput paths now use owned-buffer reuse plus `send_all_batch`/`recv_multishot_segments`, reducing per-frame async/syscall/completion overhead.
+
+In pure sustained stream-throughput cases, thread-per-core runtimes such as Compio can still outperform Spargio today.
 
 ## Done
 
 - Sharded runtime with `Queue` and Linux `IoUring` backends.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
-- Scheduler v2 MVP:
-  - per-shard stealable deques
-  - bounded steal budget (`steal_budget`)
-  - stealable queue backpressure (`stealable_queue_capacity`, `RuntimeError::Overloaded`)
-  - steal/backpressure stats (`steal_attempts`, `steal_success`, `stealable_backpressure`)
-- Runtime primitives:
-  - `sleep(Duration)`
-  - `timeout(Duration, fut) -> Result<_, TimeoutError>`
-  - `CancellationToken`
-  - `TaskGroup` cooperative cancellation
-- Native lane (`uring-native`) APIs:
-  - file-style ops: `read_at`, `read_at_into`, `write_at`, `fsync`
-  - stream/socket ops: `recv`, `send`, `recv_into`, `send_batch`, `send_all_batch`, `recv_batch_into`, `recv_multishot`, `recv_multishot_segments`
-  - bound-FD wrapper: `UringBoundFd` with `bind_file`, `bind_tcp_stream`, `bind_udp_socket`, `bind_owned_fd`
-- Unbound native lane API:
+- Work-stealing scheduler MVP with backpressure and runtime stats.
+- Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
+- Unbound native API:
   - `RuntimeHandle::uring_native_unbound() -> UringNativeAny`
-  - submission-time shard selection via `NativeLaneSelector` (pending-native depth + round-robin tie-break)
-  - FD affinity lease table (`weak` file, `strong` stream, `hard` multishot) and active `op_id -> shard` route tracking
-  - direct native command-envelope submission path (`SubmitNativeAny`) with same-shard local fast path
-- Persistent file session API:
-  - `UringBoundFd::start_file_session()`
-  - `UringFileSession::{read_at, read_at_into, shutdown}`
-- io_uring tuning preset:
-  - `RuntimeBuilder::io_uring_throughput_mode(...)` (coop-taskrun + optional sqpoll) for throughput-oriented configurations.
-- Bounded mixed-runtime boundary API: `spargio::boundary`.
-- Runtime stats snapshots via `RuntimeHandle::stats_snapshot()`.
-- KPI/perf automation:
-  - fanout guardrail
-  - ping guardrail
-  - combined KPI guardrail script
+  - file-style ops (`read_at`, `read_at_into`, `write_at`, `fsync`)
+  - stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`)
+  - submission-time shard selector + FD affinity leases + active op route tracking.
+- Ergonomic APIs on top of unbound native I/O:
+  - `spargio::fs::{OpenOptions, File}`
+  - `spargio::net::{TcpListener, TcpStream}`
+- Benchmark suites:
+  - `benches/ping_pong.rs`
+  - `benches/fanout_fanin.rs`
+  - `benches/fs_api.rs` (Tokio/Spargio/Compio)
+  - `benches/net_api.rs` (Tokio/Spargio/Compio)
+- Mixed-runtime boundary API: `spargio::boundary`.
 - Reference mixed-mode service example.
 
 ## Not Done Yet
 
-- Full production-grade work-stealing policy:
-  - richer fairness and starvation controls
-  - stronger adaptive victim-selection heuristics
-- Tail-latency-focused perf program:
-  - longer benchmark windows
-  - p95/p99 regression gates
-- Broader native I/O surface:
-  - fuller filesystem API
-  - fuller network API (beyond current send/recv MVP)
-- Production hardening:
-  - deeper stress/soak and failure-injection coverage
-  - more operational observability and tracing
-- Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a full ecosystem lane.
+- Full native open/accept/connect path on io_uring opcodes (current ergonomic wrappers use blocking helper threads for those setup steps).
+- Broader filesystem and network native-op surface (beyond current MVP read/write/send/recv set).
+- Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
+- Advanced work-stealing policy tuning beyond current MVP heuristics.
+- Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
 
 ## Quick Start
 
 ```bash
 cargo test
 cargo test --features uring-native
-cargo bench --no-run
+cargo bench --features uring-native --no-run
 ```
 
 Benchmark helpers:
@@ -136,23 +123,21 @@ cargo run --example mixed_mode_service
 
 ## Tokio Integration
 
-Recommended integration model today:
+Recommended model today:
 
-- Run Tokio and spargio side-by-side.
-- Exchange work/results through explicit boundaries (channels, request/response adapters, `spargio::boundary`).
-- Keep existing Tokio ecosystem dependencies unchanged while moving selected hot paths into spargio.
+- Run Tokio and Spargio side-by-side.
+- Exchange work/results through explicit boundaries (`spargio::boundary`, channels, adapters).
+- Move selected hot paths into Spargio without forcing full dependency migration.
 
-Alternative path:
-
-- A Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible, including work-stealing-aware scheduling behind that shim.
-- Building that into a broad, dependency-transparent compatibility layer is a large investment.
+A Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible, but building a dependency-transparent drop-in lane is a large investment.
 
 ## Inspirations
 
 - `ourio`: <https://github.com/rockorager/ourio>
 - `tokio-uring`: <https://github.com/tokio-rs/tokio-uring>
+- `compio`: <https://github.com/compio-rs/compio>
 
-Related runtimes (`glommio`, `monoio`, `compio`) are likely faster for some thread-per-core-only workloads because that is their primary design center.
+Related thread-per-core runtimes (`glommio`, `monoio`, `compio`) can be faster on some workload shapes because that design is their primary optimization target.
 
 ## Engineering Method
 

@@ -2230,3 +2230,598 @@ At completion of the ergonomics project, Spargio should provide equivalent day-t
 - This roadmap change intentionally favors API usability and adoption surface before deeper policy/perf-hardening tracks.
 - Bound APIs are treated as temporary complexity and are planned for removal ahead of the ergonomics phase.
 - Post-ergonomics benchmarking will include explicit Spargio-vs-Compio fs/net comparisons.
+
+## Update: scope simplification + ergonomics APIs + Compio benchmark lane
+
+Completed the requested implementation batch in three slices:
+
+### 1) Scope simplification (bound API removal)
+
+Removed bound-centric native public APIs from `src/lib.rs`:
+
+- removed `RuntimeHandle::uring_native_lane(...)`
+- removed `UringNativeLane`
+- removed `UringBoundFd`
+- removed `UringFileSession`
+
+Native public surface is now unbound-first:
+
+- `RuntimeHandle::uring_native_unbound() -> UringNativeAny`
+
+Also removed bound-oriented TDD/bench usage and migrated coverage to unbound equivalents.
+
+### 2) Ergonomics project (Compio-like API shape)
+
+Added high-level wrappers over unbound native ops in `src/lib.rs`:
+
+- `spargio::fs`
+  - `OpenOptions`
+  - `File`
+    - `open`, `create`, `from_std`
+    - `read_at`, `read_at_into`, `read_to_end_at`
+    - `write_at`, `write_all_at`, `fsync`
+- `spargio::net`
+  - `TcpStream`
+    - `connect`, `from_std`
+    - `send`, `recv`, `send_owned`, `recv_owned`
+    - `send_all_batch`, `recv_multishot_segments`
+    - `write_all`, `read_exact`
+  - `TcpListener`
+    - `bind`, `from_std`, `local_addr`, `accept`
+
+Added red/green tests:
+
+- new `tests/ergonomics_tdd.rs`
+  - `fs_open_read_to_end_and_write_at`
+  - `net_tcp_stream_connect_supports_read_write_all`
+  - `net_tcp_listener_bind_accepts_and_wraps_stream`
+- rewrote `tests/uring_native_tdd.rs` to unbound-only coverage.
+
+### 3) Benchmark refresh + Compio comparisons
+
+Added Compio to Linux dev-dependencies:
+
+- `Cargo.toml`:
+  - `[target.'cfg(target_os = "linux")'.dev-dependencies]`
+  - `compio = { version = "0.18.0", default-features = false, features = ["runtime", "io-uring", "fs", "net", "io"] }`
+
+Rewrote benchmark harnesses:
+
+- `benches/fs_api.rs`
+  - compares:
+    - `tokio_spawn_blocking_pread_qd1`
+    - `spargio_fs_read_at_qd1`
+    - `compio_fs_read_at_qd1`
+    - `tokio_spawn_blocking_pread_qd32`
+    - `spargio_fs_read_at_qd32`
+    - `compio_fs_read_at_qd32`
+- `benches/net_api.rs`
+  - compares:
+    - `tokio_tcp_echo_qd1`
+    - `spargio_tcp_echo_qd1`
+    - `compio_tcp_echo_qd1`
+    - `tokio_tcp_echo_window32`
+    - `spargio_tcp_echo_window32`
+    - `compio_tcp_echo_window32`
+
+### Validation
+
+- `cargo fmt`
+- `cargo test --features uring-native --tests`
+- `cargo bench --features uring-native --no-run`
+- `cargo bench --features uring-native --bench fs_api -- --sample-size 20`
+- `cargo bench --features uring-native --bench net_api -- --sample-size 20`
+
+### Latest benchmark snapshot (sample-size 20)
+
+FS:
+
+- `fs_read_rtt_4k/tokio_spawn_blocking_pread_qd1`: `1.601-1.641 ms`
+- `fs_read_rtt_4k/spargio_fs_read_at_qd1`: `1.012-1.026 ms`
+- `fs_read_rtt_4k/compio_fs_read_at_qd1`: `1.388-1.421 ms`
+- `fs_read_throughput_4k_qd32/tokio_spawn_blocking_pread_qd32`: `7.680-7.767 ms`
+- `fs_read_throughput_4k_qd32/spargio_fs_read_at_qd32`: `5.971-6.054 ms`
+- `fs_read_throughput_4k_qd32/compio_fs_read_at_qd32`: `5.983-6.119 ms`
+
+Net:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: `7.913-8.056 ms`
+- `net_echo_rtt_256b/spargio_tcp_echo_qd1`: `5.542-5.606 ms`
+- `net_echo_rtt_256b/compio_tcp_echo_qd1`: `6.530-6.646 ms`
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: `11.306-11.511 ms`
+- `net_stream_throughput_4k_window32/spargio_tcp_echo_window32`: `16.903-17.082 ms`
+- `net_stream_throughput_4k_window32/compio_tcp_echo_window32`: `6.928-7.091 ms`
+
+### Notes
+
+- This completes the requested simplification + ergonomics + Compio benchmark scope.
+- Current ergonomic `fs::OpenOptions::open`, `net::TcpListener::bind/accept`, and `net::TcpStream::connect` are async wrappers using blocking helper threads for setup operations; native io_uring open/accept/connect op coverage remains future work.
+
+## Update: net throughput optimization pass (owned buffers + batch/multishot receive)
+
+Focused on `net_stream_throughput_4k_window32`, where Spargio remained behind Tokio/Compio after the ergonomics migration.
+
+### Red/Green TDD
+
+Added failing ergonomics test first:
+
+- `tests/ergonomics_tdd.rs`
+  - `net_tcp_stream_owned_buffers_support_read_write_all`
+
+Then implemented the API and benchmark-path changes to green.
+
+### API changes (`spargio::net::TcpStream`)
+
+`src/lib.rs`:
+
+- added `write_all_owned(Vec<u8>) -> io::Result<Vec<u8>>`
+- added `read_exact_owned(Vec<u8>) -> io::Result<Vec<u8>>`
+- optimized `read_exact(&mut [u8])` to reuse a scratch receive buffer rather than allocating per recv loop.
+
+These allow high-frequency send/recv loops to reuse caller-owned buffers and avoid repeated allocation churn.
+
+### Benchmark harness changes
+
+`benches/net_api.rs`:
+
+- `spargio_echo_rtt` now uses owned-buffer helpers:
+  - `write_all_owned`
+  - `read_exact_owned`
+- `spargio_echo_windowed` now uses a throughput-oriented native path:
+  - prebuild frame batch from reusable tx pool
+  - `send_all_batch(...)`
+  - `recv_multishot_segments(...)` with kernel capability fallback (`EINVAL/ENOSYS/EOPNOTSUPP`)
+  - fallback receive path uses `read_exact_owned` with reusable buffer
+
+### Validation
+
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo bench --features uring-native --bench net_api --no-run`
+- `cargo bench --features uring-native --bench net_api -- --sample-size 20`
+
+### Latest `net_api` snapshot after optimization
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: `7.878-8.032 ms`
+- `net_echo_rtt_256b/spargio_tcp_echo_qd1`: `5.516-5.613 ms`
+- `net_echo_rtt_256b/compio_tcp_echo_qd1`: `6.555-6.715 ms`
+
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: `11.147-11.318 ms`
+- `net_stream_throughput_4k_window32/spargio_tcp_echo_window32`: `10.889-10.974 ms`
+- `net_stream_throughput_4k_window32/compio_tcp_echo_window32`: `7.090-7.225 ms`
+
+Result: Spargio throughput moved from clearly behind Tokio to slightly ahead in this harness run, while remaining behind Compio in sustained stream throughput.
+
+## Update: local stream-session fast path + pool-backed multishot snapshot
+
+Follow-up optimization work after the prior net-throughput pass.
+
+### What was implemented
+
+1) Local stream-session fast path (submission without unbound route tracking)
+
+`src/lib.rs` (`UringNativeAny` + `spargio::net::TcpStream`):
+
+- added direct-to-shard submit helper in `UringNativeAny`:
+  - bypasses `op_routes` + FD-affinity lock bookkeeping for stream-session calls.
+- added stream-session methods on `UringNativeAny`:
+  - `select_stream_session_shard`
+  - `recv_owned_on_shard`
+  - `send_owned_on_shard`
+  - `send_all_batch_on_shard`
+  - `recv_multishot_segments_on_shard`
+- `spargio::net::TcpStream` now selects a session shard at construction and routes stream ops through these methods.
+
+2) Multishot receive copy-path change
+
+`src/lib.rs` (`IoUringDriver::complete_native_op`):
+
+- removed per-CQE compaction copy (`out.extend_from_slice(...)`) for multishot segments.
+- now records segment offsets directly against buffer-pool layout (`bid * buffer_len`).
+- returns a pool-backed snapshot buffer (`pool.storage.to_vec()`) with segment metadata.
+
+Note: this is a safe pool-backed snapshot path (no per-segment compaction copy), not a full ownership-transfer zero-copy path. A first ownership-transfer attempt caused unsafe kernel buffer-registration interactions and was not kept.
+
+### Red/Green TDD additions
+
+Added failing tests first, then implemented to green:
+
+- `tests/ergonomics_tdd.rs`
+  - `net_tcp_stream_session_path_does_not_track_unbound_op_routes`
+- `tests/uring_native_tdd.rs`
+  - `uring_native_unbound_multishot_segments_expose_pool_backing_without_compaction_copy`
+
+### Validation
+
+- `cargo test --features uring-native --tests`
+- `cargo bench --features uring-native --bench net_api -- --sample-size 20`
+
+### Latest `net_api` snapshot after this pass
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: `7.923-8.118 ms`
+- `net_echo_rtt_256b/spargio_tcp_echo_qd1`: `5.410-5.516 ms`
+- `net_echo_rtt_256b/compio_tcp_echo_qd1`: `6.447-6.530 ms`
+
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: `10.902-11.155 ms`
+- `net_stream_throughput_4k_window32/spargio_tcp_echo_window32`: `11.225-11.441 ms`
+- `net_stream_throughput_4k_window32/compio_tcp_echo_window32`: `7.007-7.118 ms`
+
+Interpretation:
+
+- stream RTT improved further on Spargio.
+- throughput remains near Tokio (within a few percent in this run) and behind Compio on sustained stream throughput.
+
+## Update: imbalanced net-stream benchmark (hot/cold skew)
+
+Added a third `net_api` benchmark to measure skewed stream load across multiple concurrent TCP connections.
+
+### What changed
+
+- `benches/net_api.rs`:
+  - refactored echo server fixture to support N accepted client connections per harness (`spawn_echo_server_with_clients`).
+  - extended Tokio/Spargio/Compio harness command sets with `EchoImbalanced`.
+  - each harness now creates `IMBALANCED_STREAMS=8` persistent streams.
+  - existing RTT/windowed benchmarks continue to use the primary stream.
+  - new benchmark group: `net_stream_imbalanced_4k_hot1_light7`.
+
+### Imbalanced workload definition
+
+- Streams: `8`
+- Payload: `4096` bytes
+- Window: `32`
+- Heavy stream (`idx=0`): `2048` frames
+- Light streams (`idx=1..7`): `128` frames each
+- Total per iteration: `11,468,800` bytes
+
+### Validation
+
+- `cargo check --features uring-native --bench net_api`
+- `cargo bench --features uring-native --bench net_api -- --sample-size 20`
+
+### Latest results (`--sample-size 20`)
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: `7.903-8.093 ms`
+- `net_echo_rtt_256b/spargio_tcp_echo_qd1`: `5.405-5.474 ms`
+- `net_echo_rtt_256b/compio_tcp_echo_qd1`: `6.472-6.593 ms`
+
+- `net_stream_throughput_4k_window32/tokio_tcp_echo_window32`: `11.157-11.203 ms`
+- `net_stream_throughput_4k_window32/spargio_tcp_echo_window32`: `11.085-11.166 ms`
+- `net_stream_throughput_4k_window32/compio_tcp_echo_window32`: `7.136-7.277 ms`
+
+- `net_stream_imbalanced_4k_hot1_light7/tokio_tcp_8streams_hotcold`: `13.595-13.853 ms` (`830-846 MiB/s`)
+- `net_stream_imbalanced_4k_hot1_light7/spargio_tcp_8streams_hotcold`: `16.335-16.502 ms` (`697-704 MiB/s`)
+- `net_stream_imbalanced_4k_hot1_light7/compio_tcp_8streams_hotcold`: `12.089-12.215 ms` (`942-951 MiB/s`)
+
+### Notes
+
+- The new skew benchmark is stable and repeatable.
+- In the current implementation, Spargio is behind Tokio and Compio on this hot/cold multi-stream workload.
+
+## Update: hypotheses and A/B plan for imbalanced net-stream slowdown
+
+This captures why `net_stream_imbalanced_4k_hot1_light7` is currently slower on Spargio and what we should test next before changing core runtime behavior.
+
+### Hypotheses
+
+1. Workload shape is dominated by one serialized hot stream.
+- In hot1/light7, one stream carries most bytes; single-stream TCP ordering limits parallelism and reduces benefits from work stealing.
+
+2. Session-shard concentration reduces lane spread.
+- Streams are created from one worker context; `TcpStream` picks `session_shard` at construction.
+- With preferred-shard bias in selector, many streams may end up on the same shard.
+
+3. Cross-shard submit overhead in imbalanced path.
+- Imbalanced benchmark spawns stealable tasks per stream, but stream I/O still routes to stream `session_shard`.
+- If task executes off-session-shard, each op pays envelope/command/oneshot overhead.
+
+4. Multishot receive path still performs heavy copying.
+- Current multishot completion returns a pool snapshot via `pool.storage.to_vec()`.
+- This copies the full pool per batch and can dominate throughput in hot stream workloads.
+
+### Quick A/B plan to prove each cause
+
+A/B-1: workload-shape sensitivity (hot-stream serialization)
+- A: current `hot1/light7` profile.
+- B: balanced profile with same total bytes spread evenly across streams.
+- Success signal: if Spargio narrows/erases gap on balanced profile, shape serialization is a primary contributor.
+
+A/B-2: stream session-shard distribution
+- A: current stream construction path.
+- B: instrument and enforce explicit spread (round-robin stream creation context or per-stream target shard) and record distribution.
+- Success signal: if better spread improves imbalanced throughput, lane concentration is a contributor.
+
+A/B-3: task placement vs. stream session shard
+- A: current `spawn_stealable` for stream workers.
+- B: run stream workers pinned/preferred to each stream `session_shard`.
+- Success signal: if B improves latency/throughput, cross-shard submit overhead is material.
+
+A/B-4: multishot copy cost
+- A: current `take_recv_pool_storage -> to_vec()` behavior.
+- B: copy only touched segment ranges (or temporarily force non-multishot read path as control).
+- Success signal: lower time and reduced CPU/memory pressure confirms copy-path dominance.
+
+### Copy-reduction and related optimization options
+
+1) Copy only touched bytes from multishot segments (low risk).
+- Replace full-pool clone with segment-aware gather into a compact output buffer.
+- Expected effect: materially lower copy volume on partial-pool consumption.
+
+2) Segment-fold API to avoid materializing receive buffers (medium risk).
+- Add API that processes multishot segments in-place and returns folded result (checksum/parser state/etc.).
+- Expected effect: near-zero extra copy for many streaming workloads.
+
+3) Pool lease API for true zero-copy receive view (higher complexity).
+- Return a lease object that references registered pool storage + segment metadata.
+- Reclaim buffers on lease drop, with double-buffered pool strategy to keep pipeline full.
+
+4) Placement alignment for stream workers (complementary).
+- Run per-stream tasks on their `session_shard` by default in throughput-oriented paths.
+- Expected effect: remove cross-shard submit + response overhead from hot I/O loops.
+
+### Priority suggestion
+
+- First: A/B-4 (copy path) and A/B-3 (placement alignment).
+- Then: A/B-2 (distribution), A/B-1 (shape sensitivity) for explanatory confidence and benchmark positioning.
+
+## Update: A/B results for imbalanced net-stream hypotheses
+
+Ran targeted A/B matrix in `benches/net_api.rs` via benchmark group:
+- `net_stream_imbalanced_ab_4k`
+
+Command used:
+- `cargo bench --features uring-native --bench net_api -- net_stream_imbalanced_ab_4k --sample-size 12`
+
+### Key results (time ranges)
+
+- `tokio_hotcold`: `13.547-13.682 ms`
+- `tokio_balanced_total_bytes`: `8.046-8.174 ms`
+
+- `spargio_hotcold_stealable_multishot`: `16.337-16.454 ms`
+- `spargio_hotcold_pinned_multishot`: `16.358-16.512 ms`
+- `spargio_hotcold_stealable_readexact`: `17.902-17.970 ms`
+- `spargio_hotcold_pinned_readexact`: `17.742-17.896 ms`
+
+- `spargio_balanced_stealable_multishot` (single-context stream init): `16.861-16.986 ms`
+
+- `spargio_hotcold_stealable_multishot_distributed_connect`: `13.534-13.684 ms`
+- `spargio_hotcold_pinned_multishot_distributed_connect`: `13.300-13.360 ms`
+- `spargio_balanced_stealable_multishot_distributed_connect`: `9.080-9.172 ms`
+
+### Hypothesis outcomes
+
+1) Workload shape (hot-stream serialization) matters: **confirmed**.
+- Tokio hotcold vs balanced shows a large swing.
+- Spargio shows the same swing once stream session distribution is fixed (`13.6 ms` hotcold vs `9.1 ms` balanced in distributed-connect mode).
+
+2) Session-shard concentration / stream distribution: **strongly confirmed (primary factor)**.
+- Spargio hotcold improves from ~`16.4 ms` to ~`13.6 ms` by only changing stream init to distributed-connect.
+- This is the biggest single improvement in the A/B set.
+
+3) Placement alignment (stealable vs pinned-to-session): **secondary effect**.
+- In single-context mode, pinned vs stealable is effectively flat.
+- In distributed-connect mode, pinned gives a modest gain (~2%).
+
+4) Multishot copy-path concern: **not primary in this workload**.
+- `read_exact` variants are slower than multishot by ~8-10%.
+- Conclusion: reducing full-pool clone may still help, but it is not the top bottleneck for this benchmark shape.
+
+### Re-evaluated optimization priorities
+
+1. Make stream session-shard distribution explicit/default for multi-stream workloads.
+- Add runtime/net API controls for connect-time lane selection (e.g., round-robin shard hinting).
+
+2. Add stream-task placement helpers that align execution with stream session shard.
+- Keep work-stealable default, but provide an easy pinned/session-aligned fast path for throughput loops.
+
+3. Keep multishot as default receive path for throughput profiles.
+- Do not switch to read_exact-only path for this workload class.
+
+4. Move copy-reduction work to medium priority.
+- Touched-range copy and lease-based zero-copy remain worthwhile, but after (1) and (2).
+
+5. Add follow-up benchmark scenarios to validate generality.
+- skewed + distributed under larger windows, mixed payload sizes, and parser-like downstream processing.
+
+## Update: implemented optimization priorities from imbalanced A/B findings
+
+Implemented the re-prioritized optimization set focused on multi-stream distribution, session-aligned execution ergonomics, and receive-copy reduction.
+
+### 1) Stream distribution controls (runtime API)
+
+`src/lib.rs` (`spargio::net`):
+
+- added `StreamSessionPolicy`:
+  - `ContextPreferred`
+  - `RoundRobin`
+  - `Fixed(ShardId)`
+- added session-policy connect APIs on `TcpStream`:
+  - `connect_with_session_policy(...)`
+  - `connect_round_robin(...)`
+  - `connect_many_with_session_policy(...)`
+  - `connect_many_round_robin(...)`
+- added session-policy wrap API:
+  - `from_std_with_session_policy(...)`
+- kept existing `connect(...)` / `from_std(...)` behavior via `ContextPreferred`.
+- added session-policy accept APIs on `TcpListener`:
+  - `accept_with_session_policy(...)`
+  - `accept_round_robin(...)`
+
+This makes multi-stream session placement explicit and gives a first-class round-robin path without requiring benchmark-specific task orchestration.
+
+### 2) Session-shard-aligned execution helpers
+
+`src/lib.rs` (`spargio::net::TcpStream`):
+
+- added `spawn_on_session(&RuntimeHandle, fut)`
+- added `spawn_stealable_on_session(&RuntimeHandle, fut)`
+
+This removes boilerplate for session-aligned throughput loops and enables straightforward pinned-to-session execution from stream handles.
+
+### 3) Keep multishot as default throughput receive path
+
+`benches/net_api.rs`:
+
+- throughput/imbalanced hot paths continue to default to multishot receive mode.
+- read-exact is kept only as A/B comparison lane.
+
+### 4) Copy reduction for multishot completion
+
+`src/lib.rs` (io_uring driver):
+
+- replaced full pool clone in multishot completion path with compact touched-range copy:
+  - old: full `pool.storage.to_vec()` clone
+  - new: copy only segment-covered ranges and rewrite segment offsets to compact buffer coordinates
+
+This reduces receive-copy volume when only a subset of the registered pool is used per operation.
+
+### Benchmark harness updates
+
+`benches/net_api.rs`:
+
+- `SpargioStreamInitMode::DistributedConnect` now uses runtime API (`connect_many_round_robin`) instead of benchmark-local pinned-connect orchestration.
+- `bench_net_stream_imbalanced_4k_hot1_light7` uses distributed-connect Spargio harness (optimized multi-stream path).
+- A/B matrix retained (`net_stream_imbalanced_ab_4k`) and updated to use the new helpers.
+
+### Red/Green TDD
+
+Added failing tests first, then implemented to green:
+
+- `tests/ergonomics_tdd.rs`
+  - `net_tcp_stream_connect_round_robin_distributes_session_shards`
+  - `net_tcp_stream_spawn_on_session_runs_on_stream_session_shard`
+- `tests/uring_native_tdd.rs`
+  - updated multishot-copy expectation:
+    - `uring_native_unbound_multishot_segments_use_compact_buffer_copy`
+
+Validation:
+
+- `cargo test --features uring-native --tests`
+- `cargo check --features uring-native --bench net_api`
+- `cargo bench --features uring-native --bench net_api -- net_stream_imbalanced_ab_4k --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- net_stream_imbalanced_4k_hot1_light7 --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- net_echo_rtt_256b --sample-size 12`
+
+### Post-change benchmark snapshot (latest runs)
+
+Imbalanced target benchmark:
+
+- `net_stream_imbalanced_4k_hot1_light7/tokio_tcp_8streams_hotcold`: `14.058-14.331 ms`
+- `net_stream_imbalanced_4k_hot1_light7/spargio_tcp_8streams_hotcold`: `13.300-13.734 ms`
+- `net_stream_imbalanced_4k_hot1_light7/compio_tcp_8streams_hotcold`: `12.174-12.499 ms`
+
+A/B confirmation:
+
+- `spargio_hotcold_stealable_multishot_distributed_connect`: `13.410-13.639 ms`
+- `spargio_hotcold_pinned_multishot_distributed_connect`: `13.050-13.144 ms`
+- `spargio_balanced_stealable_multishot_distributed_connect`: `8.886-8.942 ms`
+
+RTT sanity after harness adjustment:
+
+- `net_echo_rtt_256b/tokio_tcp_echo_qd1`: `7.988-8.128 ms`
+- `net_echo_rtt_256b/spargio_tcp_echo_qd1`: `5.625-5.793 ms`
+- `net_echo_rtt_256b/compio_tcp_echo_qd1`: `6.599-6.704 ms`
+
+### Interpretation
+
+- Primary bottleneck identified earlier (session concentration) is now addressed via runtime API and benchmark-path adoption.
+- Session-aligned helpers are in place and show modest additional gains in distributed mode.
+- Compact multishot copy reduced copy overhead and improved several A/B lanes, while multishot remains better than read-exact for these workloads.
+
+## Update: separated net A/B scenarios into experimental benchmark target
+
+To keep long-running benchmark reporting focused and stable, imbalanced A/B diagnostic scenarios were moved out of the main net benchmark target.
+
+### What changed
+
+- Added new bench target in `Cargo.toml`:
+  - `[[bench]] name = "net_experiments"`
+- Main benchmark target `benches/net_api.rs` now includes only product-facing groups:
+  - `net_echo_rtt_256b`
+  - `net_stream_throughput_4k_window32`
+  - `net_stream_imbalanced_4k_hot1_light7`
+- Experimental A/B matrix moved to `benches/net_experiments.rs`.
+- Experimental group renamed for clarity:
+  - `exp_net_stream_imbalanced_ab_4k`
+
+### Usage
+
+- Product-facing benchmark suite:
+  - `cargo bench --features uring-native --bench net_api`
+- Experimental diagnostic suite:
+  - `cargo bench --features uring-native --bench net_experiments`
+
+### Validation
+
+- `cargo check --features uring-native --bench net_api --bench net_experiments`
+- Verified no A/B group is exposed from `net_api` target.
+- Verified `net_experiments` runs `exp_net_stream_imbalanced_ab_4k` as intended.
+
+## Update: dynamic-imbalance benchmark backlog + pipeline-hotspot implementation
+
+Captured additional benchmark shapes (posterity/backlog) to better probe the `msg_ring` + work-stealing value proposition under dynamic skew:
+
+1. `net_stream_hotspot_rotation`
+- rotating hot stream without explicit CPU stage.
+2. `net_stream_bursty_tenants`
+- many streams with bursty ON/OFF activity and skewed arrivals.
+3. `net_pipeline_imbalanced_io_cpu`
+- per-frame recv/CPU/send pipeline with rotating hotspot.
+4. `fanout_fanin_hotkey_rotation`
+- fanout/fanin with moving hot key pressure across shards.
+5. `accept_connect_churn_skewed`
+- skewed short-lived connection churn including setup path.
+
+Implemented now:
+
+- Added new benchmark group in `benches/net_api.rs`:
+  - `net_pipeline_hotspot_rotation_4k_window32`
+- Added runtime lanes in the existing Tokio/Spargio/Compio net harness commands:
+  - `*_pipeline_hotspot` command + execution path per runtime.
+- Workload shape:
+  - 8 streams, 4 KiB frames, window 32.
+  - hotspot rotates every 64 frames.
+  - per-frame CPU stage after echo receive (`heavy` for current hotspot stream, `light` for others).
+- Added a shared deterministic CPU stage helper used by all three runtimes to keep the comparison shape aligned.
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native --bench net_api`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+
+Quick snapshot (`sample-size 10`):
+
+- `net_pipeline_hotspot_rotation_4k_window32/tokio_tcp_pipeline_hotspot`: `26.075-26.308 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`: `32.686-33.156 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/compio_tcp_pipeline_hotspot`: `50.496-51.812 ms`
+
+## Update: added `net_stream_hotspot_rotation_4k` (I/O-only rotating hotspot)
+
+Implemented the follow-up benchmark shape requested to isolate dynamic skew effects without an explicit CPU stage.
+
+What was added:
+
+- New benchmark group in `benches/net_api.rs`:
+  - `net_stream_hotspot_rotation_4k`
+- New runtime command lane across Tokio/Spargio/Compio harnesses:
+  - `EchoHotspotRotation`
+- Workload definition:
+  - 8 streams
+  - 4 KiB frames
+  - hotspot rotates each step (`step % stream_count`)
+  - per-step frame budget:
+    - hotspot stream: `32` frames
+    - non-hot streams: `2` frames
+  - `64` steps total
+  - window `32`
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native --bench net_api`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+
+Quick snapshot (`sample-size 10`):
+
+- `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.7249-8.7700 ms`
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `11.499-11.600 ms`
+- `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.637-16.766 ms`

@@ -4,10 +4,6 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use futures::StreamExt;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -30,14 +26,8 @@ use std::time::Instant;
 use io_uring::{IoUring, opcode, types};
 #[cfg(target_os = "linux")]
 use slab::Slab;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use std::fs::File;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use std::net::{TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 
@@ -956,23 +946,6 @@ impl RuntimeHandle {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
-    pub fn uring_native_lane(&self, shard: ShardId) -> Result<UringNativeLane, RuntimeError> {
-        if self.backend() != BackendKind::IoUring {
-            return Err(RuntimeError::UnsupportedBackend(
-                "uring-native requires io_uring backend",
-            ));
-        }
-        if usize::from(shard) >= self.inner.remotes.len() {
-            return Err(RuntimeError::InvalidShard(shard));
-        }
-
-        Ok(UringNativeLane {
-            handle: self.clone(),
-            shard,
-        })
-    }
-
-    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     pub fn uring_native_unbound(&self) -> Result<UringNativeAny, RuntimeError> {
         if self.backend() != BackendKind::IoUring {
             return Err(RuntimeError::UnsupportedBackend(
@@ -1438,6 +1411,80 @@ impl UringNativeAny {
         Ok(chunks)
     }
 
+    pub(crate) fn select_stream_session_shard(&self) -> ShardId {
+        self.selector.select(self.effective_preferred_shard())
+    }
+
+    pub(crate) async fn recv_owned_on_shard(
+        &self,
+        shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::RecvOwned { fd, buf, reply },
+            "native stream-session recv response channel closed",
+        )
+        .await
+    }
+
+    pub(crate) async fn send_owned_on_shard(
+        &self,
+        shard: ShardId,
+        fd: RawFd,
+        buf: Vec<u8>,
+    ) -> std::io::Result<(usize, Vec<u8>)> {
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::SendOwned { fd, buf, reply },
+            "native stream-session send response channel closed",
+        )
+        .await
+    }
+
+    pub(crate) async fn send_all_batch_on_shard(
+        &self,
+        shard: ShardId,
+        fd: RawFd,
+        bufs: Vec<Vec<u8>>,
+        window: usize,
+    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::SendBatchOwned {
+                fd,
+                bufs,
+                window,
+                reply,
+            },
+            "native stream-session send batch response channel closed",
+        )
+        .await
+    }
+
+    pub(crate) async fn recv_multishot_segments_on_shard(
+        &self,
+        shard: ShardId,
+        fd: RawFd,
+        buffer_len: usize,
+        buffer_count: u16,
+        bytes_target: usize,
+    ) -> std::io::Result<UringRecvMultishotSegments> {
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::RecvMultishot {
+                fd,
+                buffer_len,
+                buffer_count,
+                bytes_target,
+                reply,
+            },
+            "native stream-session recv multishot response channel closed",
+        )
+        .await
+    }
+
     fn effective_preferred_shard(&self) -> Option<ShardId> {
         self.preferred_shard.or_else(|| {
             ShardCtx::current().and_then(|ctx| {
@@ -1572,6 +1619,32 @@ impl UringNativeAny {
         }
     }
 
+    async fn submit_direct<T, B>(
+        &self,
+        shard: ShardId,
+        build: B,
+        closed_msg: &'static str,
+    ) -> std::io::Result<T>
+    where
+        B: FnOnce(oneshot::Sender<std::io::Result<T>>) -> NativeAnyCommand,
+    {
+        if usize::from(shard) >= self.handle.shard_count() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("invalid shard {shard}"),
+            ));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = build(reply_tx);
+        self.dispatch_native_any(shard, cmd)?;
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                closed_msg,
+            ))
+        })
+    }
+
     async fn submit_tracked<T, B>(
         &self,
         fd: RawFd,
@@ -1602,13 +1675,6 @@ impl UringNativeAny {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
-#[derive(Clone)]
-pub struct UringNativeLane {
-    handle: RuntimeHandle,
-    shard: ShardId,
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UringRecvSegment {
     pub offset: usize,
@@ -1623,774 +1689,634 @@ pub struct UringRecvMultishotSegments {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
-enum UringFileSessionCmd {
-    ReadAtInto {
-        offset: u64,
-        buf: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<(usize, Vec<u8>)>>,
-    },
-    Shutdown {
-        ack: oneshot::Sender<()>,
-    },
-}
+pub mod fs {
+    use super::{RuntimeError, RuntimeHandle, UringNativeAny};
+    use futures::channel::oneshot;
+    use std::io;
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::thread;
 
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-#[derive(Clone)]
-pub struct UringFileSession {
-    shard: ShardId,
-    tx: mpsc::UnboundedSender<UringFileSessionCmd>,
-}
+    const READ_TO_END_CHUNK: usize = 64 * 1024;
 
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-impl UringFileSession {
-    pub fn shard(&self) -> ShardId {
-        self.shard
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct OpenOptions {
+        read: bool,
+        write: bool,
+        append: bool,
+        truncate: bool,
+        create: bool,
+        create_new: bool,
     }
 
-    pub async fn read_at_into(
-        &self,
-        offset: u64,
-        buf: Vec<u8>,
-    ) -> std::io::Result<(usize, Vec<u8>)> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .unbounded_send(UringFileSessionCmd::ReadAtInto {
-                offset,
-                buf,
-                reply: reply_tx,
+    impl OpenOptions {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn read(mut self, read: bool) -> Self {
+            self.read = read;
+            self
+        }
+
+        pub fn write(mut self, write: bool) -> Self {
+            self.write = write;
+            self
+        }
+
+        pub fn append(mut self, append: bool) -> Self {
+            self.append = append;
+            self
+        }
+
+        pub fn truncate(mut self, truncate: bool) -> Self {
+            self.truncate = truncate;
+            self
+        }
+
+        pub fn create(mut self, create: bool) -> Self {
+            self.create = create;
+            self
+        }
+
+        pub fn create_new(mut self, create_new: bool) -> Self {
+            self.create_new = create_new;
+            self
+        }
+
+        pub async fn open<P: AsRef<Path>>(
+            &self,
+            handle: RuntimeHandle,
+            path: P,
+        ) -> io::Result<File> {
+            let path = path.as_ref().to_path_buf();
+            let read = self.read;
+            let write = self.write;
+            let append = self.append;
+            let truncate = self.truncate;
+            let create = self.create;
+            let create_new = self.create_new;
+            let std_file = run_blocking(move || {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(read)
+                    .write(write)
+                    .append(append)
+                    .truncate(truncate)
+                    .create(create)
+                    .create_new(create_new);
+                opts.open(path)
             })
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "file session command channel closed",
-                )
-            })?;
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "file session read response channel closed",
+            .await?;
+            File::from_std(handle, std_file)
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct File {
+        native: UringNativeAny,
+        fd: Arc<OwnedFd>,
+    }
+
+    impl File {
+        pub async fn open<P: AsRef<Path>>(handle: RuntimeHandle, path: P) -> io::Result<Self> {
+            OpenOptions::new().read(true).open(handle, path).await
+        }
+
+        pub async fn create<P: AsRef<Path>>(handle: RuntimeHandle, path: P) -> io::Result<Self> {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(handle, path)
+                .await
+        }
+
+        pub fn from_std(handle: RuntimeHandle, file: std::fs::File) -> io::Result<Self> {
+            let native = handle
+                .uring_native_unbound()
+                .map_err(runtime_error_to_io_for_native)?;
+            Ok(Self {
+                native,
+                fd: Arc::new(file.into()),
+            })
+        }
+
+        pub fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+
+        pub async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+            self.native.read_at(self.as_raw_fd(), offset, len).await
+        }
+
+        pub async fn read_at_into(
+            &self,
+            offset: u64,
+            buf: Vec<u8>,
+        ) -> io::Result<(usize, Vec<u8>)> {
+            self.native
+                .read_at_into(self.as_raw_fd(), offset, buf)
+                .await
+        }
+
+        pub async fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
+            self.native.write_at(self.as_raw_fd(), offset, buf).await
+        }
+
+        pub async fn write_all_at(&self, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+            while !buf.is_empty() {
+                let wrote = self.write_at(offset, buf).await?;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write_at returned zero",
+                    ));
+                }
+                offset = offset.saturating_add(wrote as u64);
+                buf = &buf[wrote.min(buf.len())..];
+            }
+            Ok(())
+        }
+
+        pub async fn read_to_end_at(&self, mut offset: u64) -> io::Result<Vec<u8>> {
+            let mut out = Vec::new();
+            loop {
+                let (got, buf) = self
+                    .read_at_into(offset, vec![0; READ_TO_END_CHUNK])
+                    .await?;
+                if got == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..got.min(buf.len())]);
+                offset = offset.saturating_add(got as u64);
+                if got < READ_TO_END_CHUNK {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+
+        pub async fn fsync(&self) -> io::Result<()> {
+            self.native.fsync(self.as_raw_fd()).await
+        }
+    }
+
+    async fn run_blocking<T, F>(f: F) -> io::Result<T>
+    where
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.await.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "blocking fs helper channel closed",
             ))
         })
     }
 
-    pub async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        let (read_len, mut buf) = self.read_at_into(offset, vec![0; len]).await?;
-        buf.truncate(read_len.min(buf.len()));
-        Ok(buf)
+    fn runtime_error_to_io_for_native(err: RuntimeError) -> io::Error {
+        match err {
+            RuntimeError::InvalidConfig(msg) => io::Error::new(io::ErrorKind::InvalidInput, msg),
+            RuntimeError::ThreadSpawn(io) => io,
+            RuntimeError::InvalidShard(shard) => {
+                io::Error::new(io::ErrorKind::NotFound, format!("invalid shard {shard}"))
+            }
+            RuntimeError::Closed => io::Error::new(io::ErrorKind::BrokenPipe, "runtime closed"),
+            RuntimeError::Overloaded => {
+                io::Error::new(io::ErrorKind::WouldBlock, "runtime overloaded")
+            }
+            RuntimeError::UnsupportedBackend(msg) => {
+                io::Error::new(io::ErrorKind::Unsupported, msg)
+            }
+            RuntimeError::IoUringInit(io) => io,
+        }
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+pub mod net {
+    use super::{
+        JoinHandle, RuntimeError, RuntimeHandle, ShardId, UringNativeAny,
+        UringRecvMultishotSegments,
+    };
+    use futures::channel::oneshot;
+    use std::future::Future;
+    use std::io;
+    use std::net::{
+        SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+    };
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::sync::Arc;
+    use std::thread;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StreamSessionPolicy {
+        ContextPreferred,
+        RoundRobin,
+        Fixed(ShardId),
     }
 
-    pub async fn shutdown(self) -> std::io::Result<()> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx
-            .unbounded_send(UringFileSessionCmd::Shutdown { ack: ack_tx })
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "file session command channel closed",
+    impl Default for StreamSessionPolicy {
+        fn default() -> Self {
+            Self::ContextPreferred
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct TcpStream {
+        native: UringNativeAny,
+        fd: Arc<OwnedFd>,
+        session_shard: ShardId,
+    }
+
+    impl TcpStream {
+        pub async fn connect<A>(handle: RuntimeHandle, addr: A) -> io::Result<Self>
+        where
+            A: ToSocketAddrs,
+        {
+            Self::connect_with_session_policy(handle, addr, StreamSessionPolicy::ContextPreferred)
+                .await
+        }
+
+        pub async fn connect_round_robin<A>(handle: RuntimeHandle, addr: A) -> io::Result<Self>
+        where
+            A: ToSocketAddrs,
+        {
+            Self::connect_with_session_policy(handle, addr, StreamSessionPolicy::RoundRobin).await
+        }
+
+        pub async fn connect_with_session_policy<A>(
+            handle: RuntimeHandle,
+            addr: A,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Self>
+        where
+            A: ToSocketAddrs,
+        {
+            let socket_addr = first_socket_addr(addr)?;
+            Self::connect_socket_addr_with_session_policy(handle, socket_addr, policy).await
+        }
+
+        pub async fn connect_many_round_robin<A>(
+            handle: RuntimeHandle,
+            addr: A,
+            count: usize,
+        ) -> io::Result<Vec<Self>>
+        where
+            A: ToSocketAddrs,
+        {
+            Self::connect_many_with_session_policy(
+                handle,
+                addr,
+                count,
+                StreamSessionPolicy::RoundRobin,
+            )
+            .await
+        }
+
+        pub async fn connect_many_with_session_policy<A>(
+            handle: RuntimeHandle,
+            addr: A,
+            count: usize,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Vec<Self>>
+        where
+            A: ToSocketAddrs,
+        {
+            let socket_addr = first_socket_addr(addr)?;
+            let mut streams = Vec::with_capacity(count);
+            for _ in 0..count {
+                streams.push(
+                    Self::connect_socket_addr_with_session_policy(
+                        handle.clone(),
+                        socket_addr,
+                        policy,
+                    )
+                    .await?,
+                );
+            }
+            Ok(streams)
+        }
+
+        pub fn from_std(handle: RuntimeHandle, stream: StdTcpStream) -> io::Result<Self> {
+            Self::from_std_with_session_policy(
+                handle,
+                stream,
+                StreamSessionPolicy::ContextPreferred,
+            )
+        }
+
+        pub fn from_std_with_session_policy(
+            handle: RuntimeHandle,
+            stream: StdTcpStream,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Self> {
+            let (native, session_shard) = select_native_for_policy(handle, policy)?;
+            let _ = stream.set_nodelay(true);
+            Ok(Self {
+                native,
+                fd: Arc::new(stream.into()),
+                session_shard,
+            })
+        }
+
+        async fn connect_socket_addr_with_session_policy(
+            handle: RuntimeHandle,
+            socket_addr: SocketAddr,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Self> {
+            let stream = run_blocking(move || StdTcpStream::connect(socket_addr)).await?;
+            let _ = stream.set_nodelay(true);
+            Self::from_std_with_session_policy(handle, stream, policy)
+        }
+
+        pub fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+
+        pub fn session_shard(&self) -> ShardId {
+            self.session_shard
+        }
+
+        pub fn spawn_on_session<F, T>(
+            &self,
+            handle: &RuntimeHandle,
+            fut: F,
+        ) -> Result<JoinHandle<T>, RuntimeError>
+        where
+            F: Future<Output = T> + Send + 'static,
+            T: Send + 'static,
+        {
+            handle.spawn_pinned(self.session_shard, fut)
+        }
+
+        pub fn spawn_stealable_on_session<F, T>(
+            &self,
+            handle: &RuntimeHandle,
+            fut: F,
+        ) -> Result<JoinHandle<T>, RuntimeError>
+        where
+            F: Future<Output = T> + Send + 'static,
+            T: Send + 'static,
+        {
+            handle.spawn_stealable_on(self.session_shard, fut)
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            let (sent, _) = self.send_owned(buf.to_vec()).await?;
+            Ok(sent)
+        }
+
+        pub async fn recv(&self, len: usize) -> io::Result<Vec<u8>> {
+            let (got, mut buf) = self.recv_owned(vec![0; len]).await?;
+            buf.truncate(got.min(buf.len()));
+            Ok(buf)
+        }
+
+        pub async fn send_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.native
+                .send_owned_on_shard(self.session_shard, self.as_raw_fd(), buf)
+                .await
+        }
+
+        pub async fn recv_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.native
+                .recv_owned_on_shard(self.session_shard, self.as_raw_fd(), buf)
+                .await
+        }
+
+        pub async fn send_all_batch(
+            &self,
+            bufs: Vec<Vec<u8>>,
+            window: usize,
+        ) -> io::Result<(usize, Vec<Vec<u8>>)> {
+            self.native
+                .send_all_batch_on_shard(self.session_shard, self.as_raw_fd(), bufs, window)
+                .await
+        }
+
+        pub async fn recv_multishot_segments(
+            &self,
+            buffer_len: usize,
+            buffer_count: u16,
+            bytes_target: usize,
+        ) -> io::Result<UringRecvMultishotSegments> {
+            self.native
+                .recv_multishot_segments_on_shard(
+                    self.session_shard,
+                    self.as_raw_fd(),
+                    buffer_len,
+                    buffer_count,
+                    bytes_target,
                 )
-            })?;
-        ack_rx.await.map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "file session shutdown ack channel closed",
+                .await
+        }
+
+        pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+            while !buf.is_empty() {
+                let wrote = self.send(buf).await?;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "send returned zero",
+                    ));
+                }
+                buf = &buf[wrote.min(buf.len())..];
+            }
+            Ok(())
+        }
+
+        pub async fn write_all_owned(&self, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                if sent == 0 {
+                    let (wrote, returned) = self.send_owned(buf).await?;
+                    if wrote == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "send returned zero",
+                        ));
+                    }
+                    sent = sent.saturating_add(wrote);
+                    buf = returned;
+                    continue;
+                }
+
+                let wrote = self.send(&buf[sent..]).await?;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "send returned zero",
+                    ));
+                }
+                sent = sent.saturating_add(wrote);
+            }
+
+            Ok(buf)
+        }
+
+        pub async fn read_exact(&self, dst: &mut [u8]) -> io::Result<()> {
+            let mut received = 0usize;
+            let mut scratch = vec![0; dst.len().max(1)];
+            while received < dst.len() {
+                let want = dst.len().saturating_sub(received);
+                if scratch.len() != want {
+                    scratch.resize(want, 0);
+                }
+                let (got, buf) = self.recv_owned(scratch).await?;
+                scratch = buf;
+                if got == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ));
+                }
+                let copy_len = got
+                    .min(scratch.len())
+                    .min(dst.len().saturating_sub(received));
+                dst[received..received + copy_len].copy_from_slice(&scratch[..copy_len]);
+                received += copy_len;
+            }
+            Ok(())
+        }
+
+        pub async fn read_exact_owned(&self, mut dst: Vec<u8>) -> io::Result<Vec<u8>> {
+            self.read_exact(dst.as_mut_slice()).await?;
+            Ok(dst)
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct TcpListener {
+        handle: RuntimeHandle,
+        listener: Arc<StdTcpListener>,
+    }
+
+    impl TcpListener {
+        pub async fn bind<A>(handle: RuntimeHandle, addr: A) -> io::Result<Self>
+        where
+            A: ToSocketAddrs,
+        {
+            let socket_addr = first_socket_addr(addr)?;
+            let listener = run_blocking(move || StdTcpListener::bind(socket_addr)).await?;
+            Ok(Self {
+                handle,
+                listener: Arc::new(listener),
+            })
+        }
+
+        pub fn from_std(handle: RuntimeHandle, listener: StdTcpListener) -> Self {
+            Self {
+                handle,
+                listener: Arc::new(listener),
+            }
+        }
+
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.listener.local_addr()
+        }
+
+        pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            self.accept_with_session_policy(StreamSessionPolicy::ContextPreferred)
+                .await
+        }
+
+        pub async fn accept_round_robin(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            self.accept_with_session_policy(StreamSessionPolicy::RoundRobin)
+                .await
+        }
+
+        pub async fn accept_with_session_policy(
+            &self,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<(TcpStream, SocketAddr)> {
+            let handle = self.handle.clone();
+            let listener = self.listener.try_clone()?;
+            let (stream, addr) = run_blocking(move || listener.accept()).await?;
+            let stream = TcpStream::from_std_with_session_policy(handle, stream, policy)?;
+            Ok((stream, addr))
+        }
+    }
+
+    fn select_native_for_policy(
+        handle: RuntimeHandle,
+        policy: StreamSessionPolicy,
+    ) -> io::Result<(UringNativeAny, ShardId)> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+
+        match policy {
+            StreamSessionPolicy::ContextPreferred => {
+                let shard = native.select_stream_session_shard();
+                Ok((native, shard))
+            }
+            StreamSessionPolicy::RoundRobin => {
+                let shard = native
+                    .select_shard(None)
+                    .map_err(runtime_error_to_io_for_native)?;
+                Ok((native, shard))
+            }
+            StreamSessionPolicy::Fixed(shard) => {
+                let native = native
+                    .with_preferred_shard(shard)
+                    .map_err(runtime_error_to_io_for_native)?;
+                Ok((native, shard))
+            }
+        }
+    }
+
+    fn first_socket_addr<A>(addr: A) -> io::Result<SocketAddr>
+    where
+        A: ToSocketAddrs,
+    {
+        addr.to_socket_addrs()?.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket address resolution produced no results",
             )
         })
     }
-}
 
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-impl UringNativeLane {
-    pub fn shard(&self) -> ShardId {
-        self.shard
+    async fn run_blocking<T, F>(f: F) -> io::Result<T>
+    where
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.await.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "blocking net helper channel closed",
+            ))
+        })
     }
 
-    pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        let (read_len, mut buf) = self.read_at_into(fd, offset, vec![0; len]).await?;
-        buf.truncate(read_len.min(buf.len()));
-        Ok(buf)
-    }
-
-    pub async fn read_at_into(
-        &self,
-        fd: RawFd,
-        offset: u64,
-        buf: Vec<u8>,
-    ) -> std::io::Result<(usize, Vec<u8>)> {
-        let mut pending_buf = Some(buf);
-        if let Some(reply_rx) = {
-            let maybe_ctx = ShardCtx::current().filter(|ctx| {
-                ctx.runtime_id() == self.handle.inner.shared.runtime_id
-                    && ctx.shard_id() == self.shard
-            });
-            maybe_ctx.map(|ctx| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                ctx.inner.local_commands.borrow_mut().push_back(
-                    LocalCommand::SubmitNativeReadOwned {
-                        origin_shard: ctx.shard_id(),
-                        fd,
-                        offset,
-                        buf: pending_buf
-                            .take()
-                            .expect("native read pending buffer must exist"),
-                        reply: reply_tx,
-                    },
-                );
-                reply_rx
-            })
-        } {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "native read response channel closed",
-                ))
-            });
-        }
-
-        let buf = pending_buf
-            .take()
-            .expect("native read pending buffer must exist");
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeReadOwned {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            offset,
-                            buf,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native read response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn write_at(&self, fd: RawFd, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let payload = buf.to_vec();
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeWrite {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            offset,
-                            buf: payload,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native write response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn recv(&self, fd: RawFd, len: usize) -> std::io::Result<Vec<u8>> {
-        let (read_len, mut buf) = self.recv_owned(fd, vec![0; len]).await?;
-        buf.truncate(read_len.min(buf.len()));
-        Ok(buf)
-    }
-
-    pub async fn recv_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        let mut pending_buf = Some(buf);
-        if let Some(reply_rx) = {
-            let maybe_ctx = ShardCtx::current().filter(|ctx| {
-                ctx.runtime_id() == self.handle.inner.shared.runtime_id
-                    && ctx.shard_id() == self.shard
-            });
-            maybe_ctx.map(|ctx| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                ctx.inner.local_commands.borrow_mut().push_back(
-                    LocalCommand::SubmitNativeRecvOwned {
-                        origin_shard: ctx.shard_id(),
-                        fd,
-                        buf: pending_buf
-                            .take()
-                            .expect("native recv pending buffer must exist"),
-                        reply: reply_tx,
-                    },
-                );
-                reply_rx
-            })
-        } {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "native recv response channel closed",
-                ))
-            });
-        }
-
-        let buf = pending_buf
-            .take()
-            .expect("native recv pending buffer must exist");
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeRecvOwned {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            buf,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native recv response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn recv_into(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.recv_owned(fd, buf).await
-    }
-
-    pub async fn send(&self, fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
-        let (sent, _) = self.send_owned(fd, buf.to_vec()).await?;
-        Ok(sent)
-    }
-
-    pub async fn send_owned(&self, fd: RawFd, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        let mut pending_buf = Some(buf);
-        if let Some(reply_rx) = {
-            let maybe_ctx = ShardCtx::current().filter(|ctx| {
-                ctx.runtime_id() == self.handle.inner.shared.runtime_id
-                    && ctx.shard_id() == self.shard
-            });
-            maybe_ctx.map(|ctx| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                ctx.inner.local_commands.borrow_mut().push_back(
-                    LocalCommand::SubmitNativeSendOwned {
-                        origin_shard: ctx.shard_id(),
-                        fd,
-                        buf: pending_buf
-                            .take()
-                            .expect("native send pending buffer must exist"),
-                        reply: reply_tx,
-                    },
-                );
-                reply_rx
-            })
-        } {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "native send response channel closed",
-                ))
-            });
-        }
-
-        let buf = pending_buf
-            .take()
-            .expect("native send pending buffer must exist");
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeSendOwned {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            buf,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native send response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn send_batch(
-        &self,
-        fd: RawFd,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        self.send_all_batch(fd, bufs, window).await
-    }
-
-    pub async fn send_all_batch(
-        &self,
-        fd: RawFd,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        let mut pending_bufs = Some(bufs);
-        if pending_bufs.as_ref().is_some_and(|v| v.is_empty()) {
-            return Ok((0, pending_bufs.take().unwrap_or_default()));
-        }
-        let window = window.max(1);
-
-        if let Some(reply_rx) = {
-            let maybe_ctx = ShardCtx::current().filter(|ctx| {
-                ctx.runtime_id() == self.handle.inner.shared.runtime_id
-                    && ctx.shard_id() == self.shard
-            });
-            maybe_ctx.map(|ctx| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                ctx.inner.local_commands.borrow_mut().push_back(
-                    LocalCommand::SubmitNativeSendBatchOwned {
-                        origin_shard: ctx.shard_id(),
-                        fd,
-                        bufs: pending_bufs
-                            .take()
-                            .expect("native send batch buffers must exist"),
-                        window,
-                        reply: reply_tx,
-                    },
-                );
-                reply_rx
-            })
-        } {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "native send batch response channel closed",
-                ))
-            });
-        }
-
-        let bufs = pending_bufs
-            .take()
-            .expect("native send batch buffers must exist");
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeSendBatchOwned {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            bufs,
-                            window,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native send batch response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn recv_batch_into(
-        &self,
-        fd: RawFd,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        let mut pending = VecDeque::from(bufs);
-        let mut returned = Vec::new();
-        let mut total_received = 0usize;
-        let window = window.max(1);
-
-        while !pending.is_empty() {
-            let mut recvs = Vec::with_capacity(window);
-            for _ in 0..window {
-                if let Some(buf) = pending.pop_front() {
-                    recvs.push(self.recv_into(fd, buf));
-                } else {
-                    break;
-                }
+    fn runtime_error_to_io_for_native(err: RuntimeError) -> io::Error {
+        match err {
+            RuntimeError::InvalidConfig(msg) => io::Error::new(io::ErrorKind::InvalidInput, msg),
+            RuntimeError::ThreadSpawn(io) => io,
+            RuntimeError::InvalidShard(shard) => {
+                io::Error::new(io::ErrorKind::NotFound, format!("invalid shard {shard}"))
             }
-
-            for out in join_all(recvs).await {
-                let (received, buf) = out?;
-                total_received = total_received.saturating_add(received);
-                returned.push(buf);
+            RuntimeError::Closed => io::Error::new(io::ErrorKind::BrokenPipe, "runtime closed"),
+            RuntimeError::Overloaded => {
+                io::Error::new(io::ErrorKind::WouldBlock, "runtime overloaded")
             }
-        }
-
-        Ok((total_received, returned))
-    }
-
-    pub async fn recv_multishot_segments(
-        &self,
-        fd: RawFd,
-        buffer_len: usize,
-        buffer_count: u16,
-        bytes_target: usize,
-    ) -> std::io::Result<UringRecvMultishotSegments> {
-        if let Some(reply_rx) = {
-            let maybe_ctx = ShardCtx::current().filter(|ctx| {
-                ctx.runtime_id() == self.handle.inner.shared.runtime_id
-                    && ctx.shard_id() == self.shard
-            });
-            maybe_ctx.map(|ctx| {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                ctx.inner.local_commands.borrow_mut().push_back(
-                    LocalCommand::SubmitNativeRecvMultishot {
-                        origin_shard: ctx.shard_id(),
-                        fd,
-                        buffer_len,
-                        buffer_count,
-                        bytes_target,
-                        reply: reply_tx,
-                    },
-                );
-                reply_rx
-            })
-        } {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "native recv multishot response channel closed",
-                ))
-            });
-        }
-
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeRecvMultishot {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            buffer_len,
-                            buffer_count,
-                            bytes_target,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native recv multishot response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub async fn recv_multishot(
-        &self,
-        fd: RawFd,
-        buffer_len: usize,
-        buffer_count: u16,
-        bytes_target: usize,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
-        let out = self
-            .recv_multishot_segments(fd, buffer_len, buffer_count, bytes_target)
-            .await?;
-        let mut chunks = Vec::with_capacity(out.segments.len());
-        for seg in out.segments {
-            let end = seg.offset.saturating_add(seg.len).min(out.buffer.len());
-            if seg.offset >= end {
-                chunks.push(Vec::new());
-                continue;
+            RuntimeError::UnsupportedBackend(msg) => {
+                io::Error::new(io::ErrorKind::Unsupported, msg)
             }
-            chunks.push(out.buffer[seg.offset..end].to_vec());
-        }
-        Ok(chunks)
-    }
-
-    pub async fn fsync(&self, fd: RawFd) -> std::io::Result<()> {
-        let join = self
-            .handle
-            .spawn_pinned(self.shard, async move {
-                let reply_rx = {
-                    let ctx = ShardCtx::current().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "native lane task missing shard context",
-                        )
-                    })?;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    ctx.inner.local_commands.borrow_mut().push_back(
-                        LocalCommand::SubmitNativeFsync {
-                            origin_shard: ctx.shard_id(),
-                            fd,
-                            reply: reply_tx,
-                        },
-                    );
-                    reply_rx
-                };
-
-                reply_rx.await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "native fsync response channel closed",
-                    ))
-                })
-            })
-            .map_err(runtime_error_to_io)?;
-
-        join.await.map_err(join_error_to_io)?
-    }
-
-    pub fn bind_owned_fd(&self, fd: OwnedFd) -> UringBoundFd {
-        UringBoundFd {
-            lane: self.clone(),
-            fd: Arc::new(fd),
+            RuntimeError::IoUringInit(io) => io,
         }
     }
-
-    pub fn bind_file(&self, file: File) -> UringBoundFd {
-        self.bind_owned_fd(file.into())
-    }
-
-    pub fn bind_tcp_stream(&self, stream: TcpStream) -> UringBoundFd {
-        self.bind_owned_fd(stream.into())
-    }
-
-    pub fn bind_udp_socket(&self, socket: UdpSocket) -> UringBoundFd {
-        self.bind_owned_fd(socket.into())
-    }
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-#[derive(Clone)]
-pub struct UringBoundFd {
-    lane: UringNativeLane,
-    fd: Arc<OwnedFd>,
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-impl UringBoundFd {
-    pub fn shard(&self) -> ShardId {
-        self.lane.shard()
-    }
-
-    pub fn raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-
-    pub async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        self.lane.read_at(self.raw_fd(), offset, len).await
-    }
-
-    pub async fn read_at_into(
-        &self,
-        offset: u64,
-        buf: Vec<u8>,
-    ) -> std::io::Result<(usize, Vec<u8>)> {
-        self.lane.read_at_into(self.raw_fd(), offset, buf).await
-    }
-
-    pub async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        self.lane.write_at(self.raw_fd(), offset, buf).await
-    }
-
-    pub async fn recv(&self, len: usize) -> std::io::Result<Vec<u8>> {
-        self.lane.recv(self.raw_fd(), len).await
-    }
-
-    pub async fn recv_owned(&self, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.lane.recv_owned(self.raw_fd(), buf).await
-    }
-
-    pub async fn recv_into(&self, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.lane.recv_into(self.raw_fd(), buf).await
-    }
-
-    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.lane.send(self.raw_fd(), buf).await
-    }
-
-    pub async fn send_owned(&self, buf: Vec<u8>) -> std::io::Result<(usize, Vec<u8>)> {
-        self.lane.send_owned(self.raw_fd(), buf).await
-    }
-
-    pub async fn send_batch(
-        &self,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        self.lane.send_batch(self.raw_fd(), bufs, window).await
-    }
-
-    pub async fn send_all_batch(
-        &self,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        self.lane.send_all_batch(self.raw_fd(), bufs, window).await
-    }
-
-    pub async fn recv_batch_into(
-        &self,
-        bufs: Vec<Vec<u8>>,
-        window: usize,
-    ) -> std::io::Result<(usize, Vec<Vec<u8>>)> {
-        self.lane.recv_batch_into(self.raw_fd(), bufs, window).await
-    }
-
-    pub async fn recv_multishot(
-        &self,
-        buffer_len: usize,
-        buffer_count: u16,
-        bytes_target: usize,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
-        self.lane
-            .recv_multishot(self.raw_fd(), buffer_len, buffer_count, bytes_target)
-            .await
-    }
-
-    pub async fn recv_multishot_segments(
-        &self,
-        buffer_len: usize,
-        buffer_count: u16,
-        bytes_target: usize,
-    ) -> std::io::Result<UringRecvMultishotSegments> {
-        self.lane
-            .recv_multishot_segments(self.raw_fd(), buffer_len, buffer_count, bytes_target)
-            .await
-    }
-
-    pub async fn fsync(&self) -> std::io::Result<()> {
-        self.lane.fsync(self.raw_fd()).await
-    }
-
-    pub fn start_file_session(&self) -> Result<UringFileSession, RuntimeError> {
-        let (tx, mut rx) = mpsc::unbounded::<UringFileSessionCmd>();
-        let bound = self.clone();
-        let shard = self.shard();
-        self.lane.handle.spawn_pinned(shard, async move {
-            while let Some(cmd) = rx.next().await {
-                match cmd {
-                    UringFileSessionCmd::ReadAtInto { offset, buf, reply } => {
-                        let _ = reply.send(bound.read_at_into(offset, buf).await);
-                    }
-                    UringFileSessionCmd::Shutdown { ack } => {
-                        let _ = ack.send(());
-                        break;
-                    }
-                }
-            }
-        })?;
-        Ok(UringFileSession { shard, tx })
-    }
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-fn runtime_error_to_io(err: RuntimeError) -> std::io::Error {
-    match err {
-        RuntimeError::InvalidConfig(msg) => {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
-        }
-        RuntimeError::ThreadSpawn(io) => io,
-        RuntimeError::InvalidShard(shard) => std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("invalid shard {shard}"),
-        ),
-        RuntimeError::Closed => {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "runtime closed")
-        }
-        RuntimeError::Overloaded => {
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, "runtime overloaded")
-        }
-        RuntimeError::UnsupportedBackend(msg) => {
-            std::io::Error::new(std::io::ErrorKind::Unsupported, msg)
-        }
-        #[cfg(target_os = "linux")]
-        RuntimeError::IoUringInit(io) => io,
-    }
-}
-
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-fn join_error_to_io(_err: JoinError) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::BrokenPipe,
-        "native lane task canceled before completion",
-    )
 }
 
 fn spawn_on_shared<F, T>(
@@ -3818,7 +3744,6 @@ enum NativeIoOp {
         bytes_collected: usize,
         cancel_issued: bool,
         consumed_bids: Vec<u16>,
-        out: Vec<u8>,
         segments: Vec<UringRecvSegment>,
         reply: oneshot::Sender<std::io::Result<UringRecvMultishotSegments>>,
     },
@@ -4366,7 +4291,6 @@ impl IoUringDriver {
             bytes_collected: 0,
             cancel_issued: false,
             consumed_bids: Vec::new(),
-            out: Vec::with_capacity(bytes_target),
             segments: Vec::new(),
             reply,
         });
@@ -4505,6 +4429,45 @@ impl IoUringDriver {
         if let Some(pool) = self.native_recv_pools.get_mut(&key) {
             pool.in_use = false;
         }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn take_recv_pool_storage_compact(
+        &self,
+        key: NativeRecvPoolKey,
+        segments: &mut Vec<UringRecvSegment>,
+    ) -> std::io::Result<Vec<u8>> {
+        let Some(pool) = self.native_recv_pools.get(&key) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "multishot recv buffer pool missing",
+            ));
+        };
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_touched = segments.iter().map(|seg| seg.len).sum();
+        let mut compacted = Vec::with_capacity(total_touched);
+        let mut rewritten = Vec::with_capacity(segments.len());
+        let mut next_offset = 0usize;
+
+        for seg in segments.iter().copied() {
+            let end = seg.offset.saturating_add(seg.len).min(pool.storage.len());
+            if seg.offset >= end {
+                continue;
+            }
+            compacted.extend_from_slice(&pool.storage[seg.offset..end]);
+            let copied = end - seg.offset;
+            rewritten.push(UringRecvSegment {
+                offset: next_offset,
+                len: copied,
+            });
+            next_offset = next_offset.saturating_add(copied);
+        }
+
+        *segments = rewritten;
+        Ok(compacted)
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -5013,7 +4976,7 @@ impl IoUringDriver {
             Continue,
             IssueCancel,
             Finish(
-                Result<UringRecvMultishotSegments, std::io::Error>,
+                Result<Vec<UringRecvSegment>, std::io::Error>,
                 NativeRecvPoolKey,
                 Vec<u16>,
             ),
@@ -5027,7 +4990,6 @@ impl IoUringDriver {
             bytes_collected,
             cancel_issued,
             consumed_bids,
-            out,
             segments,
             ..
         }) = self.native_ops.get_mut(index)
@@ -5035,14 +4997,9 @@ impl IoUringDriver {
             if result < 0 {
                 let err = std::io::Error::from_raw_os_error(-result);
                 if *cancel_issued && err.raw_os_error() == Some(libc::ECANCELED) {
-                    let out_buf = std::mem::take(out);
-                    let out_segments = std::mem::take(segments);
                     let bids = std::mem::take(consumed_bids);
                     multi_outcome = Some(MultiOutcome::Finish(
-                        Ok(UringRecvMultishotSegments {
-                            buffer: out_buf,
-                            segments: out_segments,
-                        }),
+                        Ok(std::mem::take(segments)),
                         *pool_key,
                         bids,
                     ));
@@ -5057,13 +5014,10 @@ impl IoUringDriver {
                         Some(bid) if usize::from(bid) < usize::from(pool_key.buffer_count) => {
                             let start = usize::from(bid) * *buffer_len;
                             let capped = read_len.min(*buffer_len);
-                            let end = start + capped;
-                            if let Some(pool) = self.native_recv_pools.get(pool_key) {
-                                let offset = out.len();
-                                out.extend_from_slice(&pool.storage[start..end]);
+                            if self.native_recv_pools.contains_key(pool_key) {
                                 segments.push(UringRecvSegment {
-                                    offset,
-                                    len: end.saturating_sub(start),
+                                    offset: start,
+                                    len: capped,
                                 });
                                 consumed_bids.push(bid);
                                 *bytes_collected = bytes_collected.saturating_add(capped);
@@ -5110,14 +5064,9 @@ impl IoUringDriver {
                         *cancel_issued = true;
                         multi_outcome = Some(MultiOutcome::IssueCancel);
                     } else if result == 0 || !has_more {
-                        let out_buf = std::mem::take(out);
-                        let out_segments = std::mem::take(segments);
                         let bids = std::mem::take(consumed_bids);
                         multi_outcome = Some(MultiOutcome::Finish(
-                            Ok(UringRecvMultishotSegments {
-                                buffer: out_buf,
-                                segments: out_segments,
-                            }),
+                            Ok(std::mem::take(segments)),
                             *pool_key,
                             bids,
                         ));
@@ -5144,6 +5093,15 @@ impl IoUringDriver {
                 MultiOutcome::Finish(outcome, pool_key, consumed_bids) => {
                     self.on_native_complete();
                     let op = self.native_ops.remove(index);
+                    let outcome = match outcome {
+                        Ok(mut segments) => {
+                            match self.take_recv_pool_storage_compact(pool_key, &mut segments) {
+                                Ok(buffer) => Ok(UringRecvMultishotSegments { buffer, segments }),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
                     if let NativeIoOp::RecvMulti { reply, .. } = op {
                         let _ = reply.send(outcome);
                     }
