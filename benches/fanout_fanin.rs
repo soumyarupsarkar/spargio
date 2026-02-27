@@ -267,12 +267,6 @@ fn bench_balanced(c: &mut Criterion) {
     black_box(tokio.run(workload.warmup()));
     group.bench_function("tokio_mt_4", |b| b.iter(|| black_box(tokio.run(workload))));
 
-    let mut spargio_queue = SpargioHarness::new(BackendKind::Queue).expect("spargio queue harness");
-    black_box(spargio_queue.run(workload.warmup()));
-    group.bench_function("spargio_queue", |b| {
-        b.iter(|| black_box(spargio_queue.run(workload)))
-    });
-
     #[cfg(target_os = "linux")]
     if let Some(mut spargio_uring) = SpargioHarness::new(BackendKind::IoUring) {
         black_box(spargio_uring.run(workload.warmup()));
@@ -292,12 +286,6 @@ fn bench_skew(c: &mut Criterion) {
     let mut tokio = TokioHarness::new();
     black_box(tokio.run(workload.warmup()));
     group.bench_function("tokio_mt_4", |b| b.iter(|| black_box(tokio.run(workload))));
-
-    let mut spargio_queue = SpargioHarness::new(BackendKind::Queue).expect("spargio queue harness");
-    black_box(spargio_queue.run(workload.warmup()));
-    group.bench_function("spargio_queue", |b| {
-        b.iter(|| black_box(spargio_queue.run(workload)))
-    });
 
     #[cfg(target_os = "linux")]
     if let Some(mut spargio_uring) = SpargioHarness::new(BackendKind::IoUring) {

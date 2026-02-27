@@ -2989,3 +2989,114 @@ Highlights from refreshed results:
 Outcome:
 
 - README benchmark tables and interpretation updated to match this refresh.
+
+## Next Plan: remove remaining blocking surfaces (checklist + sequence)
+
+Goal:
+
+- Keep data-plane waits and setup on native nonblocking/io_uring paths.
+- Move control-plane APIs to async-first shapes, then deprecate blocking variants.
+
+Remaining blocking surfaces identified:
+
+- Boundary blocking ticket wait:
+  - `BoundaryTicket::wait_timeout_blocking`.
+- Boundary blocking server/client paths:
+  - `BoundaryServer::recv`, `BoundaryServer::recv_timeout`, and blocking `BoundaryClient::call`.
+- Timer helper:
+  - `sleep` currently spawns a thread and uses `thread::sleep`.
+- Hostname resolution path:
+  - `to_socket_addrs()` in `first_socket_addr` can block for DNS.
+- Synchronous runtime-control entry points:
+  - `run_with` (`block_on`) and `shutdown` thread `join` waits.
+- Queue-backend shard idle wait:
+  - `rx.recv_timeout(idle_wait)` (fallback/control-plane backend).
+
+Execution sequence (prioritized):
+
+1. io_uring timer lane (high impact, low risk)
+   - Add native timeout operation (`IORING_OP_TIMEOUT`) and route `sleep` through it on io_uring backend.
+   - Keep queue backend fallback behavior unchanged.
+   - Add TDD coverage for timer correctness/cancellation semantics.
+
+2. Async-first boundary API (high impact, medium risk)
+   - Add async `BoundaryServer::recv_async`/stream-style polling API.
+   - Add async-first client call path and keep existing blocking APIs as compatibility wrappers.
+   - Mark blocking variants as compatibility APIs in docs (and later deprecate).
+
+3. Address-resolution split (medium impact, low risk)
+   - Add `connect_socket_addr`-first API guidance and docs.
+   - Keep hostname API but route through explicit resolver boundary so blocking DNS is isolated and optional.
+   - Add tests that `SocketAddr` path stays fully nonblocking.
+
+4. Runtime-control async variants (medium impact, medium risk)
+   - Add `run_async` and `shutdown_async` (non-blocking caller thread semantics).
+   - Keep existing sync entry points for ergonomics/back-compat.
+
+5. Queue backend scope decision (medium impact, design choice)
+   - Either:
+     - keep queue backend as debug/fallback and accept blocking `recv_timeout`, or
+     - reduce queue backend role and push io_uring-only profiles as default perf lane.
+   - Record decision in ADR/log before implementation changes.
+
+Acceptance checklist:
+
+- [ ] No data-plane helper-thread blocking waits in io_uring mode.
+- [ ] `sleep` uses native timeout path when io_uring backend is active.
+- [ ] Boundary APIs have async-first equivalents covering current usage.
+- [ ] Hostname resolution path is explicitly isolated from native data plane.
+- [ ] README/implementation log reflect which blocking APIs are compatibility-only vs removed.
+
+## Update: queue backend removed from public runtime configuration
+
+Decision implemented from the blocking-surface plan:
+
+- Queue backend is no longer selectable via `BackendKind`.
+- `BackendKind` now exposes only `IoUring`.
+- `RuntimeBuilder::default()` now defaults to `BackendKind::IoUring`.
+
+Code and harness updates:
+
+- Removed `BackendKind::Queue` usage from tests and benches.
+- Updated runtime tests that previously forced queue mode to use io_uring (with existing graceful skip behavior when io_uring init is unavailable).
+- Updated `ping_pong` and `fanout_fanin` benches to stop running `spargio_queue` variants.
+- Updated README status text to describe io_uring-only backend.
+
+Validation:
+
+- `cargo fmt`
+- `cargo test --features uring-native`
+- `cargo bench --features uring-native --no-run`
+
+Notes:
+
+- Internal queue-oriented backend code paths remain in `ShardBackend` as dead code at this stage and are no longer instantiated through public builder/backend selection.
+- Follow-up cleanup can remove those branches entirely if we want to reduce maintenance surface further.
+
+## Update: internal queue backend branches removed
+
+Follow-up cleanup completed after public queue-backend removal.
+
+Changes:
+
+- Removed internal `ShardBackend::Queue` handling branches from runtime dispatch.
+- `ShardBackend` now routes only through io_uring paths in the Linux build.
+- Removed queue-branch fallback logic in native submit handlers (`submit_native_*`).
+- Removed shard-loop blocking idle wait path (`rx.recv_timeout(...)`), leaving nonblocking poll + cooperative yield behavior.
+- Removed `RuntimeBuilder::idle_wait` field/method since it only supported the removed queue idle path.
+
+Related API/harness alignment:
+
+- `#[spargio::main(...)]` macro backend option now accepts only `"io_uring"`.
+- Macro tests and examples updated accordingly.
+- `ping_pong` and `fanout_fanin` benches no longer include `spargio_queue` variants.
+
+Validation:
+
+- `cargo fmt`
+- `cargo test --features "uring-native macros"`
+- `cargo bench --features uring-native --no-run`
+
+Result:
+
+- All checks pass.

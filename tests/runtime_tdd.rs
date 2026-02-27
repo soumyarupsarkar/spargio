@@ -236,8 +236,8 @@ fn run_helper_executes_top_level_future() {
 
 #[test]
 fn run_with_applies_custom_builder() {
-    let out = run_with(
-        Runtime::builder().shards(1).backend(BackendKind::Queue),
+    let out = match run_with(
+        Runtime::builder().shards(1).backend(BackendKind::IoUring),
         |handle| async move {
             let join = handle
                 .spawn_pinned(0, async {
@@ -246,8 +246,12 @@ fn run_with_applies_custom_builder() {
                 .expect("spawn");
             join.await.expect("join")
         },
-    )
-    .expect("run_with");
+    ) {
+        Ok(out) => out,
+        #[cfg(target_os = "linux")]
+        Err(RuntimeError::IoUringInit(_)) | Err(RuntimeError::UnsupportedBackend(_)) => return,
+        Err(err) => panic!("unexpected run_with error: {err:?}"),
+    };
     assert_eq!(out, 0);
 }
 

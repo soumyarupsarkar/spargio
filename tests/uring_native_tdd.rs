@@ -44,16 +44,11 @@ mod linux_uring_native_tests {
     }
 
     #[test]
-    fn uring_native_unbound_requires_io_uring_backend() {
-        let rt = Runtime::builder()
-            .shards(1)
-            .backend(BackendKind::Queue)
-            .build()
-            .expect("runtime");
-        match rt.handle().uring_native_unbound() {
-            Ok(_) => panic!("expected unsupported backend error"),
-            Err(err) => assert!(matches!(err, RuntimeError::UnsupportedBackend(_))),
-        }
+    fn uring_native_unbound_is_available_on_io_uring_backend() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+        let _ = rt.handle().uring_native_unbound().expect("native any");
     }
 
     #[test]

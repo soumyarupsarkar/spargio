@@ -3,7 +3,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use futures::channel::oneshot;
 use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -561,7 +561,6 @@ pub trait RingMsg: Copy + Send + 'static {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    Queue,
     IoUring,
 }
 
@@ -620,7 +619,6 @@ impl Default for IoUringBuildConfig {
 pub struct RuntimeBuilder {
     shards: usize,
     thread_prefix: String,
-    idle_wait: Duration,
     backend: BackendKind,
     ring_entries: u32,
     msg_ring_queue_capacity: usize,
@@ -635,8 +633,7 @@ impl Default for RuntimeBuilder {
         Self {
             shards: std::thread::available_parallelism().map_or(1, usize::from),
             thread_prefix: "spargio-shard".to_owned(),
-            idle_wait: Duration::from_millis(1),
-            backend: BackendKind::Queue,
+            backend: BackendKind::IoUring,
             ring_entries: 256,
             msg_ring_queue_capacity: 4096,
             stealable_queue_capacity: 4096,
@@ -659,11 +656,6 @@ impl RuntimeBuilder {
 
     pub fn thread_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.thread_prefix = prefix.into();
-        self
-    }
-
-    pub fn idle_wait(mut self, wait: Duration) -> Self {
-        self.idle_wait = wait;
         self
     }
 
@@ -772,39 +764,6 @@ impl RuntimeBuilder {
 
         let mut joins = Vec::with_capacity(self.shards);
         match self.backend {
-            BackendKind::Queue => {
-                for (idx, rx) in receivers.into_iter().enumerate() {
-                    let remotes_for_shard = remotes.clone();
-                    let stealable_deques = stealable_inboxes.clone();
-                    let thread_name = format!("{}-{}", self.thread_prefix, idx);
-                    let idle_wait = self.idle_wait;
-                    let runtime_id = shared.runtime_id;
-                    let backend = ShardBackend::Queue;
-                    let stats = stats.clone();
-
-                    let join = match thread::Builder::new().name(thread_name).spawn(move || {
-                        run_shard(
-                            runtime_id,
-                            idx as ShardId,
-                            rx,
-                            remotes_for_shard,
-                            stealable_deques,
-                            self.steal_budget,
-                            idle_wait,
-                            backend,
-                            stats,
-                        )
-                    }) {
-                        Ok(j) => j,
-                        Err(err) => {
-                            shutdown_spawned(&shared.command_txs, &shared.stats, &mut joins);
-                            return Err(RuntimeError::ThreadSpawn(err));
-                        }
-                    };
-
-                    joins.push(join);
-                }
-            }
             BackendKind::IoUring => {
                 #[cfg(target_os = "linux")]
                 {
@@ -840,7 +799,6 @@ impl RuntimeBuilder {
                         let remotes_for_shard = remotes.clone();
                         let stealable_deques = stealable_inboxes.clone();
                         let thread_name = format!("{}-{}", self.thread_prefix, idx);
-                        let idle_wait = self.idle_wait;
                         let runtime_id = shared.runtime_id;
                         let backend = ShardBackend::IoUring(IoUringDriver::new(
                             idx as ShardId,
@@ -860,7 +818,6 @@ impl RuntimeBuilder {
                                 remotes_for_shard,
                                 stealable_deques,
                                 self.steal_budget,
-                                idle_wait,
                                 backend,
                                 stats,
                             )
@@ -3659,67 +3616,69 @@ impl EventState {
 }
 
 enum ShardBackend {
-    Queue,
     #[cfg(target_os = "linux")]
     IoUring(IoUringDriver),
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
 }
 
 impl ShardBackend {
+    #[cfg(target_os = "linux")]
+    fn driver_mut(&mut self) -> &mut IoUringDriver {
+        match self {
+            Self::IoUring(driver) => driver,
+        }
+    }
+
     fn prefers_busy_poll(&self) -> bool {
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::IoUring(_)) {
+        {
             return true;
         }
-        false
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     fn poll(&mut self, event_state: &EventState) {
         #[cfg(target_os = "linux")]
-        if let Self::IoUring(driver) = self {
-            driver.reap(event_state);
+        {
+            self.driver_mut().reap(event_state);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = event_state;
         }
     }
 
     fn submit_ring_msg(
         &mut self,
-        from: ShardId,
+        _from: ShardId,
         target: ShardId,
         tag: u16,
         val: u32,
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
-        command_txs: &[Sender<Command>],
+        _command_txs: &[Sender<Command>],
         stats: &RuntimeStatsInner,
     ) {
         stats.ring_msgs_submitted.fetch_add(1, Ordering::Relaxed);
-        match self {
-            Self::Queue => {
-                let Some(tx) = command_txs.get(usize::from(target)) else {
-                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ack) = ack {
-                        let _ = ack.send(Err(SendError::Closed));
-                    }
-                    return;
-                };
-                stats.increment_command_depth(target);
-                if tx
-                    .send(Command::InjectRawMessage {
-                        from,
-                        tag,
-                        val,
-                        ack,
-                    })
-                    .is_err()
-                {
-                    stats.decrement_command_depth(target);
-                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
-                }
+        #[cfg(target_os = "linux")]
+        {
+            if self
+                .driver_mut()
+                .submit_ring_msg(target, tag, val, ack)
+                .is_err()
+            {
+                stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
+                // submit_ring_msg already completed ack with an error
             }
-            #[cfg(target_os = "linux")]
-            Self::IoUring(driver) => {
-                if driver.submit_ring_msg(target, tag, val, ack).is_err() {
-                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
-                    // submit_ring_msg already completed ack with an error
-                }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
+            if let Some(ack) = ack {
+                let _ = ack.send(Err(SendError::Closed));
             }
         }
     }
@@ -3727,40 +3686,33 @@ impl ShardBackend {
     fn submit_stealable_wake(
         &mut self,
         target: ShardId,
-        command_txs: &[Sender<Command>],
+        _command_txs: &[Sender<Command>],
         stats: &RuntimeStatsInner,
     ) {
-        match self {
-            Self::Queue => {
-                let Some(tx) = command_txs.get(usize::from(target)) else {
-                    return;
-                };
-                stats.increment_command_depth(target);
-                if tx.send(Command::StealableWake).is_err() {
-                    stats.decrement_command_depth(target);
-                }
+        #[cfg(target_os = "linux")]
+        {
+            stats.ring_msgs_submitted.fetch_add(1, Ordering::Relaxed);
+            if self.driver_mut().submit_stealable_wake(target).is_err() {
+                stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
             }
-            #[cfg(target_os = "linux")]
-            Self::IoUring(driver) => {
-                stats.ring_msgs_submitted.fetch_add(1, Ordering::Relaxed);
-                if driver.submit_stealable_wake(target).is_err() {
-                    stats.ring_msgs_failed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            let _ = stats;
         }
     }
 
     fn flush(&mut self, ack: oneshot::Sender<Result<(), SendError>>) {
-        match self {
-            Self::Queue => {
-                let _ = ack.send(Ok(()));
+        #[cfg(target_os = "linux")]
+        {
+            if self.driver_mut().submit_flush(ack).is_err() {
+                // submit_flush already completed ack with an error
             }
-            #[cfg(target_os = "linux")]
-            Self::IoUring(driver) => {
-                if driver.submit_flush(ack).is_err() {
-                    // submit_flush already completed ack with an error
-                }
-            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ack.send(Err(SendError::Closed));
         }
     }
 
@@ -3786,17 +3738,7 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring read requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_read(fd, offset, len, reply);
-            }
-        }
+        let _ = self.driver_mut().submit_native_read(fd, offset, len, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3821,17 +3763,9 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring read requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_read_owned(fd, offset, buf, reply);
-            }
-        }
+        let _ = self
+            .driver_mut()
+            .submit_native_read_owned(fd, offset, buf, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3856,17 +3790,9 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring write requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_write(fd, offset, buf, reply);
-            }
-        }
+        let _ = self
+            .driver_mut()
+            .submit_native_write(fd, offset, buf, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3890,17 +3816,7 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring recv requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_recv(fd, buf, reply);
-            }
-        }
+        let _ = self.driver_mut().submit_native_recv(fd, buf, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3924,17 +3840,7 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring send requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_send(fd, buf, reply);
-            }
-        }
+        let _ = self.driver_mut().submit_native_send(fd, buf, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3959,17 +3865,9 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring send batch requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_send_batch(fd, bufs, window, reply);
-            }
-        }
+        let _ = self
+            .driver_mut()
+            .submit_native_send_batch(fd, bufs, window, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3995,23 +3893,13 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring recv multishot requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_recv_multishot(
-                    fd,
-                    buffer_len,
-                    buffer_count,
-                    bytes_target,
-                    reply,
-                );
-            }
-        }
+        let _ = self.driver_mut().submit_native_recv_multishot(
+            fd,
+            buffer_len,
+            buffer_count,
+            bytes_target,
+            reply,
+        );
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4034,17 +3922,7 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring fsync requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_fsync(fd, reply);
-            }
-        }
+        let _ = self.driver_mut().submit_native_fsync(fd, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4069,17 +3947,9 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring open requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_openat(path, flags, mode, reply);
-            }
-        }
+        let _ = self
+            .driver_mut()
+            .submit_native_openat(path, flags, mode, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4104,17 +3974,9 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring connect requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_connect(socket, addr, addr_len, reply);
-            }
-        }
+        let _ = self
+            .driver_mut()
+            .submit_native_connect(socket, addr, addr_len, reply);
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4137,23 +3999,13 @@ impl ShardBackend {
             return;
         }
 
-        match self {
-            Self::Queue => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "native io_uring accept requires io_uring backend",
-                )));
-            }
-            Self::IoUring(driver) => {
-                let _ = driver.submit_native_accept(fd, reply);
-            }
-        }
+        let _ = self.driver_mut().submit_native_accept(fd, reply);
     }
 
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Self::IoUring(driver) = self {
-            driver.shutdown();
+        {
+            self.driver_mut().shutdown();
         }
     }
 }
@@ -5927,7 +5779,6 @@ fn run_shard(
     remotes: Vec<RemoteShard>,
     stealable_deques: StealableInboxes,
     steal_budget: usize,
-    idle_wait: Duration,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
 ) {
@@ -6027,22 +5878,6 @@ fn run_shard(
             );
             if backend.prefers_busy_poll() {
                 thread::yield_now();
-            } else {
-                match rx.recv_timeout(idle_wait) {
-                    Ok(cmd) => {
-                        stats.decrement_command_depth(shard_id);
-                        stop = handle_command(
-                            cmd,
-                            shard_id,
-                            &spawner,
-                            &event_state,
-                            &stats,
-                            &local_commands,
-                        );
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => stop = true,
-                }
             }
         }
 

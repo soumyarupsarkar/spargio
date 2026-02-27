@@ -14,7 +14,6 @@ struct MainArgs {
 
 #[derive(Clone, Copy)]
 enum BackendArg {
-    Queue,
     IoUring,
 }
 
@@ -26,23 +25,21 @@ impl BackendArg {
         else {
             return Err(syn::Error::new(
                 value.span(),
-                "backend must be a string literal: \"queue\" or \"io_uring\"",
+                "backend must be a string literal: \"io_uring\"",
             ));
         };
 
         match lit.value().as_str() {
-            "queue" => Ok(Self::Queue),
             "io_uring" => Ok(Self::IoUring),
             other => Err(syn::Error::new(
                 lit.span(),
-                format!("unsupported backend '{other}'; expected \"queue\" or \"io_uring\""),
+                format!("unsupported backend '{other}'; expected \"io_uring\""),
             )),
         }
     }
 
     fn as_tokens(self) -> proc_macro2::TokenStream {
         match self {
-            Self::Queue => quote!(::spargio::BackendKind::Queue),
             Self::IoUring => quote!(::spargio::BackendKind::IoUring),
         }
     }

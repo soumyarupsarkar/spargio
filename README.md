@@ -2,11 +2,11 @@
 
 `spargio` is a work-stealing `io_uring`-based async runtime for Rust, using `msg_ring` for cross-shared coordination.
 
-Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), Spargio uses submission-time steering of stealable tasks across shards.
+Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across shards.
 
 For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
 
-The benchmarks below demonstrate where this helps. In short, as expected, unlike compio and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`. `compio` outperforms for sustained, balanced loads.
+The benchmarks below demonstrate where this helps. In short, as expected, unlike `compio` and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`. `compio` outperforms for sustained, balanced loads.
 
 ## Disclaimer
 
@@ -45,6 +45,16 @@ async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
     }
 }
 ```
+
+## Tokio Integration
+
+Recommended model today:
+
+- Run Tokio and Spargio side-by-side.
+- Exchange work/results through explicit boundaries (`spargio::boundary`, channels, adapters).
+- Move selected hot paths into Spargio without forcing full dependency migration.
+
+Note: uniquely to Spargio, a Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible to build on top of it without sacrificing work-stealing, but building and maintaining a dependency-transparent drop-in lane would be a large investment.
 
 ## Inspirations and Further Reading
 
@@ -87,7 +97,7 @@ Compio is not listed in this coordination-only table because it is share-nothing
 
 ## Benchmark Interpretation
 
-TL;DR: Spargio is strongest on coordination-heavy and low-depth latency workloads. Compio is strongest on peak sustained balanced stream throughput, while Tokio remains strongest on the rotating-hotspot network shapes in this suite.
+TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput. Somewhat surprisingly, Tokio is currently better optimized for some rotating-hotspot network shapes.
 
 - Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `steady_one_way_send_drain`, `cold_start_ping_pong`, `fanout_fanin_*`).
 - Spargio leads in low-depth fs/net latency (`fs_read_rtt_4k`, `net_echo_rtt_256b`) versus both Tokio and Compio.
@@ -98,38 +108,25 @@ For performance, different workload shapes favor different runtimes.
 
 ## What's Done
 
-- Sharded runtime with `Queue` and Linux `IoUring` backends.
+- Sharded runtime with Linux `IoUring` backend.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
 - Work-stealing scheduler MVP with backpressure and runtime stats.
 - Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
-- Runtime entry ergonomics:
-  - `spargio::run(...)`
-  - `spargio::run_with(builder, ...)`
-  - optional `#[spargio::main(...)]` attribute via `macros` feature
-- Unbound native API:
-  - `RuntimeHandle::uring_native_unbound() -> UringNativeAny`
-  - file-style ops (`read_at`, `read_at_into`, `write_at`, `fsync`)
-  - stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`)
-  - submission-time shard selector + FD affinity leases + active op route tracking.
-- Ergonomic APIs on top of unbound native I/O:
-  - `spargio::fs::{OpenOptions, File}`
-  - `spargio::net::{TcpListener, TcpStream}`
-- Benchmark suites:
-  - `benches/ping_pong.rs`
-  - `benches/fanout_fanin.rs`
-  - `benches/fs_api.rs` (Tokio/Spargio/Compio)
-  - `benches/net_api.rs` (Tokio/Spargio/Compio)
+- Runtime entry ergonomics: `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
+- Unbound native API: `RuntimeHandle::uring_native_unbound() -> UringNativeAny` with file ops (`read_at`, `read_at_into`, `write_at`, `fsync`) and stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`), plus submission-time shard selector, FD affinity leases, and active op route tracking.
+- Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` and `spargio::net::{TcpListener, TcpStream}`.
+- Native setup path on Linux io_uring lane: `open/connect/accept` are nonblocking and routed through native setup ops (no helper-thread `run_blocking` wrappers in public fs/net setup APIs).
+- Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
 - Mixed-runtime boundary API: `spargio::boundary`.
 - Reference mixed-mode service example.
 
 ## What's Not Done Yet
 
-- Full native open/accept/connect path on io_uring opcodes (current ergonomic wrappers use blocking helper threads for those setup steps).
-- Broader filesystem and network native-op surface (beyond current MVP read/write/send/recv set).
+- Broader filesystem and network native-op surface (beyond current MVP set, including richer open/metadata/fs management and broader socket operations).
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
-- Documentation / "the spargio book"
+- Deeper documentation (`spargio` book / guides for API selection, placement strategy, and benchmark methodology).
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
 
 ## Contributor Quick Start
@@ -172,7 +169,7 @@ fn main() -> Result<(), spargio::RuntimeError> {
 Attribute-macro entry (enable with `--features macros`):
 
 ```rust
-#[spargio::main(shards = 4, backend = "queue")]
+#[spargio::main(shards = 4, backend = "io_uring")]
 async fn main() {
     // async body runs on Spargio runtime
 }
@@ -188,16 +185,6 @@ async fn main() {
 - `.github/workflows/`: CI gates.
 - `IMPLEMENTATION_LOG.md`: implementation and benchmark log.
 - `architecture_decision_records/`: ADRs.
-
-## Tokio Integration
-
-Recommended model today:
-
-- Run Tokio and Spargio side-by-side.
-- Exchange work/results through explicit boundaries (`spargio::boundary`, channels, adapters).
-- Move selected hot paths into Spargio without forcing full dependency migration.
-
-A Tokio-compat readiness shim based on `IORING_OP_POLL_ADD` is possible, but building a dependency-transparent drop-in lane is a large investment.
 
 ## Connection Placement Best Practices
 
