@@ -60,11 +60,11 @@ Wondering whether to build a work-stealing pool using `io_uring` at all was insp
 
 | Benchmark | Description | Tokio | Spargio | Speedup |
 | --- | --- | --- | --- | --- |
-| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.434-1.553 ms` | `366-381 us` | `4.0x` |
-| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `68.8-76.2 us` | `70.5-71.7 us` | `1.0x` |
-| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `561-610 us` | `249-267 us` | `2.3x` |
-| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.473-1.621 ms` | `1.387-1.404 ms` | `1.1x` |
-| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.366-2.437 ms` | `1.993-2.003 ms` | `1.2x` |
+| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.4509-1.4888 ms` | `357.27-378.34 us` | `4.0x` |
+| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `70.972-75.645 us` | `66.006-66.811 us` | `1.1x` |
+| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `535.65-601.90 us` | `262.24-291.99 us` | `2.1x` |
+| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.4625-1.5346 ms` | `1.3333-1.3496 ms` | `1.1x` |
+| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.4001-2.7005 ms` | `1.9590-1.9900 ms` | `1.3x` |
 
 Compio is not listed in this coordination-only table because it is share-nothing (thread-per-core), while these cases are focused on cross-shard coordination behavior.
 
@@ -72,26 +72,26 @@ Compio is not listed in this coordination-only table because it is share-nothing
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.601-1.641 ms` | `1.012-1.026 ms` | `1.388-1.421 ms` | `1.6x` | `1.4x` |
-| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `7.680-7.767 ms` | `5.971-6.054 ms` | `5.983-6.119 ms` | `1.3x` | `1.0x` |
-| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.923-8.118 ms` | `5.410-5.516 ms` | `6.447-6.530 ms` | `1.5x` | `1.2x` |
-| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `10.902-11.155 ms` | `11.225-11.441 ms` | `7.007-7.118 ms` | `1.0x` | `0.6x` |
+| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.6476-1.7647 ms` | `0.99148-1.0145 ms` | `1.3893-1.4970 ms` | `1.7x` | `1.4x` |
+| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `7.4895-7.6145 ms` | `5.9790-6.4699 ms` | `5.4749-5.8905 ms` | `1.2x` | `0.9x` |
+| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.7059-8.0959 ms` | `5.3708-5.6477 ms` | `6.4743-6.7640 ms` | `1.4x` | `1.2x` |
+| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `11.163-11.324 ms` | `10.668-10.719 ms` | `7.2779-7.4795 ms` | `1.1x` | `0.7x` |
 
 ### Imbalanced Native API workloads (Tokio vs Spargio vs Compio)
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `14.058-14.331 ms` | `13.300-13.734 ms` | `12.174-12.499 ms` | `1.1x` | `0.9x` |
-| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.7249-8.7700 ms` | `11.499-11.600 ms` | `16.637-16.766 ms` | `0.8x` | `1.4x` |
-| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.075-26.308 ms` | `32.686-33.156 ms` | `50.496-51.812 ms` | `0.8x` | `1.5x` |
+| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `13.426-14.098 ms` | `13.510-13.911 ms` | `12.221-12.479 ms` | `1.0x` | `0.9x` |
+| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.6480-8.7488 ms` | `11.285-11.811 ms` | `16.346-16.702 ms` | `0.8x` | `1.4x` |
+| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.383-26.937 ms` | `34.962-35.935 ms` | `50.764-51.179 ms` | `0.8x` | `1.4x` |
 
 ## Benchmark Interpretation
 
-TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput. Somewhat surprisingly, Tokio is currently better optimized for some rotating-hotspot network shapes.
+TL;DR: Spargio is strongest on coordination-heavy and low-depth latency workloads. Compio is strongest on peak sustained balanced stream throughput, while Tokio remains strongest on the rotating-hotspot network shapes in this suite.
 
-- Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `cold_start_ping_pong`, `fanout_fanin_*`).
+- Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `steady_one_way_send_drain`, `cold_start_ping_pong`, `fanout_fanin_*`).
 - Spargio leads in low-depth fs/net latency (`fs_read_rtt_4k`, `net_echo_rtt_256b`) versus both Tokio and Compio.
-- Compio leads in sustained balanced stream throughput and some static-hotspot imbalance (`net_stream_throughput_4k_window32`, `net_stream_imbalanced_4k_hot1_light7`).
+- Compio leads in sustained balanced stream throughput and static-hotspot imbalance (`net_stream_throughput_4k_window32`, `net_stream_imbalanced_4k_hot1_light7`), with Spargio now ahead of Tokio in the balanced throughput case.
 - Tokio currently leads in some rotating-hotspot network cases in this suite (`net_stream_hotspot_rotation_4k`, `net_pipeline_hotspot_rotation_4k_window32`).
 
 For performance, different workload shapes favor different runtimes.

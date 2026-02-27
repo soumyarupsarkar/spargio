@@ -28,6 +28,14 @@ mod ergonomics_tests {
         }
     }
 
+    fn is_nonblocking(fd: i32) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return false;
+        }
+        flags & libc::O_NONBLOCK != 0
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fs_open_read_to_end_and_write_at() {
         let Some(rt) = try_build_io_uring_runtime() else {
@@ -58,6 +66,48 @@ mod ergonomics_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_open_options_create_new_reports_already_exists() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let path = unique_temp_path("spargio-fs-create-new");
+        std::fs::write(&path, b"seed").expect("seed file");
+
+        let err = spargio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(rt.handle(), &path)
+            .await
+            .err()
+            .expect("create_new on existing path should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_open_options_append_and_truncate_is_invalid() {
+        let Some(rt) = try_build_io_uring_runtime() else {
+            return;
+        };
+
+        let path = unique_temp_path("spargio-fs-append-truncate");
+        std::fs::write(&path, b"seed").expect("seed file");
+
+        let err = spargio::fs::OpenOptions::new()
+            .append(true)
+            .truncate(true)
+            .open(rt.handle(), &path)
+            .await
+            .err()
+            .expect("append+truncate should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn net_tcp_stream_connect_supports_read_write_all() {
         let Some(rt) = try_build_io_uring_runtime() else {
             return;
@@ -76,6 +126,10 @@ mod ergonomics_tests {
         let stream = spargio::net::TcpStream::connect(rt.handle(), addr)
             .await
             .expect("connect");
+        assert!(
+            is_nonblocking(stream.as_raw_fd()),
+            "connected spargio tcp stream should be nonblocking"
+        );
         stream.write_all(b"ping").await.expect("write_all");
         let mut recv = [0u8; 4];
         stream.read_exact(&mut recv).await.expect("read_exact");
@@ -141,6 +195,10 @@ mod ergonomics_tests {
         });
 
         let (stream, _addr) = listener.accept().await.expect("accept");
+        assert!(
+            is_nonblocking(stream.as_raw_fd()),
+            "accepted spargio tcp stream should be nonblocking"
+        );
         let mut recv = [0u8; 3];
         stream.read_exact(&mut recv).await.expect("server read");
         assert_eq!(&recv, b"abc");

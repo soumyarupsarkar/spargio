@@ -14,6 +14,10 @@ use std::cell::RefCell;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use std::collections::HashMap;
 use std::collections::VecDeque;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::ffi::CString;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,9 +31,7 @@ use io_uring::{IoUring, opcode, types};
 #[cfg(target_os = "linux")]
 use slab::Slab;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 pub type ShardId = u16;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -58,6 +60,97 @@ const NATIVE_WEAK_AFFINITY_TTL: Duration = Duration::from_millis(0);
 const NATIVE_STRONG_AFFINITY_TTL: Duration = Duration::from_millis(200);
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_HARD_AFFINITY_TTL: Duration = Duration::from_secs(5);
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn socket_addr_to_storage(addr: SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t, i32) {
+    let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+    let (len, domain) = match addr {
+        SocketAddr::V4(v4) => {
+            let raw = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::write(
+                    &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in,
+                    raw,
+                );
+            }
+            (
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                libc::AF_INET,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let raw = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                std::ptr::write(
+                    &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6,
+                    raw,
+                );
+            }
+            (
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                libc::AF_INET6,
+            )
+        }
+    };
+    (Box::new(storage), len, domain)
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn socket_addr_from_storage(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> std::io::Result<SocketAddr> {
+    match storage.ss_family as i32 {
+        libc::AF_INET => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid sockaddr_in length from accept completion",
+                ));
+            }
+            let raw = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(raw.sin_addr.s_addr.to_ne_bytes());
+            let port = u16::from_be(raw.sin_port);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid sockaddr_in6 length from accept completion",
+                ));
+            }
+            let raw = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(raw.sin6_addr.s6_addr);
+            let port = u16::from_be(raw.sin6_port);
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                port,
+                raw.sin6_flowinfo,
+                raw.sin6_scope_id,
+            )))
+        }
+        family => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported sockaddr family from accept completion: {family}"),
+        )),
+    }
+}
 
 pub mod boundary {
     use core::future::Future;
@@ -1302,6 +1395,72 @@ impl UringNativeAny {
         .await
     }
 
+    pub(crate) async fn open_at(
+        &self,
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+    ) -> std::io::Result<OwnedFd> {
+        let shard = self.selector.select(self.effective_preferred_shard());
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::OpenAt {
+                path,
+                flags,
+                mode,
+                reply,
+            },
+            "native unbound open response channel closed",
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_on_shard(
+        &self,
+        shard: ShardId,
+        socket_addr: SocketAddr,
+    ) -> std::io::Result<OwnedFd> {
+        let (addr, addr_len, domain) = socket_addr_to_storage(socket_addr);
+        let raw_fd = unsafe {
+            libc::socket(
+                domain,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::Connect {
+                socket,
+                addr,
+                addr_len,
+                reply,
+            },
+            "native unbound connect response channel closed",
+        )
+        .await
+    }
+
+    pub(crate) async fn accept_on_shard(
+        &self,
+        shard: ShardId,
+        listener_fd: RawFd,
+    ) -> std::io::Result<(OwnedFd, SocketAddr)> {
+        self.submit_direct(
+            shard,
+            |reply| NativeAnyCommand::Accept {
+                fd: listener_fd,
+                reply,
+            },
+            "native unbound accept response channel closed",
+        )
+        .await
+    }
+
     pub async fn recv(&self, fd: RawFd, len: usize) -> std::io::Result<Vec<u8>> {
         let (got, mut buf) = self.recv_owned(fd, vec![0; len]).await?;
         buf.truncate(got.min(buf.len()));
@@ -1725,12 +1884,12 @@ pub struct UringRecvMultishotSegments {
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 pub mod fs {
     use super::{RuntimeError, RuntimeHandle, UringNativeAny};
-    use futures::channel::oneshot;
+    use std::ffi::CString;
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     use std::sync::Arc;
-    use std::thread;
 
     const READ_TO_END_CHUNK: usize = 64 * 1024;
 
@@ -1784,25 +1943,60 @@ pub mod fs {
             handle: RuntimeHandle,
             path: P,
         ) -> io::Result<File> {
-            let path = path.as_ref().to_path_buf();
-            let read = self.read;
-            let write = self.write;
-            let append = self.append;
-            let truncate = self.truncate;
-            let create = self.create;
-            let create_new = self.create_new;
-            let std_file = run_blocking(move || {
-                let mut opts = std::fs::OpenOptions::new();
-                opts.read(read)
-                    .write(write)
-                    .append(append)
-                    .truncate(truncate)
-                    .create(create)
-                    .create_new(create_new);
-                opts.open(path)
+            let native = handle
+                .uring_native_unbound()
+                .map_err(runtime_error_to_io_for_native)?;
+            let (flags, mode) = self.to_open_flags()?;
+            let path = path_to_cstring(path.as_ref())?;
+            let fd = native.open_at(path, flags, mode).await?;
+            Ok(File {
+                native,
+                fd: Arc::new(fd),
             })
-            .await?;
-            File::from_std(handle, std_file)
+        }
+
+        fn to_open_flags(&self) -> io::Result<(i32, libc::mode_t)> {
+            if !self.read && !self.write && !self.append {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "must specify at least one of read, write, or append access",
+                ));
+            }
+
+            if self.truncate && self.append {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "creating or truncating a file requires write or append access",
+                ));
+            }
+
+            if (self.truncate || self.create || self.create_new) && !(self.write || self.append) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "creating or truncating a file requires write or append access",
+                ));
+            }
+
+            let access_flags = match (self.read, self.write, self.append) {
+                (true, false, false) => libc::O_RDONLY,
+                (false, true, false) => libc::O_WRONLY,
+                (true, true, false) => libc::O_RDWR,
+                (false, _, true) => libc::O_WRONLY | libc::O_APPEND,
+                (true, _, true) => libc::O_RDWR | libc::O_APPEND,
+                (false, false, false) => unreachable!("validated above"),
+            };
+
+            let mut flags = access_flags | libc::O_CLOEXEC;
+            if self.create {
+                flags |= libc::O_CREAT;
+            }
+            if self.create_new {
+                flags |= libc::O_CREAT | libc::O_EXCL;
+            }
+            if self.truncate {
+                flags |= libc::O_TRUNC;
+            }
+            Ok((flags, 0o666))
         }
     }
 
@@ -1896,20 +2090,12 @@ pub mod fs {
         }
     }
 
-    async fn run_blocking<T, F>(f: F) -> io::Result<T>
-    where
-        F: FnOnce() -> io::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = oneshot::channel();
-        thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        rx.await.unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "blocking fs helper channel closed",
-            ))
+    fn path_to_cstring(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains interior NUL byte",
+            )
         })
     }
 
@@ -1938,15 +2124,13 @@ pub mod net {
         JoinHandle, RuntimeError, RuntimeHandle, ShardId, UringNativeAny,
         UringRecvMultishotSegments,
     };
-    use futures::channel::oneshot;
     use std::future::Future;
     use std::io;
     use std::net::{
         SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
     };
-    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
-    use std::thread;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum StreamSessionPolicy {
@@ -2051,6 +2235,7 @@ pub mod net {
             policy: StreamSessionPolicy,
         ) -> io::Result<Self> {
             let (native, session_shard) = select_native_for_policy(handle, policy)?;
+            stream.set_nonblocking(true)?;
             let _ = stream.set_nodelay(true);
             Ok(Self {
                 native,
@@ -2064,9 +2249,16 @@ pub mod net {
             socket_addr: SocketAddr,
             policy: StreamSessionPolicy,
         ) -> io::Result<Self> {
-            let stream = run_blocking(move || StdTcpStream::connect(socket_addr)).await?;
+            let (native, session_shard) = select_native_for_policy(handle, policy)?;
+            let socket = native.connect_on_shard(session_shard, socket_addr).await?;
+            let stream = StdTcpStream::from(socket);
+            stream.set_nonblocking(true)?;
             let _ = stream.set_nodelay(true);
-            Self::from_std_with_session_policy(handle, stream, policy)
+            Ok(Self {
+                native,
+                fd: Arc::new(stream.into()),
+                session_shard,
+            })
         }
 
         pub fn as_raw_fd(&self) -> RawFd {
@@ -2237,7 +2429,7 @@ pub mod net {
             A: ToSocketAddrs,
         {
             let socket_addr = first_socket_addr(addr)?;
-            let listener = run_blocking(move || StdTcpListener::bind(socket_addr)).await?;
+            let listener = bind_std_listener(socket_addr)?;
             Ok(Self {
                 handle,
                 listener: Arc::new(listener),
@@ -2245,6 +2437,7 @@ pub mod net {
         }
 
         pub fn from_std(handle: RuntimeHandle, listener: StdTcpListener) -> Self {
+            let _ = listener.set_nonblocking(true);
             Self {
                 handle,
                 listener: Arc::new(listener),
@@ -2270,8 +2463,16 @@ pub mod net {
             policy: StreamSessionPolicy,
         ) -> io::Result<(TcpStream, SocketAddr)> {
             let handle = self.handle.clone();
-            let listener = self.listener.try_clone()?;
-            let (stream, addr) = run_blocking(move || listener.accept()).await?;
+            let native = handle
+                .uring_native_unbound()
+                .map_err(runtime_error_to_io_for_native)?;
+            let accept_shard = native
+                .select_shard(None)
+                .map_err(runtime_error_to_io_for_native)?;
+            let (socket, addr) = native
+                .accept_on_shard(accept_shard, self.listener.as_raw_fd())
+                .await?;
+            let stream = StdTcpStream::from(socket);
             let stream = TcpStream::from_std_with_session_policy(handle, stream, policy)?;
             Ok((stream, addr))
         }
@@ -2317,21 +2518,51 @@ pub mod net {
         })
     }
 
-    async fn run_blocking<T, F>(f: F) -> io::Result<T>
-    where
-        F: FnOnce() -> io::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = oneshot::channel();
-        thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        rx.await.unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "blocking net helper channel closed",
-            ))
-        })
+    fn bind_std_listener(socket_addr: SocketAddr) -> io::Result<StdTcpListener> {
+        let (addr, addr_len, domain) = super::socket_addr_to_storage(socket_addr);
+        let raw_fd = unsafe {
+            libc::socket(
+                domain,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let one: libc::c_int = 1;
+        let set_reuse = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if set_reuse < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let bind_result = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                addr.as_ref() as *const libc::sockaddr_storage as *const libc::sockaddr,
+                addr_len,
+            )
+        };
+        if bind_result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let listen_result = unsafe { libc::listen(fd.as_raw_fd(), libc::SOMAXCONN) };
+        if listen_result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(fd.into())
     }
 
     fn runtime_error_to_io_for_native(err: RuntimeError) -> io::Error {
@@ -3097,6 +3328,28 @@ enum LocalCommand {
         fd: RawFd,
         reply: oneshot::Sender<std::io::Result<()>>,
     },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeOpenAt {
+        origin_shard: ShardId,
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeConnect {
+        origin_shard: ShardId,
+        socket: OwnedFd,
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: libc::socklen_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeAccept {
+        origin_shard: ShardId,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
+    },
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3145,6 +3398,22 @@ enum NativeAnyCommand {
     Fsync {
         fd: RawFd,
         reply: oneshot::Sender<std::io::Result<()>>,
+    },
+    OpenAt {
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    Connect {
+        socket: OwnedFd,
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: libc::socklen_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    Accept {
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
     },
 }
 
@@ -3231,6 +3500,35 @@ impl NativeAnyCommand {
                 fd,
                 reply,
             },
+            Self::OpenAt {
+                path,
+                flags,
+                mode,
+                reply,
+            } => LocalCommand::SubmitNativeOpenAt {
+                origin_shard,
+                path,
+                flags,
+                mode,
+                reply,
+            },
+            Self::Connect {
+                socket,
+                addr,
+                addr_len,
+                reply,
+            } => LocalCommand::SubmitNativeConnect {
+                origin_shard,
+                socket,
+                addr,
+                addr_len,
+                reply,
+            },
+            Self::Accept { fd, reply } => LocalCommand::SubmitNativeAccept {
+                origin_shard,
+                fd,
+                reply,
+            },
         }
     }
 
@@ -3282,6 +3580,24 @@ impl NativeAnyCommand {
                 let _ = reply.send(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "native unbound fsync command channel closed",
+                )));
+            }
+            Self::OpenAt { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound open command channel closed",
+                )));
+            }
+            Self::Connect { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound connect command channel closed",
+                )));
+            }
+            Self::Accept { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unbound accept command channel closed",
                 )));
             }
         }
@@ -3731,6 +4047,109 @@ impl ShardBackend {
         }
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_openat(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring open violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring open requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_openat(path, flags, mode, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_connect(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        socket: OwnedFd,
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: libc::socklen_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring connect violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring connect requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_connect(socket, addr, addr_len, reply);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_accept(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring accept violated ring affinity",
+            )));
+            return;
+        }
+
+        match self {
+            Self::Queue => {
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native io_uring accept requires io_uring backend",
+                )));
+            }
+            Self::IoUring(driver) => {
+                let _ = driver.submit_native_accept(fd, reply);
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         if let Self::IoUring(driver) = self {
@@ -3751,6 +4170,21 @@ type PayloadQueues = Arc<Vec<Vec<Mutex<VecDeque<DoorbellPayload>>>>>;
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 enum NativeIoOp {
+    OpenAt {
+        path: CString,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    Connect {
+        socket: OwnedFd,
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: libc::socklen_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    },
+    Accept {
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: Box<libc::socklen_t>,
+        reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
+    },
     Read {
         buf: Vec<u8>,
         reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
@@ -4025,6 +4459,109 @@ impl IoUringDriver {
 
         if self.push_entry(entry).is_err() {
             self.fail_waiter(waiter_idx);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_openat(
+        &mut self,
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    ) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::OpenAt { path, reply });
+        self.on_native_submit();
+
+        let path_ptr = match self.native_ops.get(native_index) {
+            Some(NativeIoOp::OpenAt { path, .. }) => path.as_ptr(),
+            _ => unreachable!("native open op kind mismatch"),
+        };
+
+        let entry = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+            .flags(flags)
+            .mode(mode)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_connect(
+        &mut self,
+        socket: OwnedFd,
+        addr: Box<libc::sockaddr_storage>,
+        addr_len: libc::socklen_t,
+        reply: oneshot::Sender<std::io::Result<OwnedFd>>,
+    ) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::Connect {
+            socket,
+            addr,
+            addr_len,
+            reply,
+        });
+        self.on_native_submit();
+
+        let (fd, addr_ptr, addr_len) = match self.native_ops.get(native_index) {
+            Some(NativeIoOp::Connect {
+                socket,
+                addr,
+                addr_len,
+                ..
+            }) => (
+                socket.as_raw_fd(),
+                addr.as_ref() as *const libc::sockaddr_storage,
+                *addr_len,
+            ),
+            _ => unreachable!("native connect op kind mismatch"),
+        };
+
+        let entry = opcode::Connect::new(types::Fd(fd), addr_ptr.cast(), addr_len)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_accept(
+        &mut self,
+        fd: RawFd,
+        reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
+    ) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::Accept {
+            addr: Box::new(unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }),
+            addr_len: Box::new(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t),
+            reply,
+        });
+        self.on_native_submit();
+
+        let (addr_ptr, addr_len_ptr) = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Accept { addr, addr_len, .. }) => (
+                addr.as_mut() as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+                addr_len.as_mut() as *mut libc::socklen_t,
+            ),
+            _ => unreachable!("native accept op kind mismatch"),
+        };
+
+        let entry = opcode::Accept::new(types::Fd(fd), addr_ptr, addr_len_ptr)
+            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+            .build()
+            .user_data(native_to_userdata(native_index));
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
             return Err(SendError::Closed);
         }
         self.mark_submission_pending()
@@ -4714,6 +5251,24 @@ impl IoUringDriver {
             self.on_native_complete();
             let op = self.native_ops.remove(index);
             match op {
+                NativeIoOp::OpenAt { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring open failed",
+                    )));
+                }
+                NativeIoOp::Connect { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring connect failed",
+                    )));
+                }
+                NativeIoOp::Accept { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring accept failed",
+                    )));
+                }
                 NativeIoOp::Read { reply, .. } => {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -4780,6 +5335,24 @@ impl IoUringDriver {
         self.on_native_complete_many(ops.len());
         for (_, op) in ops {
             match op {
+                NativeIoOp::OpenAt { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring open canceled",
+                    )));
+                }
+                NativeIoOp::Connect { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring connect canceled",
+                    )));
+                }
+                NativeIoOp::Accept { reply, .. } => {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring accept canceled",
+                    )));
+                }
                 NativeIoOp::Read { reply, .. } => {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -5149,6 +5722,34 @@ impl IoUringDriver {
         self.on_native_complete();
         let op = self.native_ops.remove(index);
         match op {
+            NativeIoOp::OpenAt { reply, .. } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let file = unsafe { OwnedFd::from_raw_fd(result) };
+                let _ = reply.send(Ok(file));
+            }
+            NativeIoOp::Connect { socket, reply, .. } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let _ = reply.send(Ok(socket));
+            }
+            NativeIoOp::Accept {
+                addr,
+                addr_len,
+                reply,
+            } => {
+                if result < 0 {
+                    let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
+                    return;
+                }
+                let socket = unsafe { OwnedFd::from_raw_fd(result) };
+                let peer = socket_addr_from_storage(addr.as_ref(), *addr_len);
+                let _ = reply.send(peer.map(|peer| (socket, peer)));
+            }
             NativeIoOp::Read { mut buf, reply } => {
                 if result < 0 {
                     let _ = reply.send(Err(std::io::Error::from_raw_os_error(-result)));
@@ -5714,6 +6315,44 @@ fn drain_local_commands(
                 fd,
                 reply,
             } => backend.submit_native_fsync(shard_id, origin_shard, fd, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeOpenAt {
+                origin_shard,
+                path,
+                flags,
+                mode,
+                reply,
+            } => backend.submit_native_openat(
+                shard_id,
+                origin_shard,
+                path,
+                flags,
+                mode,
+                reply,
+                stats,
+            ),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeConnect {
+                origin_shard,
+                socket,
+                addr,
+                addr_len,
+                reply,
+            } => backend.submit_native_connect(
+                shard_id,
+                origin_shard,
+                socket,
+                addr,
+                addr_len,
+                reply,
+                stats,
+            ),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeAccept {
+                origin_shard,
+                fd,
+                reply,
+            } => backend.submit_native_accept(shard_id, origin_shard, fd, reply, stats),
         }
     }
 }

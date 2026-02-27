@@ -2885,3 +2885,107 @@ Completed the next runtime-entry ergonomics slice with red/green TDD.
   - helper entry (`run`, `run_with`) and
   - optional attribute macro entry (`#[spargio::main]`).
 - Next planned item remains removing blocking setup APIs from the public fs/net surface.
+
+## Update: removed blocking setup helpers from fs/net public APIs (Red/Green TDD)
+
+Goal completed:
+
+- Removed helper-thread `run_blocking` setup paths from:
+  - `spargio::fs::OpenOptions::open`
+  - `spargio::net::TcpStream::connect*`
+  - `spargio::net::TcpListener::bind/accept*`
+
+### Red phase
+
+Added/expanded failing tests in `tests/ergonomics_tdd.rs` to lock behavior before implementation:
+
+- `net_tcp_stream_connect_supports_read_write_all` now asserts returned stream fd is nonblocking.
+- `net_tcp_listener_bind_accepts_and_wraps_stream` now asserts accepted stream fd is nonblocking.
+- Added fs option-compat tests:
+  - `fs_open_options_create_new_reports_already_exists`
+  - `fs_open_options_append_and_truncate_is_invalid`
+
+Observed red failure before implementation:
+
+- connected/accepted stream nonblocking assertions failed with existing helper-thread setup path.
+
+### Green phase
+
+Implemented native setup operations in the io_uring command pipeline:
+
+- Added new native command flow variants (`NativeAnyCommand`, `LocalCommand`, backend dispatch, driver submission/completion):
+  - `OpenAt`
+  - `Connect`
+  - `Accept`
+- Added `UringNativeAny` helpers:
+  - `open_at(...)`
+  - `connect_on_shard(...)`
+  - `accept_on_shard(...)`
+- Added driver-side completion handling for new `NativeIoOp` variants.
+
+Public API behavior changes:
+
+- `fs::OpenOptions::open` now uses native `IORING_OP_OPENAT` instead of helper threads.
+- `net::TcpStream::connect*` now creates nonblocking sockets and completes with native `IORING_OP_CONNECT` on the chosen shard.
+- `net::TcpListener::accept*` now uses native `IORING_OP_ACCEPT` (nonblocking + cloexec accepted sockets).
+- `net::TcpListener::bind` now creates/binds/listens via nonblocking socket syscalls (no helper thread).
+- `TcpStream::from_std_with_session_policy` now enforces nonblocking mode.
+
+Notes:
+
+- Added sockaddr encode/decode helpers for IPv4/IPv6 setup/completion paths.
+- `fs::OpenOptions` flag mapping now validates invalid combinations in-process and uses `openat` flags/mode directly.
+
+### Validation
+
+Executed:
+
+- `cargo fmt`
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo test --features uring-native --test uring_native_tdd`
+- `cargo test --features uring-native`
+
+Result:
+
+- All tests pass.
+
+## Update: benchmark refresh after native setup-path changes
+
+Re-ran the monitored benchmark suites and refreshed README tables.
+
+Command profile used for all runs:
+
+- `--warm-up-time 0.05`
+- `--measurement-time 0.05`
+- `--sample-size 20`
+
+Commands executed:
+
+- `cargo bench --features uring-native --bench ping_pong -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --features uring-native --bench fanout_fanin -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --features uring-native --bench fs_api -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+- `cargo bench --features uring-native --bench net_api -- --warm-up-time 0.05 --measurement-time 0.05 --sample-size 20`
+
+Highlights from refreshed results:
+
+- Coordination:
+  - `steady_ping_pong_rtt`: Tokio `1.4509-1.4888 ms`, Spargio `357.27-378.34 us`.
+  - `steady_one_way_send_drain`: Tokio `70.972-75.645 us`, Spargio `66.006-66.811 us`.
+  - `cold_start_ping_pong`: Tokio `535.65-601.90 us`, Spargio `262.24-291.99 us`.
+  - `fanout_fanin_balanced`: Tokio `1.4625-1.5346 ms`, Spargio `1.3333-1.3496 ms`.
+  - `fanout_fanin_skewed`: Tokio `2.4001-2.7005 ms`, Spargio `1.9590-1.9900 ms`.
+
+- Native fs/net:
+  - `fs_read_rtt_4k`: Tokio `1.6476-1.7647 ms`, Spargio `0.99148-1.0145 ms`, Compio `1.3893-1.4970 ms`.
+  - `fs_read_throughput_4k_qd32`: Tokio `7.4895-7.6145 ms`, Spargio `5.9790-6.4699 ms`, Compio `5.4749-5.8905 ms`.
+  - `net_echo_rtt_256b`: Tokio `7.7059-8.0959 ms`, Spargio `5.3708-5.6477 ms`, Compio `6.4743-6.7640 ms`.
+  - `net_stream_throughput_4k_window32`: Tokio `11.163-11.324 ms`, Spargio `10.668-10.719 ms`, Compio `7.2779-7.4795 ms`.
+
+- Imbalanced net:
+  - `net_stream_imbalanced_4k_hot1_light7`: Tokio `13.426-14.098 ms`, Spargio `13.510-13.911 ms`, Compio `12.221-12.479 ms`.
+  - `net_stream_hotspot_rotation_4k`: Tokio `8.6480-8.7488 ms`, Spargio `11.285-11.811 ms`, Compio `16.346-16.702 ms`.
+  - `net_pipeline_hotspot_rotation_4k_window32`: Tokio `26.383-26.937 ms`, Spargio `34.962-35.935 ms`, Compio `50.764-51.179 ms`.
+
+Outcome:
+
+- README benchmark tables and interpretation updated to match this refresh.
