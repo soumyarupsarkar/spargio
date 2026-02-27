@@ -1,6 +1,6 @@
 # spargio
 
-`spargio` is a work-stealing async runtime for Rust built around `io_uring` and `msg_ring`.
+`spargio` is a work-stealing `io_uring`-based async runtime for Rust, using `msg_ring` for cross-shared coordination.
 
 Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), Spargio uses submission-time steering of stealable tasks across shards.
 
