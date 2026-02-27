@@ -85,16 +85,18 @@ Compio is not listed in this coordination-only table because it is share-nothing
 | `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.7249-8.7700 ms` | `11.499-11.600 ms` | `16.637-16.766 ms` | `0.8x` | `1.4x` |
 | `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.075-26.308 ms` | `32.686-33.156 ms` | `50.496-51.812 ms` | `0.8x` | `1.5x` |
 
-## Why Spargio Is Faster
+## Benchmark Interpretation
 
-- Cross-shard coordination uses `IORING_OP_MSG_RING` directly, which keeps hot signaling paths inside ring-to-ring messaging.
-- Submission-time steering and stealable execution help absorb shard imbalance in fanout/fanin-style workloads.
-- Unbound native I/O (`UringNativeAny`) allows dispatch decisions at submission time rather than pinning all work to a pre-bound lane.
-- Throughput paths now use owned-buffer reuse plus `send_all_batch`/`recv_multishot_segments`, reducing per-frame async/syscall/completion overhead.
+TL;DR: Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput; Tokio is currently better optimized for some rotating-hotspot network shapes.
 
-In pure sustained stream-throughput cases, thread-per-core runtimes such as Compio can still outperform Spargio today.
+- Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `cold_start_ping_pong`, `fanout_fanin_*`).
+- Spargio leads in low-depth fs/net latency (`fs_read_rtt_4k`, `net_echo_rtt_256b`) versus both Tokio and Compio.
+- Compio leads in sustained balanced stream throughput and some static-hotspot imbalance (`net_stream_throughput_4k_window32`, `net_stream_imbalanced_4k_hot1_light7`).
+- Tokio currently leads in some rotating-hotspot network cases in this suite (`net_stream_hotspot_rotation_4k`, `net_pipeline_hotspot_rotation_4k_window32`).
 
-## Done
+For performance, different workload shapes favor different runtimes.
+
+## What's Done
 
 - Sharded runtime with `Queue` and Linux `IoUring` backends.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
@@ -121,12 +123,13 @@ In pure sustained stream-throughput cases, thread-per-core runtimes such as Comp
 - Mixed-runtime boundary API: `spargio::boundary`.
 - Reference mixed-mode service example.
 
-## Not Done Yet
+## What's Not Done Yet
 
 - Full native open/accept/connect path on io_uring opcodes (current ergonomic wrappers use blocking helper threads for those setup steps).
 - Broader filesystem and network native-op surface (beyond current MVP read/write/send/recv set).
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
+- Documentation / "the spargio book"
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
 
 ## Contributor Quick Start
