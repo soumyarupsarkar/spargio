@@ -1,7 +1,7 @@
 #[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
-use spargio::net::TcpStream;
-#[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
 use spargio::ShardCtx;
+#[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
+use spargio::net::TcpStream;
 
 #[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
 #[spargio::main(backend = "io_uring", shards = 2)]

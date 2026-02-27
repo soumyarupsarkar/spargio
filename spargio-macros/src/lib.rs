@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::parse_macro_input;
 use syn::parse::Parser;
+use syn::parse_macro_input;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{Expr, ExprLit, FnArg, ItemFn, Lit, MetaNameValue, Pat, PatIdent, Token};
@@ -56,7 +56,10 @@ impl MainArgs {
         for arg in args {
             if arg.path.is_ident("shards") {
                 if out.shards.is_some() {
-                    return Err(syn::Error::new(arg.path.span(), "duplicate 'shards' option"));
+                    return Err(syn::Error::new(
+                        arg.path.span(),
+                        "duplicate 'shards' option",
+                    ));
                 }
                 out.shards = Some(arg.value);
                 continue;
@@ -113,7 +116,7 @@ pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
                             "#[spargio::main] parameter must be an identifier binding",
                         )
                         .to_compile_error()
-                        .into()
+                        .into();
                     }
                 },
                 FnArg::Receiver(receiver) => {
@@ -122,7 +125,7 @@ pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
                         "#[spargio::main] does not support method receivers",
                     )
                     .to_compile_error()
-                    .into()
+                    .into();
                 }
             }
         }
@@ -132,7 +135,7 @@ pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
                 "#[spargio::main] supports at most one function parameter (RuntimeHandle)",
             )
             .to_compile_error()
-            .into()
+            .into();
         }
     };
     if !input.sig.generics.params.is_empty() {

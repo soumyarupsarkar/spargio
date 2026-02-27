@@ -86,7 +86,10 @@ mod linux_example {
                             for round in 0..ROUNDS {
                                 let frame = make_frame(stream_id as u32, round);
                                 task_stream.write_all(&frame).await.expect("client write");
-                                task_stream.read_exact(&mut recv).await.expect("client read");
+                                task_stream
+                                    .read_exact(&mut recv)
+                                    .await
+                                    .expect("client read");
                                 assert_eq!(recv, frame, "echo mismatch");
 
                                 let shard = ShardCtx::current().expect("current shard").shard_id();

@@ -1,5 +1,5 @@
 #[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
-use spargio::{fs::File, net::TcpListener, RuntimeHandle};
+use spargio::{RuntimeHandle, fs::File, net::TcpListener};
 #[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
 use std::sync::Arc;
 #[cfg(all(feature = "macros", feature = "uring-native", target_os = "linux"))]
