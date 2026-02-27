@@ -37,6 +37,9 @@ pub type NativeOpId = u64;
 const EXTERNAL_SENDER: ShardId = ShardId::MAX;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "macros")]
+pub use spargio_macros::main;
+
 #[cfg(target_os = "linux")]
 const MSG_RING_CQE_FLAG: u32 = 1 << 8;
 #[cfg(target_os = "linux")]
@@ -297,6 +300,37 @@ where
         Either::Left((value, _)) => Ok(value),
         Either::Right((_, _)) => Err(TimeoutError),
     }
+}
+
+/// Runs a top-level async job on a freshly constructed runtime using default builder settings.
+///
+/// The provided closure receives a [`RuntimeHandle`] so the job can spawn additional work.
+pub fn run<F, Fut, T>(entry: F) -> Result<T, RuntimeError>
+where
+    F: FnOnce(RuntimeHandle) -> Fut,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_with(Runtime::builder(), entry)
+}
+
+/// Runs a top-level async job on a freshly constructed runtime built from `builder`.
+///
+/// This is an ergonomic entry helper equivalent to:
+/// 1) `builder.build()`
+/// 2) `handle.spawn_stealable(...)`
+/// 3) waiting for the returned join handle.
+pub fn run_with<F, Fut, T>(builder: RuntimeBuilder, entry: F) -> Result<T, RuntimeError>
+where
+    F: FnOnce(RuntimeHandle) -> Fut,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = builder.build()?;
+    let handle = runtime.handle();
+    let job = entry(handle.clone());
+    let join = handle.spawn_stealable(job)?;
+    futures::executor::block_on(join).map_err(|_| RuntimeError::Closed)
 }
 
 #[derive(Clone, Default)]

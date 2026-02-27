@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx};
+use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_with};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
@@ -222,6 +222,40 @@ fn flush_completes_without_messages() {
         .expect("spawn sender");
 
     block_on(send).expect("sender join");
+}
+
+#[test]
+fn run_helper_executes_top_level_future() {
+    let out = run(|handle| async move {
+        let join = handle.spawn_stealable(async { 41usize }).expect("spawn");
+        join.await.expect("join") + 1
+    })
+    .expect("run");
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn run_with_applies_custom_builder() {
+    let out = run_with(
+        Runtime::builder().shards(1).backend(BackendKind::Queue),
+        |handle| async move {
+            let join = handle
+                .spawn_pinned(0, async {
+                    ShardCtx::current().expect("on shard").shard_id()
+                })
+                .expect("spawn");
+            join.await.expect("join")
+        },
+    )
+    .expect("run_with");
+    assert_eq!(out, 0);
+}
+
+#[test]
+fn run_with_propagates_builder_errors() {
+    let err = run_with(Runtime::builder().shards(0), |_| async { 1usize })
+        .expect_err("invalid runtime config");
+    assert!(matches!(err, RuntimeError::InvalidConfig(_)));
 }
 
 #[test]

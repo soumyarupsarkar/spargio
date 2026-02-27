@@ -6,7 +6,7 @@ Instead of a strict thread-per-core/share-nothing execution model like other `io
 
 For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
 
-The benchmarks below demonstrate where this helps. In short, as expected, unlike compio and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`.
+The benchmarks below demonstrate where this helps. In short, as expected, unlike compio and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`. `compio` outperforms for sustained, balanced loads.
 
 ## Disclaimer
 
@@ -59,6 +59,10 @@ In pure sustained stream-throughput cases, thread-per-core runtimes such as Comp
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
 - Work-stealing scheduler MVP with backpressure and runtime stats.
 - Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
+- Runtime entry ergonomics:
+  - `spargio::run(...)`
+  - `spargio::run_with(builder, ...)`
+  - optional `#[spargio::main(...)]` attribute via `macros` feature
 - Unbound native API:
   - `RuntimeHandle::uring_native_unbound() -> UringNativeAny`
   - file-style ops (`read_at`, `read_at_into`, `write_at`, `fsync`)
@@ -89,6 +93,7 @@ In pure sustained stream-throughput cases, thread-per-core runtimes such as Comp
 cargo test
 cargo test --features uring-native
 cargo bench --features uring-native --no-run
+cargo test --features macros --test entry_macro_tdd
 ```
 
 Benchmark helpers:
@@ -104,6 +109,28 @@ Reference app:
 
 ```bash
 cargo run --example mixed_mode_service
+```
+
+## Runtime Entry
+
+Helper-based entry:
+
+```rust
+fn main() -> Result<(), spargio::RuntimeError> {
+    spargio::run(|handle| async move {
+        let job = handle.spawn_stealable(async { 42usize }).expect("spawn");
+        assert_eq!(job.await.expect("join"), 42);
+    })
+}
+```
+
+Attribute-macro entry (enable with `--features macros`):
+
+```rust
+#[spargio::main(shards = 4, backend = "queue")]
+async fn main() {
+    // async body runs on Spargio runtime
+}
 ```
 
 ## Repository Map

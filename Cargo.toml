@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 crossbeam-channel = "0.5"
 futures = "0.3"
+spargio-macros = { path = "spargio-macros", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -22,6 +23,7 @@ slab = "0.4"
 
 [features]
 default = []
+macros = ["dep:spargio-macros"]
 uring-native = []
 
 [[bench]]

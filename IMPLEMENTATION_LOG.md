@@ -2825,3 +2825,63 @@ Quick snapshot (`sample-size 10`):
 - `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.7249-8.7700 ms`
 - `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `11.499-11.600 ms`
 - `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.637-16.766 ms`
+
+## Roadmap update: runtime entry ergonomics moved to the front
+
+To reduce first-use friction, runtime entry ergonomics is now the first item in the upcoming roadmap.
+
+Updated upcoming order:
+
+1. Runtime entry ergonomics:
+   - add a simple helper entrypoint (for example `spargio::run(...)`).
+   - add optional `#[spargio::main]` proc-macro sugar in a companion proc-macro crate.
+   - ensure feature-gated behavior and clear fallback/error messaging on unsupported platforms.
+2. Remove blocking APIs from the public runtime surface.
+   - replace helper-thread `run_blocking` paths in `fs::OpenOptions::open`, `net::TcpStream::connect`, and `net::TcpListener::bind/accept`.
+   - require native/non-blocking paths for these setup operations.
+3. Continue ergonomic parity work for fs/net API discoverability and docs.
+4. Continue dynamic-imbalance benchmark expansion and optimization loops.
+5. Proceed with broader native I/O surface + hardening milestones.
+
+## Update: runtime entry ergonomics slice (helpers + `#[spargio::main]`)
+
+Completed the next runtime-entry ergonomics slice with red/green TDD.
+
+### Red phase
+
+- Added new integration tests in `tests/entry_macro_tdd.rs`:
+  - `main_macro_executes_async_body`
+  - `main_macro_applies_builder_overrides`
+  - `main_macro_panics_on_runtime_build_failure`
+- Ran:
+  - `cargo test --features macros --test entry_macro_tdd`
+- Expected failure observed:
+  - package did not yet expose a `macros` feature.
+
+### Green phase
+
+- Added companion proc-macro crate:
+  - `spargio-macros/Cargo.toml`
+  - `spargio-macros/src/lib.rs`
+- Implemented `#[spargio::main]` attribute macro:
+  - supports async no-arg function entry wrappers;
+  - supports options: `shards = ...`, `backend = "queue" | "io_uring"`;
+  - validates unsupported signatures/options at compile time.
+- Wired feature-gated export in main crate:
+  - `Cargo.toml`: added optional dependency + `macros` feature.
+  - `src/lib.rs`: `#[cfg(feature = "macros")] pub use spargio_macros::main;`
+- Existing helper entry APIs (`spargio::run`, `spargio::run_with`) remain the non-macro path.
+
+### Validation
+
+- `cargo test --features macros --test entry_macro_tdd`
+- `cargo test --test runtime_tdd`
+- `cargo test --features macros --tests`
+- `cargo fmt`
+
+### Status
+
+- Runtime entry ergonomics roadmap item is now covered by:
+  - helper entry (`run`, `run_with`) and
+  - optional attribute macro entry (`#[spargio::main]`).
+- Next planned item remains removing blocking setup APIs from the public fs/net surface.
