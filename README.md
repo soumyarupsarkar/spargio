@@ -1,10 +1,10 @@
 # spargio
 
-`spargio` is a **work-stealing `io_uring`-based async runtime** for Rust, using `msg_ring` for cross-shared coordination.
+`spargio` is a **work-stealing `io_uring`-based async runtime** for Rust, using `msg_ring` for cross-thread coordination.
 
-Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across shards.
+Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across threads.
 
-For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the shard that is best positioned to execute it.
+For coordination-heavy workloads, that gives a useful lever: work and native I/O can be directed to the thread that is best positioned to execute it.
 
 The benchmarks below demonstrate where this helps. In short, as expected, unlike `compio` and other share-nothing runtimes, `spargio` has more predictable response times under imbalanced loads, and unlike `tokio`, we have nonblocking disk I/O and avoid epoll overhead with `io_uring`. `compio` outperforms for sustained, balanced loads.
 
@@ -45,6 +45,8 @@ async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
     }
 }
 ```
+
+In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a local run/command queue. Internally within spargio, we pass work between one shard to another by enqueueing work and injecting CQEs across shards, waking up a recipient worker thread to drain pending work from its queue.
 
 ## Tokio Integration
 
