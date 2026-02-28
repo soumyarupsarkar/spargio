@@ -3072,6 +3072,14 @@ pub mod fs {
         run_blocking(handle, move || std::fs::metadata(path)).await
     }
 
+    pub async fn metadata_lite<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+    ) -> io::Result<super::extension::fs::StatxMetadata> {
+        let path = path.as_ref().to_path_buf();
+        super::extension::fs::statx_or_metadata(handle.clone(), path).await
+    }
+
     pub async fn symlink_metadata<P: AsRef<Path>>(
         handle: &RuntimeHandle,
         path: P,

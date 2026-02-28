@@ -465,6 +465,10 @@ mod ergonomics_tests {
             .await
             .expect("metadata");
         assert_eq!(meta.len(), 11);
+        let lite = spargio::fs::metadata_lite(&handle, &file)
+            .await
+            .expect("metadata_lite");
+        assert_eq!(lite.size, 11);
         let canonical = spargio::fs::canonicalize(&handle, &file)
             .await
             .expect("canonicalize");

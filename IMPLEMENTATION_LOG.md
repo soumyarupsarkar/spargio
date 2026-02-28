@@ -5034,3 +5034,67 @@ Executed and passing:
 
 - `cargo test --test docs_tdd`
 - `mdbook build book`
+
+## Update: Milestone M4 implemented (measured core refinements) with Red/Green TDD (2026-02-28)
+
+Executed a low-risk, measured refinement for one deferred fs area without
+forcing full std-type migration complexity.
+
+### Red phase
+
+Extended `tests/ergonomics_tdd.rs` in:
+
+- `fs_path_helpers_cover_common_workflows`
+
+New assertion required unresolved API:
+
+- `spargio::fs::metadata_lite(...)`
+
+Expected red failure:
+
+- missing `metadata_lite` helper in `spargio::fs`.
+
+### Green phase
+
+Implemented in core:
+
+1. New measured helper
+   - `spargio::fs::metadata_lite(handle, path)` in `src/lib.rs`.
+   - Returns `spargio::extension::fs::StatxMetadata`.
+   - Uses native-first safe wrapper (`statx_or_metadata`) with unsupported-op
+     fallback to blocking metadata path.
+
+2. Benchmark instrumentation for ROI tracking
+   - added `fs_metadata_rtt` group in `benches/fs_api.rs`:
+     - `tokio_spawn_blocking_metadata`
+     - `spargio_metadata_lite`
+   - extended fs harnesses with metadata command path to keep benchmark setup
+     comparable with existing harness style.
+
+### Measurement snapshot
+
+Executed:
+
+- `cargo bench --features uring-native --bench fs_api fs_metadata_rtt -- --warm-up-time 0.10 --measurement-time 0.10 --sample-size 20`
+
+Observed:
+
+- `fs_metadata_rtt/tokio_spawn_blocking_metadata`: `6.8858-7.2658 ms`
+  (`140.93-148.71 Kelem/s`)
+- `fs_metadata_rtt/spargio_metadata_lite`: `4.6598-4.8596 ms`
+  (`210.72-219.75 Kelem/s`)
+
+Interpretation:
+
+- native-first `metadata_lite` shows a clear throughput and latency win in this
+  short-run metadata workload while preserving compatibility fallback.
+- retained the prior decision to defer full std-wrapper migration for
+  `metadata`/`symlink_metadata`/`set_permissions` itself until broader,
+  benchmark-backed conversion is justified.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --features uring-native --test ergonomics_tdd fs_path_helpers_cover_common_workflows`
+- `cargo bench --features uring-native --bench fs_api --no-run`

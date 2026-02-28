@@ -35,6 +35,8 @@ const RTT_ROUNDS: usize = 256;
 const THROUGHPUT_ROUNDS: usize = 4096;
 #[cfg(unix)]
 const THROUGHPUT_QD: usize = 32;
+#[cfg(unix)]
+const METADATA_ROUNDS: usize = 1024;
 
 #[cfg(unix)]
 struct DiskFixture {
@@ -90,6 +92,10 @@ enum TokioFsCmd {
         qd: usize,
         reply: std_mpsc::Sender<u64>,
     },
+    Metadata {
+        rounds: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
     Shutdown {
         reply: std_mpsc::Sender<()>,
     },
@@ -115,7 +121,7 @@ impl TokioFsHarness {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                let file = Arc::new(File::open(path).expect("open fixture"));
+                let file = Arc::new(File::open(&path).expect("open fixture"));
 
                 rt.block_on(async move {
                     while let Some(cmd) = cmd_rx.recv().await {
@@ -143,6 +149,20 @@ impl TokioFsHarness {
                                         checksum = checksum.wrapping_add(value);
                                     }
                                     next += batch;
+                                }
+                                let _ = reply.send(checksum);
+                            }
+                            TokioFsCmd::Metadata { rounds, reply } => {
+                                let mut checksum = 0u64;
+                                for _ in 0..rounds {
+                                    let meta = tokio::task::spawn_blocking({
+                                        let path = path.clone();
+                                        move || std::fs::metadata(path)
+                                    })
+                                    .await
+                                    .expect("spawn_blocking metadata")
+                                    .expect("metadata");
+                                    checksum = checksum.wrapping_add(meta.len());
                                 }
                                 let _ = reply.send(checksum);
                             }
@@ -180,6 +200,14 @@ impl TokioFsHarness {
             })
             .expect("send qd cmd");
         rx.recv().expect("read qd reply")
+    }
+
+    fn metadata(&mut self, rounds: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(TokioFsCmd::Metadata { rounds, reply: tx })
+            .expect("send metadata cmd");
+        rx.recv().expect("read metadata reply")
     }
 
     fn shutdown(&mut self) {
@@ -223,6 +251,10 @@ enum SpargioFsCmd {
         qd: usize,
         reply: std_mpsc::Sender<u64>,
     },
+    MetadataLite {
+        rounds: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
     Shutdown {
         reply: std_mpsc::Sender<()>,
     },
@@ -257,15 +289,17 @@ impl SpargioFsHarness {
             Err(err) => panic!("unexpected runtime init error: {err:?}"),
         };
 
+        let metadata_path = path.to_path_buf();
+        let handle = runtime.handle();
         let file = OpenOptions::new()
             .read(true)
             .open(path)
             .expect("open fixture");
-        let file = spargio::fs::File::from_std(runtime.handle(), file).ok()?;
+        let file = spargio::fs::File::from_std(handle.clone(), file).ok()?;
+        let handle_for_worker = handle.clone();
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioFsCmd>();
-        let worker_join = runtime
-            .handle()
+        let worker_join = handle
             .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), async move {
                 let mut rtt_buf = vec![0u8; BLOCK_SIZE];
                 while let Some(cmd) = cmd_rx.next().await {
@@ -313,6 +347,17 @@ impl SpargioFsHarness {
                             }
                             let _ = reply.send(checksum);
                         }
+                        SpargioFsCmd::MetadataLite { rounds, reply } => {
+                            let mut checksum = 0u64;
+                            for _ in 0..rounds {
+                                let meta =
+                                    spargio::fs::metadata_lite(&handle_for_worker, &metadata_path)
+                                        .await
+                                        .expect("metadata_lite");
+                                checksum = checksum.wrapping_add(meta.size);
+                            }
+                            let _ = reply.send(checksum);
+                        }
                         SpargioFsCmd::Shutdown { reply } => {
                             let _ = reply.send(());
                             break;
@@ -347,6 +392,14 @@ impl SpargioFsHarness {
             })
             .expect("send spargio qd cmd");
         rx.recv().expect("spargio qd reply")
+    }
+
+    fn metadata_lite(&mut self, rounds: usize) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioFsCmd::MetadataLite { rounds, reply: tx })
+            .expect("send spargio metadata cmd");
+        rx.recv().expect("spargio metadata reply")
     }
 
     fn shutdown(&mut self) {
@@ -580,7 +633,35 @@ fn bench_fs_read_throughput(c: &mut Criterion) {
 }
 
 #[cfg(unix)]
-criterion_group!(benches, bench_fs_read_rtt, bench_fs_read_throughput);
+fn bench_fs_metadata_rtt(c: &mut Criterion) {
+    let fixture = DiskFixture::new(FILE_BLOCKS);
+    let mut group = c.benchmark_group("fs_metadata_rtt");
+    group.throughput(Throughput::Elements(METADATA_ROUNDS as u64));
+
+    let mut tokio = TokioFsHarness::new(&fixture.path, fixture.blocks);
+    black_box(tokio.metadata(64));
+    group.bench_function("tokio_spawn_blocking_metadata", |b| {
+        b.iter(|| black_box(tokio.metadata(METADATA_ROUNDS)))
+    });
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioFsHarness::new(&fixture.path, fixture.blocks) {
+        black_box(spargio.metadata_lite(64));
+        group.bench_function("spargio_metadata_lite", |b| {
+            b.iter(|| black_box(spargio.metadata_lite(METADATA_ROUNDS)))
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(unix)]
+criterion_group!(
+    benches,
+    bench_fs_read_rtt,
+    bench_fs_read_throughput,
+    bench_fs_metadata_rtt
+);
 #[cfg(unix)]
 criterion_main!(benches);
 
