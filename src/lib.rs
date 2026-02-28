@@ -262,6 +262,7 @@ pub mod boundary {
     use core::task::{Context, Poll};
     use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
     use futures::channel::oneshot;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     const POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -272,6 +273,54 @@ pub mod boundary {
         Overloaded,
         Timeout,
         Canceled,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct BoundaryStats {
+        pub overloaded: u64,
+        pub timed_out: u64,
+        pub canceled: u64,
+        pub closed: u64,
+    }
+
+    struct BoundaryStatsInner {
+        overloaded: AtomicU64,
+        timed_out: AtomicU64,
+        canceled: AtomicU64,
+        closed: AtomicU64,
+    }
+
+    static BOUNDARY_STATS: BoundaryStatsInner = BoundaryStatsInner {
+        overloaded: AtomicU64::new(0),
+        timed_out: AtomicU64::new(0),
+        canceled: AtomicU64::new(0),
+        closed: AtomicU64::new(0),
+    };
+
+    impl BoundaryStatsInner {
+        fn snapshot(&self) -> BoundaryStats {
+            BoundaryStats {
+                overloaded: self.overloaded.load(Ordering::Relaxed),
+                timed_out: self.timed_out.load(Ordering::Relaxed),
+                canceled: self.canceled.load(Ordering::Relaxed),
+                closed: self.closed.load(Ordering::Relaxed),
+            }
+        }
+
+        fn clear(&self) {
+            self.overloaded.store(0, Ordering::Relaxed);
+            self.timed_out.store(0, Ordering::Relaxed);
+            self.canceled.store(0, Ordering::Relaxed);
+            self.closed.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn stats_snapshot() -> BoundaryStats {
+        BOUNDARY_STATS.snapshot()
+    }
+
+    pub fn reset_stats_for_tests() {
+        BOUNDARY_STATS.clear();
     }
 
     struct BoundaryEnvelope<Request, Response> {
@@ -305,17 +354,20 @@ pub mod boundary {
                     if let Some(reply) = self.reply.take() {
                         let _ = reply.send(Err(BoundaryError::Timeout));
                     }
+                    BOUNDARY_STATS.timed_out.fetch_add(1, Ordering::Relaxed);
                     return Err(BoundaryError::Timeout);
                 }
             }
 
             let Some(reply) = self.reply.take() else {
+                BOUNDARY_STATS.canceled.fetch_add(1, Ordering::Relaxed);
                 return Err(BoundaryError::Canceled);
             };
 
-            reply
-                .send(Ok(response))
-                .map_err(|_| BoundaryError::Canceled)
+            reply.send(Ok(response)).map_err(|_| {
+                BOUNDARY_STATS.canceled.fetch_add(1, Ordering::Relaxed);
+                BoundaryError::Canceled
+            })
         }
     }
 
@@ -336,7 +388,10 @@ pub mod boundary {
         pub async fn wait_timeout(self, timeout: Duration) -> Result<Response, BoundaryError> {
             match super::timeout(timeout, self).await {
                 Ok(outcome) => outcome,
-                Err(_) => Err(BoundaryError::Timeout),
+                Err(_) => {
+                    BOUNDARY_STATS.timed_out.fetch_add(1, Ordering::Relaxed);
+                    Err(BoundaryError::Timeout)
+                }
             }
         }
     }
@@ -356,6 +411,7 @@ pub mod boundary {
                 }
                 Poll::Ready(Err(_)) => {
                     self.rx = None;
+                    BOUNDARY_STATS.canceled.fetch_add(1, Ordering::Relaxed);
                     Poll::Ready(Err(BoundaryError::Canceled))
                 }
                 Poll::Pending => Poll::Pending,
@@ -393,8 +449,14 @@ pub mod boundary {
 
             match self.tx.try_send(msg) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => return Err(BoundaryError::Overloaded),
-                Err(TrySendError::Disconnected(_)) => return Err(BoundaryError::Closed),
+                Err(TrySendError::Full(_)) => {
+                    BOUNDARY_STATS.overloaded.fetch_add(1, Ordering::Relaxed);
+                    return Err(BoundaryError::Overloaded);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    BOUNDARY_STATS.closed.fetch_add(1, Ordering::Relaxed);
+                    return Err(BoundaryError::Closed);
+                }
             }
             Ok(BoundaryTicket { rx: Some(reply_rx) })
         }
@@ -414,6 +476,7 @@ pub mod boundary {
             loop {
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
+                        BOUNDARY_STATS.timed_out.fetch_add(1, Ordering::Relaxed);
                         return Err(BoundaryError::Timeout);
                     }
                 }
@@ -422,10 +485,14 @@ pub mod boundary {
                 match self.tx.try_send(next) {
                     Ok(()) => return Ok(BoundaryTicket { rx: Some(reply_rx) }),
                     Err(TrySendError::Full(returned)) => {
+                        BOUNDARY_STATS.overloaded.fetch_add(1, Ordering::Relaxed);
                         msg = Some(returned);
                         super::sleep(POLL_INTERVAL).await;
                     }
-                    Err(TrySendError::Disconnected(_)) => return Err(BoundaryError::Closed),
+                    Err(TrySendError::Disconnected(_)) => {
+                        BOUNDARY_STATS.closed.fetch_add(1, Ordering::Relaxed);
+                        return Err(BoundaryError::Closed);
+                    }
                 }
             }
         }
@@ -437,7 +504,10 @@ pub mod boundary {
                 match self.rx.try_recv() {
                     Ok(msg) => return Ok(boundary_request(msg)),
                     Err(TryRecvError::Empty) => super::sleep(POLL_INTERVAL).await,
-                    Err(TryRecvError::Disconnected) => return Err(BoundaryError::Closed),
+                    Err(TryRecvError::Disconnected) => {
+                        BOUNDARY_STATS.closed.fetch_add(1, Ordering::Relaxed);
+                        return Err(BoundaryError::Closed);
+                    }
                 }
             }
         }
@@ -453,12 +523,16 @@ pub mod boundary {
                     Err(TryRecvError::Empty) => {
                         let now = Instant::now();
                         if now >= deadline {
+                            BOUNDARY_STATS.timed_out.fetch_add(1, Ordering::Relaxed);
                             return Err(BoundaryError::Timeout);
                         }
                         let sleep_for = deadline.saturating_duration_since(now).min(POLL_INTERVAL);
                         super::sleep(sleep_for).await;
                     }
-                    Err(TryRecvError::Disconnected) => return Err(BoundaryError::Closed),
+                    Err(TryRecvError::Disconnected) => {
+                        BOUNDARY_STATS.closed.fetch_add(1, Ordering::Relaxed);
+                        return Err(BoundaryError::Closed);
+                    }
                 }
             }
         }
@@ -895,6 +969,31 @@ pub struct RuntimeStats {
     pub ring_msgs_backpressure: u64,
     pub native_affinity_violations: u64,
     pub pending_native_ops: u64,
+}
+
+impl RuntimeStats {
+    pub fn total_command_depth(&self) -> usize {
+        self.shard_command_depths.iter().sum()
+    }
+
+    pub fn max_command_depth(&self) -> usize {
+        self.shard_command_depths.iter().copied().max().unwrap_or(0)
+    }
+
+    pub fn max_pending_native_ops_by_shard(&self) -> usize {
+        self.pending_native_ops_by_shard
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn steal_success_rate(&self) -> f64 {
+        if self.steal_attempts == 0 {
+            return 0.0;
+        }
+        self.steal_success as f64 / self.steal_attempts as f64
+    }
 }
 
 #[cfg(target_os = "linux")]

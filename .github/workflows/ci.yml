@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: ["master"]
+  schedule:
+    - cron: "0 4 * * *"
 
 jobs:
   test-and-build:
@@ -34,3 +36,26 @@ jobs:
 
       - name: Fanout perf guardrail
         run: ./scripts/bench_fanout_guardrail.sh
+
+      - name: Ping percentile guardrails
+        run: |
+          ./scripts/bench_tail_guardrail.sh steady_ping_pong_rtt tokio_two_worker spargio_io_uring
+          ./scripts/bench_tail_guardrail.sh steady_one_way_send_drain tokio_two_worker spargio_io_uring
+          ./scripts/bench_tail_guardrail.sh cold_start_ping_pong tokio_two_worker spargio_io_uring
+
+      - name: Fanout percentile guardrails
+        run: |
+          MAX_P50_RATIO=2.5 MAX_P95_RATIO=2.5 MAX_P99_RATIO=2.5 ./scripts/bench_tail_guardrail.sh fanout_fanin_balanced tokio_mt_4 spargio_io_uring
+          MAX_P50_RATIO=2.5 MAX_P95_RATIO=2.5 MAX_P99_RATIO=2.5 ./scripts/bench_tail_guardrail.sh fanout_fanin_skewed tokio_mt_4 spargio_io_uring
+
+  nightly-soak:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Soak tests (ignored)
+        run: cargo test --features uring-native --test stress_tdd -- --ignored

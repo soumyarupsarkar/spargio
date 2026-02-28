@@ -156,6 +156,10 @@ fn stats_snapshot_tracks_messages_and_spawns() {
     assert!(stats.spawn_pinned_submitted >= 2);
     assert!(stats.ring_msgs_submitted >= 1);
     assert!(stats.ring_msgs_completed >= 1);
+    assert!(stats.total_command_depth() <= 2);
+    assert!(stats.max_command_depth() <= 2);
+    assert!(stats.max_pending_native_ops_by_shard() <= 1);
+    assert!(stats.steal_success_rate().is_finite());
 }
 
 #[cfg(target_os = "linux")]

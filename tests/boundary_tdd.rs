@@ -25,6 +25,43 @@ async fn boundary_wait_timeout_reports_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_stats_capture_timeout_cancel_and_overload() {
+    boundary::reset_stats_for_tests();
+    {
+        let (client, _server) = boundary::channel::<u64, u64>(1);
+        let _first = client.try_call(1).expect("first queued");
+        match client.try_call(2) {
+            Ok(_) => panic!("second call should overflow"),
+            Err(err) => assert_eq!(err, BoundaryError::Overloaded),
+        }
+    }
+
+    {
+        let (client, _server) = boundary::channel::<u64, u64>(1);
+        let ticket = client.call(7).await.expect("queued");
+        let timeout_err = ticket
+            .wait_timeout(Duration::from_millis(10))
+            .await
+            .expect_err("must time out");
+        assert_eq!(timeout_err, BoundaryError::Timeout);
+    }
+
+    {
+        let (client, server) = boundary::channel::<u64, u64>(1);
+        let ticket = client.call(11).await.expect("queued");
+        drop(ticket);
+        let req = server.recv().await.expect("request");
+        let canceled = req.respond(22).expect_err("client canceled");
+        assert_eq!(canceled, BoundaryError::Canceled);
+    }
+
+    let stats = boundary::stats_snapshot();
+    assert!(stats.overloaded >= 1, "expected overloaded count");
+    assert!(stats.timed_out >= 1, "expected timeout count");
+    assert!(stats.canceled >= 1, "expected canceled count");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_server_observes_canceled_client() {
     let (client, server) = boundary::channel::<u64, u64>(1);
 

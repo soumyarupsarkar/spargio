@@ -4690,3 +4690,247 @@ Executed and passing:
 - `cargo test --features uring-native --test uring_native_tdd`
 - `cargo test --features uring-native --test ergonomics_tdd`
 - `cargo test --features uring-native`
+
+## Update: higher-level ecosystem parity check (Compio vs monoio) (2026-02-28)
+
+Context:
+
+- Follow-up comparison for higher-level "not done yet" surfaces:
+  `process`, `signal`, `tls`, `ws`, `quic`.
+
+### Feature presence snapshot
+
+1. Compio
+   - `process`:
+     - available through first-party Compio family surface.
+   - `signal`:
+     - available through first-party Compio family surface.
+   - `tls`:
+     - available through first-party Compio family surface (feature-gated).
+   - `ws`:
+     - available in Compio ecosystem integrations (not a minimal runtime-core primitive).
+   - `quic`:
+     - available in Compio ecosystem integrations (not a minimal runtime-core primitive).
+   - Assessment:
+     - broad coverage with strong first-party/feature-gated story.
+
+2. monoio
+   - `process`:
+     - not a primary monoio-core built-in surface; typically external integration.
+   - `signal`:
+     - available in monoio core behind feature gating.
+   - `tls`:
+     - primarily ecosystem crates/integrations.
+   - `ws`:
+     - primarily ecosystem crate coverage.
+   - `quic`:
+     - primarily ecosystem crate coverage.
+   - Assessment:
+     - slim core with higher-level surfaces mostly delegated to ecosystem crates.
+
+### Implication for Spargio
+
+- Current Spargio direction (core runtime + io_uring-aligned fs/net/io breadth,
+  higher-level protocol/process surfaces deferred) is closer to monoio layering
+  than to Compio's broader first-party family.
+- Recommendation remains:
+  - keep `process/signal/tls/ws/quic` out of `spargio` core for now;
+  - deliver these as extension/companion crates after core fs/net/io parity
+    and stability milestones;
+  - if one is pulled forward, `signal` is the lowest-risk first candidate.
+
+### Recommendation tags
+
+- `process`: add later via companion crate, not core now.
+- `signal`: consider next in companion form; optional core later if justified.
+- `tls`: companion crate target, not core.
+- `ws`: companion crate target, not core.
+- `quic`: companion crate target, not core.
+
+## Update: prioritized roadmap as concrete milestones (2026-02-28)
+
+Converted the current roadmap direction into execution milestones with explicit
+acceptance criteria.
+
+### Milestone M1: production hardening + observability (highest priority)
+
+Scope:
+
+- Add stress/soak/failure-injection coverage for scheduler, boundary, and native
+  fs/net paths.
+- Expand runtime observability for queue depth, steal rates, in-flight native op
+  counts, and timeout/cancellation outcomes.
+- Add long-window p95/p99 benchmark tracking and guardrails.
+
+Acceptance criteria:
+
+- New stress/failure suites pass under `uring-native` in CI/nightly runs.
+- Benchmark guardrail workflow reports p50/p95/p99 for key suites and enforces
+  no-regression thresholds.
+- At least one documented regression triage loop exists (capture -> compare ->
+  bisect -> fix).
+
+### Milestone M2: safe extension API wrappers + cookbook
+
+Scope:
+
+- Define and publish safe wrapper patterns for common unsafe native extension
+  use-cases (ownership, lifetime, affinity, cancellation, fallback strategy).
+- Add cookbook-quality examples for custom opcode submission and validation.
+
+Acceptance criteria:
+
+- Cookbook/examples compile and test in CI.
+- At least one end-to-end extension example avoids direct user-facing unsafe
+  blocks outside the wrapper boundary.
+- Invariants/checklist for extension authors are documented and versioned.
+
+### Milestone M3: docs and API-selection guidance
+
+Scope:
+
+- Expand docs for API selection (`fs/net/io` helpers vs native ops), placement
+  policy choice, and benchmark interpretation.
+- Add migration notes for users coming from Tokio/Compio/monoio surfaces.
+- Stand up an in-repo `mdBook` as the long-form documentation home.
+- Keep root `README.md` content/length stable for now, and add book links once
+  the initial book structure is published.
+
+Acceptance criteria:
+
+- mdBook skeleton and initial chapters are in-repo and build in CI.
+- `README.md` remains concise/current and links to the book after publish.
+- README + guide pages clearly map common tasks to preferred APIs.
+- Placement and latency/throughput tradeoffs are documented with concrete
+  examples.
+- Benchmark methodology is reproducible from documented commands.
+
+### Milestone M4: measured core refinements (only clear-ROI changes)
+
+Scope:
+
+- Evaluate deferred fs helper migration items (`create_dir_all`,
+  `canonicalize`, `metadata`, `symlink_metadata`, `set_permissions`) only when
+  there is measured benefit.
+- Tune work-stealing heuristics based on M1 telemetry, not ad-hoc changes.
+
+Acceptance criteria:
+
+- Each migration/tuning change ships with before/after benchmark data and no
+  correctness regressions.
+- No low-value complexity is added for cases with no measurable user impact.
+- `cargo test`, `cargo test --features uring-native`, and benchmark guardrails
+  remain green.
+
+### Milestone M5: higher-level ecosystem parity via companion crates
+
+Scope:
+
+- Deliver higher-level surfaces outside core in this order:
+  1) `signal` companion crate
+  2) `tls` / `ws` / `quic` integrations
+  3) `process` companion crate
+- Implement companion crates as workspace subcrates in this repository (shared
+  CI, tests, versioning, and release flow).
+- Keep core focused on runtime + io_uring-aligned fs/net/io fundamentals.
+
+Acceptance criteria:
+
+- Companion crates have docs, tests, and minimal examples.
+- Companion crates are wired as workspace members and participate in standard
+  workspace CI checks.
+- Core crate API remains stable/lean and does not absorb large optional stacks.
+- Integration ergonomics are comparable to current core APIs for common use.
+
+### Milestone M6: optional readiness-emulation track (last)
+
+Scope:
+
+- Explore optional Tokio-compat readiness shim (`IORING_OP_POLL_ADD`) only after
+  M1-M5 are stable.
+
+Acceptance criteria:
+
+- Implemented behind explicit opt-in feature gate.
+- Benchmark data shows practical value for targeted readiness-centric workloads.
+- Does not regress default core paths or increase default runtime complexity.
+
+## Update: Milestone M1 implemented (hardening + observability) with Red/Green TDD (2026-02-28)
+
+Executed Milestone M1 scope with explicit red tests first, then implementation
+and validation.
+
+### Red phase
+
+Added failing tests:
+
+1. Boundary outcome observability (`tests/boundary_tdd.rs`)
+   - `boundary_stats_capture_timeout_cancel_and_overload`
+   - expected red failure:
+     - missing `boundary::stats_snapshot`
+     - missing `boundary::reset_stats_for_tests`.
+
+2. Runtime stats helper observability (`tests/slices_tdd.rs`)
+   - extended `stats_snapshot_tracks_messages_and_spawns` to require:
+     - `RuntimeStats::total_command_depth`
+     - `RuntimeStats::max_command_depth`
+     - `RuntimeStats::max_pending_native_ops_by_shard`
+     - `RuntimeStats::steal_success_rate`
+   - expected red failure:
+     - unresolved methods on `RuntimeStats`.
+
+3. Percentile guardrail tooling (`tests/bench_tail_guardrail_tdd.rs`)
+   - `percentile_guardrail_passes_for_fixture_profile`
+   - `percentile_guardrail_fails_when_threshold_is_too_strict`
+   - expected red failure:
+     - missing `scripts/bench_tail_guardrail.sh`.
+
+### Green phase
+
+Implemented:
+
+1. Boundary outcome stats API in `spargio::boundary`
+   - new `BoundaryStats` snapshot struct:
+     - `overloaded`, `timed_out`, `canceled`, `closed`
+   - new APIs:
+     - `boundary::stats_snapshot()`
+     - `boundary::reset_stats_for_tests()`
+   - instrumented boundary paths to record outcomes:
+     - enqueue/try-enqueue overload and closed cases
+     - ticket wait timeout and recv timeout
+     - cancel paths (`respond` with dropped receiver, ticket poll canceled).
+
+2. Runtime observability helper methods
+   - added on `RuntimeStats`:
+     - `total_command_depth()`
+     - `max_command_depth()`
+     - `max_pending_native_ops_by_shard()`
+     - `steal_success_rate()`.
+
+3. p50/p95/p99 guardrail script
+   - added `scripts/bench_tail_guardrail.sh`
+     - consumes Criterion `sample.json`
+     - computes per-iteration p50/p95/p99
+     - enforces `MAX_P50_RATIO`, `MAX_P95_RATIO`, `MAX_P99_RATIO`.
+   - integrated into `scripts/bench_kpi_guardrail.sh`.
+   - added fixture-backed tests under `tests/bench_tail_guardrail_tdd.rs`
+     and `tests/fixtures/criterion/...`.
+
+4. Hardening/soak coverage and nightly execution
+   - added soak tests in `tests/stress_tdd.rs` (ignored by default):
+     - `soak_stealable_burst_completes_without_dropping_tasks`
+     - `soak_boundary_timeout_cancel_overload_paths_accumulate_stats`
+   - CI workflow updates in `.github/workflows/ci.yml`:
+     - added percentile guardrail steps
+     - added nightly scheduled trigger
+     - added `nightly-soak` job running ignored soak tests.
+
+5. Regression triage loop documentation
+   - added `docs/perf_regression_triage.md` with capture/compare/bisect/fix loop.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --test boundary_tdd --test slices_tdd --test bench_tail_guardrail_tdd`
+- `cargo test --test stress_tdd -- --ignored`
