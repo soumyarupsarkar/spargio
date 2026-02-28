@@ -1,11 +1,13 @@
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 mod linux_uring_native_tests {
     use libc;
+    use io_uring::{opcode, types};
     use spargio::{BackendKind, Runtime, RuntimeError};
     use std::fs::{File, OpenOptions};
+    use std::io;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -483,6 +485,69 @@ mod linux_uring_native_tests {
             stats.native_any_local_fastpath_submitted > 0,
             "expected local fast-path submissions to be recorded"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_unsafe_extension_supports_custom_nop() {
+        let Some(rt) = try_build_io_uring_runtime_shards(1) else {
+            return;
+        };
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let out = unsafe {
+            any.submit_unsafe(
+                (),
+                |_| Ok(opcode::Nop::new().build()),
+                |(), cqe| Ok::<i32, io::Error>(cqe.result),
+            )
+            .await
+        }
+        .expect("submit unsafe nop");
+        assert_eq!(out, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_unsafe_extension_supports_custom_read_entry() {
+        let Some(rt) = try_build_io_uring_runtime_shards(1) else {
+            return;
+        };
+        let path = unique_temp_path("uring-native-unsafe-read");
+        let mut file = File::create(&path).expect("create");
+        file.write_all(b"unsafe-path").expect("seed");
+        drop(file);
+
+        let file = OpenOptions::new().read(true).open(&path).expect("open");
+        let any = rt.handle().uring_native_unbound().expect("native any");
+
+        struct RawReadState {
+            fd: RawFd,
+            buf: Vec<u8>,
+        }
+
+        let out = unsafe {
+            any.submit_unsafe(
+                RawReadState {
+                    fd: file.as_raw_fd(),
+                    buf: vec![0u8; 6],
+                },
+                |state| {
+                    let len = u32::try_from(state.buf.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "buffer too large")
+                    })?;
+                    Ok(opcode::Read::new(types::Fd(state.fd), state.buf.as_mut_ptr(), len).build())
+                },
+                |mut state, cqe| {
+                    if cqe.result < 0 {
+                        return Err(io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    state.buf.truncate(cqe.result as usize);
+                    Ok(state.buf)
+                },
+            )
+            .await
+        }
+        .expect("submit unsafe read");
+        assert_eq!(&out, b"unsafe");
         let _ = std::fs::remove_file(path);
     }
 }

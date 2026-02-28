@@ -1520,6 +1520,79 @@ impl UringNativeAny {
             .copied()
     }
 
+    /// Submits a low-level custom `io_uring` operation on an explicit shard.
+    ///
+    /// `state` is retained until completion so extension writers can keep any
+    /// buffers/ownership needed by the SQE alive.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - any pointers/FD references encoded in the built SQE remain valid until
+    ///   completion is delivered for this operation.
+    /// - SQE semantics (opcode, flags, argument layout) are valid for the
+    ///   running kernel and target descriptor.
+    /// - completion decoding in `complete` is correct for the submitted opcode.
+    pub async unsafe fn submit_unsafe_on_shard<S, T, B, C>(
+        &self,
+        shard: ShardId,
+        state: S,
+        build: B,
+        complete: C,
+    ) -> std::io::Result<T>
+    where
+        S: Send + 'static,
+        T: Send + 'static,
+        B: FnOnce(&mut S) -> std::io::Result<io_uring::squeue::Entry> + Send + 'static,
+        C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
+    {
+        if usize::from(shard) >= self.handle.shard_count() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("invalid shard {shard}"),
+            ));
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let op = NativeUnsafeOpEnvelope::new(state, build, complete, reply_tx);
+        self.dispatch_native_any(
+            shard,
+            NativeAnyCommand::Unsafe {
+                op: Box::new(op),
+            },
+        )?;
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native unsafe op response channel closed",
+            ))
+        })
+    }
+
+    /// Submits a low-level custom `io_uring` operation using current selector policy.
+    ///
+    /// This is equivalent to selecting a shard with `select_shard(...)` and then
+    /// calling [`UringNativeAny::submit_unsafe_on_shard`].
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as [`UringNativeAny::submit_unsafe_on_shard`].
+    pub async unsafe fn submit_unsafe<S, T, B, C>(
+        &self,
+        state: S,
+        build: B,
+        complete: C,
+    ) -> std::io::Result<T>
+    where
+        S: Send + 'static,
+        T: Send + 'static,
+        B: FnOnce(&mut S) -> std::io::Result<io_uring::squeue::Entry> + Send + 'static,
+        C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
+    {
+        let shard = self.selector.select(self.effective_preferred_shard());
+        unsafe { self.submit_unsafe_on_shard(shard, state, build, complete).await }
+    }
+
     pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         self.submit_tracked(
             fd,
@@ -2180,6 +2253,13 @@ pub struct UringRecvSegment {
 pub struct UringRecvMultishotSegments {
     pub buffer: Vec<u8>,
     pub segments: Vec<UringRecvSegment>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UringCqe {
+    pub result: i32,
+    pub flags: u32,
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3887,6 +3967,91 @@ enum LocalCommand {
         fd: RawFd,
         reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
     },
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    SubmitNativeUnsafe {
+        origin_shard: ShardId,
+        op: Box<dyn NativeUnsafeOpDriver>,
+    },
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+trait NativeUnsafeOpDriver: Send {
+    fn build_entry(&mut self) -> std::io::Result<io_uring::squeue::Entry>;
+    fn complete(self: Box<Self>, cqe: UringCqe);
+    fn fail(self: Box<Self>, err: std::io::Error);
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+struct NativeUnsafeOpEnvelope<S, T, B, C>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    B: FnOnce(&mut S) -> std::io::Result<io_uring::squeue::Entry> + Send + 'static,
+    C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
+{
+    state: Option<S>,
+    build: Option<B>,
+    complete: Option<C>,
+    reply: Option<oneshot::Sender<std::io::Result<T>>>,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl<S, T, B, C> NativeUnsafeOpEnvelope<S, T, B, C>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    B: FnOnce(&mut S) -> std::io::Result<io_uring::squeue::Entry> + Send + 'static,
+    C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
+{
+    fn new(state: S, build: B, complete: C, reply: oneshot::Sender<std::io::Result<T>>) -> Self {
+        Self {
+            state: Some(state),
+            build: Some(build),
+            complete: Some(complete),
+            reply: Some(reply),
+        }
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+impl<S, T, B, C> NativeUnsafeOpDriver for NativeUnsafeOpEnvelope<S, T, B, C>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    B: FnOnce(&mut S) -> std::io::Result<io_uring::squeue::Entry> + Send + 'static,
+    C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
+{
+    fn build_entry(&mut self) -> std::io::Result<io_uring::squeue::Entry> {
+        let build = self
+            .build
+            .take()
+            .expect("native unsafe op build closure missing");
+        let state = self
+            .state
+            .as_mut()
+            .expect("native unsafe op state missing before build");
+        build(state)
+    }
+
+    fn complete(mut self: Box<Self>, cqe: UringCqe) {
+        let complete = self
+            .complete
+            .take()
+            .expect("native unsafe op completion closure missing");
+        let state = self
+            .state
+            .take()
+            .expect("native unsafe op state missing on completion");
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(complete(state, cqe));
+        }
+    }
+
+    fn fail(mut self: Box<Self>, err: std::io::Error) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(err));
+        }
+    }
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -3957,6 +4122,9 @@ enum NativeAnyCommand {
     Accept {
         fd: RawFd,
         reply: oneshot::Sender<std::io::Result<(OwnedFd, SocketAddr)>>,
+    },
+    Unsafe {
+        op: Box<dyn NativeUnsafeOpDriver>,
     },
 }
 
@@ -4089,6 +4257,7 @@ impl NativeAnyCommand {
                 fd,
                 reply,
             },
+            Self::Unsafe { op } => LocalCommand::SubmitNativeUnsafe { origin_shard, op },
         }
     }
 
@@ -4165,6 +4334,12 @@ impl NativeAnyCommand {
                     std::io::ErrorKind::BrokenPipe,
                     "native unbound accept command channel closed",
                 )));
+            }
+            Self::Unsafe { op } => {
+                op.fail(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native unsafe op command channel closed",
+                ));
             }
         }
     }
@@ -4819,6 +4994,28 @@ impl ShardBackend {
         let _ = self.driver_mut().submit_native_accept(fd, reply);
     }
 
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_unsafe(
+        &mut self,
+        current_shard: ShardId,
+        origin_shard: ShardId,
+        op: Box<dyn NativeUnsafeOpDriver>,
+        stats: &RuntimeStatsInner,
+    ) {
+        if current_shard != origin_shard {
+            stats
+                .native_affinity_violations
+                .fetch_add(1, Ordering::Relaxed);
+            op.fail(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native io_uring unsafe op violated ring affinity",
+            ));
+            return;
+        }
+
+        let _ = self.driver_mut().submit_native_unsafe(op);
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         {
@@ -4892,6 +5089,9 @@ enum NativeIoOp {
     Timeout {
         timespec: Box<types::Timespec>,
         reply: oneshot::Sender<std::io::Result<()>>,
+    },
+    Unsafe {
+        op: Box<dyn NativeUnsafeOpDriver>,
     },
 }
 
@@ -5285,6 +5485,33 @@ impl IoUringDriver {
 
         if self.push_entry(entry).is_err() {
             self.fail_waiter(waiter_idx);
+            return Err(SendError::Closed);
+        }
+        self.mark_submission_pending()
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    fn submit_native_unsafe(&mut self, op: Box<dyn NativeUnsafeOpDriver>) -> Result<(), SendError> {
+        let native_index = self.native_ops.insert(NativeIoOp::Unsafe { op });
+        self.on_native_submit();
+
+        let entry = match self.native_ops.get_mut(native_index) {
+            Some(NativeIoOp::Unsafe { op }) => match op.build_entry() {
+                Ok(entry) => entry.user_data(native_to_userdata(native_index)),
+                Err(err) => {
+                    self.on_native_complete();
+                    let op = self.native_ops.remove(native_index);
+                    if let NativeIoOp::Unsafe { op } = op {
+                        op.fail(err);
+                    }
+                    return Ok(());
+                }
+            },
+            _ => unreachable!("native unsafe op kind mismatch"),
+        };
+
+        if self.push_entry(entry).is_err() {
+            self.fail_native_op(native_index);
             return Err(SendError::Closed);
         }
         self.mark_submission_pending()
@@ -6212,6 +6439,12 @@ impl IoUringDriver {
                         "native io_uring timeout failed",
                     )));
                 }
+                NativeIoOp::Unsafe { op } => {
+                    op.fail(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring unsafe op failed",
+                    ));
+                }
             }
         }
     }
@@ -6301,6 +6534,12 @@ impl IoUringDriver {
                         std::io::ErrorKind::BrokenPipe,
                         "native io_uring timeout canceled",
                     )));
+                }
+                NativeIoOp::Unsafe { op } => {
+                    op.fail(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native io_uring unsafe op canceled",
+                    ));
                 }
             }
         }
@@ -6733,6 +6972,9 @@ impl IoUringDriver {
                     return;
                 }
                 let _ = reply.send(Ok(()));
+            }
+            NativeIoOp::Unsafe { op } => {
+                op.complete(UringCqe { result, flags });
             }
         }
     }
@@ -7400,6 +7642,10 @@ fn drain_local_commands(
                 fd,
                 reply,
             } => backend.submit_native_accept(shard_id, origin_shard, fd, reply, stats),
+            #[cfg(all(feature = "uring-native", target_os = "linux"))]
+            LocalCommand::SubmitNativeUnsafe { origin_shard, op } => {
+                backend.submit_native_unsafe(shard_id, origin_shard, op, stats)
+            }
         }
     }
 }

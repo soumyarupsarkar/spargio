@@ -119,7 +119,9 @@ For performance, different workload shapes favor different runtimes.
 - Work-stealing scheduler MVP with backpressure and runtime stats.
 - Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
 - Runtime entry ergonomics: async-first `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
+- Local `!Send` ergonomics: `run_local_on(...)` and `RuntimeHandle::spawn_local_on(...)` for shard-pinned local futures.
 - Unbound native API: `RuntimeHandle::uring_native_unbound() -> UringNativeAny` with file ops (`read_at`, `read_at_into`, `write_at`, `fsync`) and stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`), plus submission-time shard selector, FD affinity leases, and active op route tracking.
+- Low-level unsafe native extension API: `UringNativeAny::{submit_unsafe, submit_unsafe_on_shard}` for custom SQE/CQE workflows in external extensions.
 - Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` and `spargio::net::{TcpListener, TcpStream}`.
 - Native setup path on Linux io_uring lane: `open/connect/accept` are nonblocking and routed through native setup ops (no helper-thread `run_blocking` wrappers in public fs/net setup APIs).
 - Native timeout path on io_uring lane: `UringNativeAny::sleep(...)` and shard-context `spargio::sleep(...)` route through `IORING_OP_TIMEOUT`.
@@ -131,7 +133,8 @@ For performance, different workload shapes favor different runtimes.
 
 ## What's Not Done Yet
 
-- Broader filesystem and network native-op surface (beyond current MVP set, including richer open/metadata/fs management and broader socket operations).
+- Broader built-in filesystem and network native-op surface (beyond current MVP set, including richer open/metadata/fs management and broader socket operations).
+- Safe wrapper ecosystem and cookbook around the unsafe native extension API (patterns, invariants, and reusable extension crates).
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.

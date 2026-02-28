@@ -4064,3 +4064,69 @@ Result:
 - Spargio now supports a direct top-level local entry and handle-level local
   spawn path for `!Send` futures, reducing friction for shard-local state
   patterns (`Rc`, `RefCell`, etc.) while preserving existing shard-safety model.
+
+## Update: low-level unsafe native extension API slice (2026-02-28)
+
+Recorded proposal and implemented it in this slice:
+
+- add a low-level unsafe extension lane so external crates can submit custom
+  SQE/CQE workflows without editing Spargio core for each new operation.
+- keep high-level fs/net APIs safe and unchanged; isolate risk in explicit
+  unsafe extension entry points.
+
+### Red phase
+
+Added new tests in `tests/uring_native_tdd.rs` for extension use-cases:
+
+- `uring_native_unbound_unsafe_extension_supports_custom_nop`
+- `uring_native_unbound_unsafe_extension_supports_custom_read_entry`
+
+These encode the intended external-writer workflow:
+
+- provide extension-owned state
+- build a custom SQE from that state
+- decode CQE into a typed result
+
+### Green phase
+
+Implemented low-level unsafe API on `UringNativeAny`:
+
+- `unsafe submit_unsafe(...)`
+- `unsafe submit_unsafe_on_shard(...)`
+
+Added new public completion type:
+
+- `UringCqe { result, flags }`
+
+Internal runtime wiring added:
+
+- new internal native command variant carrying extension op envelopes
+- extension op envelope retained in runtime until completion
+- SQE built on target shard, user data overridden by runtime tracking key
+- completion/failure paths return typed result through oneshot
+- dispatch integrated with existing fast path / envelope path and affinity
+  violation guardrails
+
+### Validation
+
+Commands run:
+
+- `cargo test --features uring-native --test uring_native_tdd uring_native_unbound_unsafe_extension_supports_custom_nop`
+- `cargo test --features uring-native --test uring_native_tdd uring_native_unbound_unsafe_extension_supports_custom_read_entry`
+- `cargo test --features uring-native --test runtime_tdd --test uring_native_tdd`
+
+Result:
+
+- new unsafe-extension tests pass.
+- full `runtime_tdd` and `uring_native_tdd` suites pass.
+
+### Docs sync
+
+README updated to reflect completed status:
+
+- added done bullets for:
+  - `!Send` ergonomics (`run_local_on`, `RuntimeHandle::spawn_local_on`)
+  - low-level unsafe extension API (`UringNativeAny::{submit_unsafe, submit_unsafe_on_shard}`)
+- reviewed done/not-done sections and adjusted wording:
+  - "broader built-in fs/net surface" remains not done
+  - added safe-wrapper/cookbook work for unsafe extension API to not-done backlog
