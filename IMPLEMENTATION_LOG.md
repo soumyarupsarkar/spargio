@@ -3906,3 +3906,36 @@ Follow-up planned:
 - Add user-facing documentation for these knobs (what each knob does, semantic
   trade-offs, recommended workload shapes, and safe defaults), plus a short
   tuning guide in README/docs.
+
+## Update: flaky `uring-native` CI test fixed (2026-02-28)
+
+Observed:
+
+- CI run `22511780569` failed at `Cargo test (uring-native)` with exit code 101.
+- Failure was intermittent and initially non-reproducible on a single local run.
+
+Root cause:
+
+- `coalesced_hot_count_accumulates_across_batches` in `tests/runtime_tdd.rs` had
+  a race in test logic.
+- The receiver polled `try_take_hot_count(61)` in a loop and could consume the
+  first coalesced update (`3`) before the second batch (`+3`) arrived, causing
+  occasional `left: 3, right: 6`.
+
+Fix:
+
+- Made the test deterministic by introducing a non-coalesced barrier tag and
+  waiting for a barrier event before reading the hot counter.
+- Updated the test to assert total hot count only after both sends are known to
+  have been delivered to the target shard.
+
+Validation:
+
+- `cargo test --features uring-native --test runtime_tdd coalesced_hot_count_accumulates_across_batches`
+- 50x stress loop of that single test: all pass.
+- `cargo test --features uring-native`: pass.
+
+Outcome:
+
+- Removed known flake in `uring-native` test suite.
+- No runtime behavior change; this was a test synchronization fix.

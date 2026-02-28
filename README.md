@@ -21,7 +21,7 @@ Add `spargio` as a dependency:
 cargo add spargio --features macros,uring-native
 ```
 
-Then use it for native IO operations and stealable task spawning:
+Then use it for native I/O operations and stealable task spawning:
 ```rust
 use spargio::{fs::File, net::TcpListener, RuntimeHandle};
 
