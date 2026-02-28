@@ -4842,15 +4842,17 @@ Acceptance criteria:
 - Core crate API remains stable/lean and does not absorb large optional stacks.
 - Integration ergonomics are comparable to current core APIs for common use.
 
-### Milestone M6: optional readiness-emulation track (last)
+### Milestone M6: optional readiness-emulation track (deprioritized backlog)
 
 Scope:
 
-- Explore optional Tokio-compat readiness shim (`IORING_OP_POLL_ADD`) only after
-  M1-M5 are stable.
+- Explicitly deprioritized for now.
+- Reconsider optional Tokio-compat readiness shim (`IORING_OP_POLL_ADD`) only
+  after M1-M5 are stable and after concrete demand is demonstrated.
 
 Acceptance criteria:
 
+- Not planned in the current execution window.
 - Implemented behind explicit opt-in feature gate.
 - Benchmark data shows practical value for targeted readiness-centric workloads.
 - Does not regress default core paths or increase default runtime complexity.
@@ -5181,3 +5183,212 @@ Executed and passing:
 - `cargo test --test workspace_companions_tdd`
 - `cargo test --workspace`
 - `cargo test --workspace --features uring-native`
+
+## Update: execution breakdown to reach deep protocol adapters + polished APIs (2026-02-28)
+
+Captured a concrete implementation plan for completing the remaining higher-level
+ecosystem maturity work.
+
+Bridge-first principle for these phases:
+
+- prefer proven upstream protocol/runtime crates and build thin `spargio-*`
+  adapters around them.
+- keep runtime integration value in `spargio` (timeouts/cancellation,
+  instrumentation, placement ergonomics), while avoiding protocol reimplementation
+  in core.
+- keep protocol engines swappable behind stable companion-crate APIs.
+
+### Phase 1: foundation layer (2-3 weeks)
+
+Scope:
+
+- freeze public API contracts for companion crates (`signal`, `process`, `tls`,
+  `ws`, `quic`).
+- define shared error taxonomy and conversions.
+- add/finish `spargio::io` compatibility adapters needed by protocol crates.
+- standardize timeout/cancellation/close semantics across companion crates.
+- decide and document upstream bridge backends:
+  - TLS: `rustls` + `futures-rustls`.
+  - WS: `async-tungstenite` as default path; optional high-performance path via
+    `fastwebsockets` where fit is proven.
+  - QUIC: `quinn` first.
+  - process: `async-process` bridge.
+  - signal: `signal-hook`/`async-signal` style bridge model.
+
+Done criteria:
+
+- RFC-style contract docs checked in.
+- compile-tested API skeletons.
+- conformance tests for shared semantics.
+- backend-selection rationale and compatibility policy documented.
+
+### Phase 2: TLS deep adapter (3-5 weeks)
+
+Scope:
+
+- add `spargio-tls` companion crate (thin wrapper over
+  `rustls`/`futures-rustls`, not a new TLS engine).
+- implement connector/acceptor/stream APIs.
+- implement handshake timeout/cancel semantics and ALPN/SNI config surface.
+- add client/server interop tests.
+
+Done criteria:
+
+- stable TLS API for common client/server flows.
+- interop + stress tests passing.
+- cookbook/example coverage for common TLS service patterns.
+
+### Phase 3: WebSocket deep adapter (2-4 weeks)
+
+Scope:
+
+- add `spargio-ws` companion crate.
+- bridge to `async-tungstenite` first for broad interop; evaluate
+  `fastwebsockets` as an optional backend for high-throughput paths.
+- implement handshake APIs for client/server.
+- implement frame/message API (`text`, `binary`, `ping/pong`, close).
+- add fragmentation/backpressure/size-limit controls.
+
+Done criteria:
+
+- interoperable ws client/server examples.
+- conformance tests for close/ping/pong and framing paths.
+- documented limits and backpressure behavior.
+
+### Phase 4: QUIC deep adapter (6-12 weeks)
+
+Scope:
+
+- add `spargio-quic` companion crate (quinn-first path).
+- keep transport/protocol core in `quinn`; `spargio-quic` provides runtime
+  integration and ergonomic API shaping.
+- implement endpoint/connect/accept lifecycle APIs.
+- implement uni/bi streams + datagram APIs.
+- add config builder surface (timeouts/flow-control/congestion knobs).
+
+Done criteria:
+
+- stable endpoint/connection/stream/dgram APIs.
+- interop/load tests passing.
+- operational docs for tuning and shutdown semantics.
+
+### Phase 5: process/signal maturity pass (2-3 weeks)
+
+Scope:
+
+- evolve current `spargio-process` and `spargio-signal` from minimal bridges to
+  richer production APIs.
+- process path: solidify `async-process`-style bridge ergonomics with cancellation
+  and stdio behavior consistency.
+- signal path: `signal-hook`/`async-signal` bridge with robust subscription and
+  shutdown semantics.
+- process: lifecycle + stdio handling polish.
+- signal: richer subscription ergonomics and graceful-shutdown recipes.
+
+Done criteria:
+
+- expanded APIs with tests for lifecycle/race cases.
+- cookbook examples for service shutdown and child-process orchestration.
+
+### Phase 6: hardening + operations (3-5 weeks, overlaps phases 2-5)
+
+Scope:
+
+- failure-injection, stress/soak suites for companion protocol paths.
+- p50/p95/p99 guardrail expansion for protocol benchmarks.
+- observability hooks and regression triage workflow maturity.
+- upstream compatibility matrix in CI (selected backend versions) to catch
+  bridge drift early.
+
+Done criteria:
+
+- nightly/CI hardening lanes in place and stable.
+- measurable long-window tail-latency tracking with gates.
+
+### Phase 7: docs + polish (2-3 weeks, overlaps late phases)
+
+Scope:
+
+- expand mdBook protocol coverage and API selection guidance.
+- migration docs and production checklists.
+- semver/deprecation policy for companion crates.
+- explicit "use direct upstream crate vs use `spargio-*` adapter" guidance for
+  each protocol domain.
+
+Done criteria:
+
+- publish-grade docs for all companion crates.
+- clear migration paths and stability guarantees documented.
+
+### Recommended sequencing
+
+1. Foundation
+2. TLS + WS in parallel
+3. QUIC
+4. process/signal maturity
+5. hardening/docs finalization across all crates
+
+### Effort estimate
+
+- single engineer: ~4-6 months
+- 2-3 engineers in parallel: ~8-12 weeks for a strong first production-grade cut
+
+## Update: Phase 1 implemented (foundation contracts + semantics + io compatibility) with Red/Green TDD (2026-02-28)
+
+Executed a concrete Phase 1 slice with red-first tests, then implementation and
+green verification.
+
+### Red tests added first
+
+- `crates/spargio-protocols/tests/foundation_tdd.rs`
+  - `blocking_options_enforce_timeout`
+  - `futures_io_adapter_roundtrip_over_tcp_stream` (Linux + `uring-native`)
+- `crates/spargio-process/tests/foundation_tdd.rs`
+  - `status_with_options_enforces_timeout`
+
+Observed expected red state before implementation:
+
+- unresolved imports/APIs:
+  - `BlockingOptions`, `tls_blocking_with_options`
+  - `CommandOptions`, `status_with_options`
+  - `io_compat::FuturesTcpStream`
+
+### Implementation delivered
+
+`spargio-protocols`:
+
+- added `BlockingOptions` with optional timeout policy.
+- added optioned API variants:
+  - `tls_blocking_with_options`
+  - `ws_blocking_with_options`
+  - `quic_blocking_with_options`
+- kept existing `*_blocking` helpers as defaults over optioned APIs.
+- standardized timeout semantics with `spargio::timeout(...)` -> `io::ErrorKind::TimedOut`.
+- added Linux `uring-native` `futures::io` adapter:
+  - `io_compat::FuturesTcpStream` implements
+    `futures::io::{AsyncRead, AsyncWrite}` over `spargio::net::TcpStream`.
+- added crate feature forwarding:
+  - `uring-native = ["spargio/uring-native"]`.
+
+`spargio-process`:
+
+- added `CommandOptions` with optional timeout policy.
+- added optioned API variants:
+  - `status_with_options`
+  - `output_with_options`
+  - `CommandBuilder::{status_with_options, output_with_options}`
+- kept existing `status`/`output` APIs delegating to default options.
+- standardized timeout semantics with `spargio::timeout(...)` -> `io::ErrorKind::TimedOut`.
+
+Contracts/docs:
+
+- added `docs/companion_contracts.md` to capture baseline shared semantics for
+  companion crates (error mapping, cancellation, timeout, io compatibility).
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test -p spargio-process --test foundation_tdd`
+- `cargo test -p spargio-protocols --test foundation_tdd`
+- `cargo test -p spargio-protocols --features uring-native --test foundation_tdd`

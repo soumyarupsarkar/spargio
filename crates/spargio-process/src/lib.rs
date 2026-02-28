@@ -7,23 +7,60 @@ use spargio::{RuntimeError, RuntimeHandle};
 use std::ffi::OsStr;
 use std::io;
 use std::process::{Command, ExitStatus, Output};
+use std::time::Duration;
 
-pub async fn status(handle: &RuntimeHandle, mut command: Command) -> io::Result<ExitStatus> {
+pub async fn status(handle: &RuntimeHandle, command: Command) -> io::Result<ExitStatus> {
+    status_with_options(handle, command, CommandOptions::default()).await
+}
+
+pub async fn status_with_options(
+    handle: &RuntimeHandle,
+    mut command: Command,
+    options: CommandOptions,
+) -> io::Result<ExitStatus> {
     run_blocking(
         handle,
+        options,
         move || command.status(),
         "process status task canceled",
+        "process status task timed out",
     )
     .await
 }
 
-pub async fn output(handle: &RuntimeHandle, mut command: Command) -> io::Result<Output> {
+pub async fn output(handle: &RuntimeHandle, command: Command) -> io::Result<Output> {
+    output_with_options(handle, command, CommandOptions::default()).await
+}
+
+pub async fn output_with_options(
+    handle: &RuntimeHandle,
+    mut command: Command,
+    options: CommandOptions,
+) -> io::Result<Output> {
     run_blocking(
         handle,
+        options,
         move || command.output(),
         "process output task canceled",
+        "process output task timed out",
     )
     .await
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommandOptions {
+    timeout: Option<Duration>,
+}
+
+impl CommandOptions {
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    fn timeout(self) -> Option<Duration> {
+        self.timeout
+    }
 }
 
 pub struct CommandBuilder {
@@ -55,15 +92,33 @@ impl CommandBuilder {
         status(handle, self.command).await
     }
 
+    pub async fn status_with_options(
+        self,
+        handle: &RuntimeHandle,
+        options: CommandOptions,
+    ) -> io::Result<ExitStatus> {
+        status_with_options(handle, self.command, options).await
+    }
+
     pub async fn output(self, handle: &RuntimeHandle) -> io::Result<Output> {
         output(handle, self.command).await
+    }
+
+    pub async fn output_with_options(
+        self,
+        handle: &RuntimeHandle,
+        options: CommandOptions,
+    ) -> io::Result<Output> {
+        output_with_options(handle, self.command, options).await
     }
 }
 
 async fn run_blocking<T, F>(
     handle: &RuntimeHandle,
+    options: CommandOptions,
     f: F,
     canceled_msg: &'static str,
+    timeout_msg: &'static str,
 ) -> io::Result<T>
 where
     T: Send + 'static,
@@ -72,8 +127,14 @@ where
     let join = handle
         .spawn_blocking(f)
         .map_err(runtime_error_to_io_for_blocking)?;
-    join.await
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, canceled_msg))?
+    let joined = match options.timeout() {
+        Some(duration) => match spargio::timeout(duration, join).await {
+            Ok(result) => result,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_msg)),
+        },
+        None => join.await,
+    };
+    joined.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, canceled_msg))?
 }
 
 fn runtime_error_to_io_for_blocking(err: RuntimeError) -> io::Error {
@@ -94,6 +155,7 @@ fn runtime_error_to_io_for_blocking(err: RuntimeError) -> io::Error {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use std::time::Duration;
 
     fn success_command() -> Command {
         if cfg!(windows) {
@@ -139,5 +201,31 @@ mod tests {
                 .expect("status")
         });
         assert!(status.success());
+    }
+
+    #[test]
+    fn status_with_options_timeout_fails() {
+        let rt = spargio::Runtime::builder()
+            .shards(1)
+            .build()
+            .expect("runtime");
+        let err = block_on(async {
+            status_with_options(
+                &rt.handle(),
+                if cfg!(windows) {
+                    let mut cmd = Command::new("cmd");
+                    cmd.args(["/C", "ping -n 2 127.0.0.1 > nul"]);
+                    cmd
+                } else {
+                    let mut cmd = Command::new("sh");
+                    cmd.args(["-c", "sleep 0.1"]);
+                    cmd
+                },
+                CommandOptions::default().with_timeout(Duration::from_millis(5)),
+            )
+            .await
+            .expect_err("timeout")
+        });
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
