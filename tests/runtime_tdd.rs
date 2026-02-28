@@ -565,6 +565,16 @@ fn coalesced_hot_tag_absorbs_batch_under_tight_queue_capacity() {
     assert_eq!(count, 6);
 }
 
+#[test]
+fn runtime_builder_thread_affinity_option_builds_runtime() {
+    let rt = Runtime::builder()
+        .shards(1)
+        .thread_affinity([0usize])
+        .build()
+        .expect("runtime");
+    drop(rt);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coalesced_hot_count_accumulates_across_batches() {
     const HOT_TAG: u16 = 61;

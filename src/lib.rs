@@ -22,9 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -244,6 +242,18 @@ fn socket_addr_from_storage(
             format!("unsupported sockaddr family from accept completion: {family}"),
         )),
     }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+fn path_to_cstring_for_native_ops(path: &std::path::Path) -> std::io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains interior NUL byte",
+        )
+    })
 }
 
 pub mod boundary {
@@ -494,6 +504,69 @@ pub async fn sleep(duration: Duration) {
     let _ = rx.await;
 }
 
+pub async fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline <= now {
+        return;
+    }
+    sleep(deadline.saturating_duration_since(now)).await;
+}
+
+pub struct Sleep {
+    deadline: Instant,
+    fut: Pin<Box<dyn Future<Output = ()> + 'static>>,
+    elapsed: bool,
+}
+
+impl Sleep {
+    pub fn new(duration: Duration) -> Self {
+        Self::until(Instant::now() + duration)
+    }
+
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            fut: Box::pin(sleep_until(deadline)),
+            elapsed: false,
+        }
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn is_elapsed(&self) -> bool {
+        self.elapsed || Instant::now() >= self.deadline
+    }
+
+    pub fn reset(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+        self.elapsed = false;
+        self.fut = Box::pin(sleep_until(deadline));
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.elapsed {
+            return Poll::Ready(());
+        }
+        if Instant::now() >= self.deadline {
+            self.elapsed = true;
+            return Poll::Ready(());
+        }
+        match self.fut.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.elapsed = true;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 pub async fn timeout<F>(duration: Duration, fut: F) -> Result<F::Output, TimeoutError>
 where
     F: Future,
@@ -503,6 +576,100 @@ where
     match select(fut.as_mut(), timer.as_mut()).await {
         Either::Left((value, _)) => Ok(value),
         Either::Right((_, _)) => Err(TimeoutError),
+    }
+}
+
+pub async fn timeout_at<F>(deadline: Instant, fut: F) -> Result<F::Output, TimeoutError>
+where
+    F: Future,
+{
+    timeout(deadline.saturating_duration_since(Instant::now()), fut).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedTickBehavior {
+    Burst,
+    Delay,
+    Skip,
+}
+
+impl Default for MissedTickBehavior {
+    fn default() -> Self {
+        Self::Burst
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Interval {
+    period: Duration,
+    next: Instant,
+    missed_tick_behavior: MissedTickBehavior,
+}
+
+impl Interval {
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
+    pub fn missed_tick_behavior(&self) -> MissedTickBehavior {
+        self.missed_tick_behavior
+    }
+
+    pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
+        self.missed_tick_behavior = behavior;
+    }
+
+    pub async fn tick(&mut self) -> Instant {
+        let scheduled = self.next;
+        sleep_until(scheduled).await;
+        let now = Instant::now();
+        self.next = compute_next_tick(
+            self.next,
+            self.period,
+            self.missed_tick_behavior,
+            now.max(scheduled),
+        );
+        scheduled
+    }
+}
+
+pub fn interval(period: Duration) -> Interval {
+    interval_at(Instant::now(), period)
+}
+
+pub fn interval_at(start: Instant, period: Duration) -> Interval {
+    assert!(period > Duration::ZERO, "`period` must be non-zero");
+    Interval {
+        period,
+        next: start,
+        missed_tick_behavior: MissedTickBehavior::Burst,
+    }
+}
+
+fn compute_next_tick(
+    scheduled: Instant,
+    period: Duration,
+    behavior: MissedTickBehavior,
+    now: Instant,
+) -> Instant {
+    match behavior {
+        MissedTickBehavior::Burst => scheduled + period,
+        MissedTickBehavior::Delay => now + period,
+        MissedTickBehavior::Skip => {
+            if now <= scheduled {
+                return scheduled + period;
+            }
+            let elapsed = now.saturating_duration_since(scheduled);
+            let step = period.as_nanos();
+            if step == 0 {
+                return now;
+            }
+            let ticks_missed = elapsed.as_nanos() / step + 1;
+            let jump = period
+                .checked_mul(ticks_missed.min(u128::from(u32::MAX)) as u32)
+                .unwrap_or(Duration::MAX);
+            scheduled.checked_add(jump).unwrap_or(now + period)
+        }
     }
 }
 
@@ -755,6 +922,7 @@ impl Default for IoUringBuildConfig {
 pub struct RuntimeBuilder {
     shards: usize,
     thread_prefix: String,
+    thread_affinity: Vec<usize>,
     backend: BackendKind,
     ring_entries: u32,
     msg_ring_queue_capacity: usize,
@@ -772,6 +940,7 @@ impl Default for RuntimeBuilder {
         Self {
             shards: std::thread::available_parallelism().map_or(1, usize::from),
             thread_prefix: "spargio-shard".to_owned(),
+            thread_affinity: Vec::new(),
             backend: BackendKind::IoUring,
             ring_entries: 256,
             msg_ring_queue_capacity: 4096,
@@ -798,6 +967,17 @@ impl RuntimeBuilder {
 
     pub fn thread_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.thread_prefix = prefix.into();
+        self
+    }
+
+    pub fn thread_affinity<I>(mut self, cpus: I) -> Self
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut cpus = cpus.into_iter().collect::<Vec<_>>();
+        cpus.sort_unstable();
+        cpus.dedup();
+        self.thread_affinity = cpus;
         self
     }
 
@@ -941,6 +1121,7 @@ impl RuntimeBuilder {
                 shared: shared.clone(),
             })
             .collect();
+        let thread_affinity = Arc::new(self.thread_affinity.clone());
 
         let mut joins = Vec::with_capacity(self.shards);
         match self.backend {
@@ -980,6 +1161,7 @@ impl RuntimeBuilder {
                         let stealable_deques = stealable_inboxes.clone();
                         let hot_msg_tags = hot_msg_tags.clone();
                         let coalesced_hot_msg_tags = coalesced_hot_msg_tags.clone();
+                        let thread_affinity = thread_affinity.clone();
                         let thread_name = format!("{}-{}", self.thread_prefix, idx);
                         let runtime_id = shared.runtime_id;
                         let backend = ShardBackend::IoUring(IoUringDriver::new(
@@ -994,6 +1176,11 @@ impl RuntimeBuilder {
                         let stats = stats.clone();
 
                         let join = match thread::Builder::new().name(thread_name).spawn(move || {
+                            if let Some(cpu) =
+                                thread_affinity_cpu_for_shard(thread_affinity.as_ref(), idx)
+                            {
+                                let _ = set_current_thread_affinity(cpu);
+                            }
                             run_shard(
                                 runtime_id,
                                 idx as ShardId,
@@ -1034,6 +1221,39 @@ impl RuntimeBuilder {
             is_shutdown: false,
         })
     }
+}
+
+fn thread_affinity_cpu_for_shard(cpus: &[usize], shard_idx: usize) -> Option<usize> {
+    if cpus.is_empty() {
+        return None;
+    }
+    cpus.get(shard_idx % cpus.len()).copied()
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_thread_affinity(cpu: usize) -> std::io::Result<()> {
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_thread_affinity(_cpu: usize) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn shutdown_spawned(
@@ -1255,6 +1475,22 @@ impl RuntimeHandle {
                 spawn_stealable_on_shared(&self.inner.shared, preferred, fut)
             }
         }
+    }
+
+    pub fn spawn_blocking<F, T>(&self, f: F) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        thread::Builder::new()
+            .name("spargio-blocking".to_string())
+            .spawn(move || {
+                let out = f();
+                let _ = tx.send(out);
+            })
+            .map_err(RuntimeError::ThreadSpawn)?;
+        Ok(JoinHandle { rx: Some(rx) })
     }
 
     pub fn stats_snapshot(&self) -> RuntimeStats {
@@ -1555,12 +1791,7 @@ impl UringNativeAny {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let op = NativeUnsafeOpEnvelope::new(state, build, complete, reply_tx);
-        self.dispatch_native_any(
-            shard,
-            NativeAnyCommand::Unsafe {
-                op: Box::new(op),
-            },
-        )?;
+        self.dispatch_native_any(shard, NativeAnyCommand::Unsafe { op: Box::new(op) })?;
         reply_rx.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -1590,7 +1821,10 @@ impl UringNativeAny {
         C: FnOnce(S, UringCqe) -> std::io::Result<T> + Send + 'static,
     {
         let shard = self.selector.select(self.effective_preferred_shard());
-        unsafe { self.submit_unsafe_on_shard(shard, state, build, complete).await }
+        unsafe {
+            self.submit_unsafe_on_shard(shard, state, build, complete)
+                .await
+        }
     }
 
     pub async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
@@ -1685,6 +1919,155 @@ impl UringNativeAny {
             "native unbound open response channel closed",
         )
         .await
+    }
+
+    pub async fn mkdir_at<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        mode: libc::mode_t,
+    ) -> std::io::Result<()> {
+        let path = path_to_cstring_for_native_ops(path.as_ref())?;
+        unsafe {
+            self.submit_unsafe(
+                (path, mode),
+                |state| {
+                    let (path, mode) = state;
+                    Ok(
+                        opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+                            .mode(*mode)
+                            .build(),
+                    )
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    pub async fn unlink_at<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        is_dir: bool,
+    ) -> std::io::Result<()> {
+        let path = path_to_cstring_for_native_ops(path.as_ref())?;
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        unsafe {
+            self.submit_unsafe(
+                (path, flags),
+                |state| {
+                    let (path, flags) = state;
+                    Ok(
+                        opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+                            .flags(*flags)
+                            .build(),
+                    )
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    pub async fn rename_at<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        &self,
+        from: P,
+        to: Q,
+    ) -> std::io::Result<()> {
+        let from = path_to_cstring_for_native_ops(from.as_ref())?;
+        let to = path_to_cstring_for_native_ops(to.as_ref())?;
+        unsafe {
+            self.submit_unsafe(
+                (from, to),
+                |state| {
+                    let (from, to) = state;
+                    Ok(opcode::RenameAt::new(
+                        types::Fd(libc::AT_FDCWD),
+                        from.as_ptr(),
+                        types::Fd(libc::AT_FDCWD),
+                        to.as_ptr(),
+                    )
+                    .build())
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    pub async fn link_at<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        &self,
+        original: P,
+        link: Q,
+    ) -> std::io::Result<()> {
+        let original = path_to_cstring_for_native_ops(original.as_ref())?;
+        let link = path_to_cstring_for_native_ops(link.as_ref())?;
+        unsafe {
+            self.submit_unsafe(
+                (original, link),
+                |state| {
+                    let (original, link) = state;
+                    Ok(opcode::LinkAt::new(
+                        types::Fd(libc::AT_FDCWD),
+                        original.as_ptr(),
+                        types::Fd(libc::AT_FDCWD),
+                        link.as_ptr(),
+                    )
+                    .build())
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    pub async fn symlink_at<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        &self,
+        target: P,
+        linkpath: Q,
+    ) -> std::io::Result<()> {
+        let target = path_to_cstring_for_native_ops(target.as_ref())?;
+        let linkpath = path_to_cstring_for_native_ops(linkpath.as_ref())?;
+        unsafe {
+            self.submit_unsafe(
+                (target, linkpath),
+                |state| {
+                    let (target, linkpath) = state;
+                    Ok(opcode::SymlinkAt::new(
+                        types::Fd(libc::AT_FDCWD),
+                        target.as_ptr(),
+                        linkpath.as_ptr(),
+                    )
+                    .build())
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
     }
 
     pub(crate) async fn connect_on_shard(
@@ -2266,10 +2649,11 @@ pub struct UringCqe {
 pub mod fs {
     use super::{RuntimeError, RuntimeHandle, UringNativeAny};
     use std::ffi::CString;
+    use std::fs::{Metadata, Permissions};
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     const READ_TO_END_CHUNK: usize = 64 * 1024;
@@ -2471,6 +2855,177 @@ pub mod fs {
         }
     }
 
+    pub async fn create_dir<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let path_ref = path.as_ref();
+        match native.mkdir_at(path_ref, 0o777).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let path = path_ref.to_path_buf();
+                run_blocking(handle, move || std::fs::create_dir(path)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn create_dir_all<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        run_blocking(handle, move || std::fs::create_dir_all(path)).await
+    }
+
+    pub async fn remove_file<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let path_ref = path.as_ref();
+        match native.unlink_at(path_ref, false).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let path = path_ref.to_path_buf();
+                run_blocking(handle, move || std::fs::remove_file(path)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn remove_dir<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let path_ref = path.as_ref();
+        match native.unlink_at(path_ref, true).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let path = path_ref.to_path_buf();
+                run_blocking(handle, move || std::fs::remove_dir(path)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        from: P,
+        to: Q,
+    ) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let from_ref = from.as_ref();
+        let to_ref = to.as_ref();
+        match native.rename_at(from_ref, to_ref).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let from = from_ref.to_path_buf();
+                let to = to_ref.to_path_buf();
+                run_blocking(handle, move || std::fs::rename(from, to)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        original: P,
+        link: Q,
+    ) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let original_ref = original.as_ref();
+        let link_ref = link.as_ref();
+        match native.link_at(original_ref, link_ref).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let original = original_ref.to_path_buf();
+                let link = link_ref.to_path_buf();
+                run_blocking(handle, move || std::fs::hard_link(original, link)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        original: P,
+        link: Q,
+    ) -> io::Result<()> {
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io_for_native)?;
+        let original_ref = original.as_ref();
+        let link_ref = link.as_ref();
+        match native.symlink_at(original_ref, link_ref).await {
+            Ok(()) => Ok(()),
+            Err(err) if should_fallback_to_blocking_for_path_op(&err) => {
+                let original = original_ref.to_path_buf();
+                let link = link_ref.to_path_buf();
+                run_blocking(handle, move || std::os::unix::fs::symlink(original, link)).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn metadata<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<Metadata> {
+        let path = path.as_ref().to_path_buf();
+        run_blocking(handle, move || std::fs::metadata(path)).await
+    }
+
+    pub async fn symlink_metadata<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+    ) -> io::Result<Metadata> {
+        let path = path.as_ref().to_path_buf();
+        run_blocking(handle, move || std::fs::symlink_metadata(path)).await
+    }
+
+    pub async fn set_permissions<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+        perm: Permissions,
+    ) -> io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        run_blocking(handle, move || std::fs::set_permissions(path, perm)).await
+    }
+
+    pub async fn canonicalize<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+    ) -> io::Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        run_blocking(handle, move || std::fs::canonicalize(path)).await
+    }
+
+    pub async fn read<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<Vec<u8>> {
+        let file = File::open(handle.clone(), path).await?;
+        file.read_to_end_at(0).await
+    }
+
+    pub async fn read_to_string<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+    ) -> io::Result<String> {
+        let bytes = read(handle, path).await?;
+        String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    pub async fn write<P: AsRef<Path>, B: AsRef<[u8]>>(
+        handle: &RuntimeHandle,
+        path: P,
+        contents: B,
+    ) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(handle.clone(), path)
+            .await?;
+        file.write_all_at(0, contents.as_ref()).await?;
+        file.fsync().await
+    }
+
     fn path_to_cstring(path: &Path) -> io::Result<CString> {
         CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -2478,6 +3033,29 @@ pub mod fs {
                 "path contains interior NUL byte",
             )
         })
+    }
+
+    fn should_fallback_to_blocking_for_path_op(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        )
+    }
+
+    async fn run_blocking<T, F>(handle: &RuntimeHandle, f: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+    {
+        let join = handle
+            .spawn_blocking(f)
+            .map_err(runtime_error_to_io_for_native)?;
+        join.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "blocking helper worker exited before sending result",
+            )
+        })?
     }
 
     fn runtime_error_to_io_for_native(err: RuntimeError) -> io::Error {
@@ -2509,9 +3087,17 @@ pub mod net {
     use std::io;
     use std::net::{
         SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+        UdpSocket as StdUdpSocket,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::net::{
+        SocketAddr as UnixSocketAddr, UnixDatagram as StdUnixDatagram,
+        UnixListener as StdUnixListener, UnixStream as StdUnixStream,
+    };
+    use std::path::Path;
     use std::sync::Arc;
+
+    const IO_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum StreamSessionPolicy {
@@ -2931,6 +3517,421 @@ pub mod net {
         }
     }
 
+    #[derive(Clone)]
+    pub struct UdpSocket {
+        handle: RuntimeHandle,
+        socket: Arc<StdUdpSocket>,
+    }
+
+    impl UdpSocket {
+        pub async fn bind<A>(handle: RuntimeHandle, addr: A) -> io::Result<Self>
+        where
+            A: ToSocketAddrs,
+        {
+            let socket_addr = resolve_first_socket_addr_blocking(addr)?;
+            let socket = StdUdpSocket::bind(socket_addr)?;
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                socket: Arc::new(socket),
+            })
+        }
+
+        pub fn from_std(handle: RuntimeHandle, socket: StdUdpSocket) -> io::Result<Self> {
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                socket: Arc::new(socket),
+            })
+        }
+
+        pub fn as_raw_fd(&self) -> RawFd {
+            self.socket.as_raw_fd()
+        }
+
+        pub fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.socket.local_addr()
+        }
+
+        pub async fn connect<A>(&self, addr: A) -> io::Result<()>
+        where
+            A: ToSocketAddrs,
+        {
+            let socket_addr = resolve_first_socket_addr_blocking(addr)?;
+            self.socket.connect(socket_addr)
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            loop {
+                match self.socket.send(buf) {
+                    Ok(sent) => return Ok(sent),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn recv(&self, len: usize) -> io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; len.max(1)];
+            loop {
+                match self.socket.recv(&mut buf) {
+                    Ok(got) => {
+                        buf.truncate(got.min(buf.len()));
+                        return Ok(buf);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+            loop {
+                match self.socket.send_to(buf, target) {
+                    Ok(sent) => return Ok(sent),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn recv_from(&self, len: usize) -> io::Result<(Vec<u8>, SocketAddr)> {
+            let mut buf = vec![0u8; len.max(1)];
+            loop {
+                match self.socket.recv_from(&mut buf) {
+                    Ok((got, from)) => {
+                        buf.truncate(got.min(buf.len()));
+                        return Ok((buf, from));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub fn handle(&self) -> RuntimeHandle {
+            self.handle.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct UnixStream {
+        native: UringNativeAny,
+        fd: Arc<OwnedFd>,
+        session_shard: ShardId,
+    }
+
+    impl UnixStream {
+        pub async fn connect<P: AsRef<Path>>(handle: RuntimeHandle, path: P) -> io::Result<Self> {
+            Self::connect_with_session_policy(handle, path, StreamSessionPolicy::ContextPreferred)
+                .await
+        }
+
+        pub async fn connect_with_session_policy<P: AsRef<Path>>(
+            handle: RuntimeHandle,
+            path: P,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Self> {
+            let stream = StdUnixStream::connect(path)?;
+            Self::from_std_with_session_policy(handle, stream, policy)
+        }
+
+        pub fn from_std(handle: RuntimeHandle, stream: StdUnixStream) -> io::Result<Self> {
+            Self::from_std_with_session_policy(
+                handle,
+                stream,
+                StreamSessionPolicy::ContextPreferred,
+            )
+        }
+
+        pub fn from_std_with_session_policy(
+            handle: RuntimeHandle,
+            stream: StdUnixStream,
+            policy: StreamSessionPolicy,
+        ) -> io::Result<Self> {
+            let (native, session_shard) = select_native_for_policy(handle, policy)?;
+            stream.set_nonblocking(true)?;
+            Ok(Self {
+                native,
+                fd: Arc::new(stream.into()),
+                session_shard,
+            })
+        }
+
+        pub fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+
+        pub fn session_shard(&self) -> ShardId {
+            self.session_shard
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            let (sent, _) = self.send_owned(buf.to_vec()).await?;
+            Ok(sent)
+        }
+
+        pub async fn recv(&self, len: usize) -> io::Result<Vec<u8>> {
+            let (got, mut buf) = self.recv_owned(vec![0; len.max(1)]).await?;
+            buf.truncate(got.min(buf.len()));
+            Ok(buf)
+        }
+
+        pub async fn send_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.send_owned_from(buf, 0).await
+        }
+
+        async fn send_owned_from(
+            &self,
+            buf: Vec<u8>,
+            offset: usize,
+        ) -> io::Result<(usize, Vec<u8>)> {
+            self.native
+                .send_owned_at_on_shard(self.session_shard, self.as_raw_fd(), buf, offset)
+                .await
+        }
+
+        pub async fn recv_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.recv_owned_from(buf, 0).await
+        }
+
+        async fn recv_owned_from(
+            &self,
+            buf: Vec<u8>,
+            offset: usize,
+        ) -> io::Result<(usize, Vec<u8>)> {
+            self.native
+                .recv_owned_at_on_shard(self.session_shard, self.as_raw_fd(), buf, offset)
+                .await
+        }
+
+        pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+            while !buf.is_empty() {
+                let wrote = self.send(buf).await?;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "send returned zero",
+                    ));
+                }
+                buf = &buf[wrote.min(buf.len())..];
+            }
+            Ok(())
+        }
+
+        pub async fn write_all_owned(&self, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
+            let mut sent = 0usize;
+            while sent < buf.len() {
+                let remaining = buf.len().saturating_sub(sent);
+                let (wrote, returned) = self.send_owned_from(buf, sent).await?;
+                buf = returned;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "send returned zero",
+                    ));
+                }
+                sent = sent.saturating_add(wrote.min(remaining));
+            }
+            Ok(buf)
+        }
+
+        pub async fn read_exact(&self, dst: &mut [u8]) -> io::Result<()> {
+            let mut received = 0usize;
+            let mut scratch = vec![0; dst.len().max(1)];
+            while received < dst.len() {
+                let want = dst.len().saturating_sub(received);
+                if scratch.len() != want {
+                    scratch.resize(want, 0);
+                }
+                let (got, buf) = self.recv_owned(scratch).await?;
+                scratch = buf;
+                if got == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ));
+                }
+                let copy_len = got
+                    .min(scratch.len())
+                    .min(dst.len().saturating_sub(received));
+                dst[received..received + copy_len].copy_from_slice(&scratch[..copy_len]);
+                received += copy_len;
+            }
+            Ok(())
+        }
+
+        pub async fn read_exact_owned(&self, mut dst: Vec<u8>) -> io::Result<Vec<u8>> {
+            let mut received = 0usize;
+            while received < dst.len() {
+                let remaining = dst.len().saturating_sub(received);
+                let (got, returned) = self.recv_owned_from(dst, received).await?;
+                dst = returned;
+                if got == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ));
+                }
+                received = received.saturating_add(got.min(remaining));
+            }
+            Ok(dst)
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct UnixListener {
+        handle: RuntimeHandle,
+        listener: Arc<StdUnixListener>,
+    }
+
+    impl UnixListener {
+        pub async fn bind<P: AsRef<Path>>(handle: RuntimeHandle, path: P) -> io::Result<Self> {
+            let path = path.as_ref();
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+            let listener = StdUnixListener::bind(path)?;
+            listener.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                listener: Arc::new(listener),
+            })
+        }
+
+        pub fn from_std(handle: RuntimeHandle, listener: StdUnixListener) -> io::Result<Self> {
+            listener.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                listener: Arc::new(listener),
+            })
+        }
+
+        pub fn local_addr(&self) -> io::Result<UnixSocketAddr> {
+            self.listener.local_addr()
+        }
+
+        pub async fn accept(&self) -> io::Result<(UnixStream, UnixSocketAddr)> {
+            loop {
+                match self.listener.accept() {
+                    Ok((stream, addr)) => {
+                        let stream = UnixStream::from_std(self.handle.clone(), stream)?;
+                        return Ok((stream, addr));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct UnixDatagram {
+        handle: RuntimeHandle,
+        socket: Arc<StdUnixDatagram>,
+    }
+
+    impl UnixDatagram {
+        pub async fn bind<P: AsRef<Path>>(handle: RuntimeHandle, path: P) -> io::Result<Self> {
+            let path = path.as_ref();
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+            let socket = StdUnixDatagram::bind(path)?;
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                socket: Arc::new(socket),
+            })
+        }
+
+        pub fn from_std(handle: RuntimeHandle, socket: StdUnixDatagram) -> io::Result<Self> {
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                handle,
+                socket: Arc::new(socket),
+            })
+        }
+
+        pub fn local_addr(&self) -> io::Result<UnixSocketAddr> {
+            self.socket.local_addr()
+        }
+
+        pub async fn connect<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+            self.socket.connect(path)
+        }
+
+        pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            loop {
+                match self.socket.send(buf) {
+                    Ok(sent) => return Ok(sent),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn recv(&self, len: usize) -> io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; len.max(1)];
+            loop {
+                match self.socket.recv(&mut buf) {
+                    Ok(got) => {
+                        buf.truncate(got.min(buf.len()));
+                        return Ok(buf);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
+            loop {
+                match self.socket.send_to(buf, path.as_ref()) {
+                    Ok(sent) => return Ok(sent),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub async fn recv_from(&self, len: usize) -> io::Result<(Vec<u8>, UnixSocketAddr)> {
+            let mut buf = vec![0u8; len.max(1)];
+            loop {
+                match self.socket.recv_from(&mut buf) {
+                    Ok((got, from)) => {
+                        buf.truncate(got.min(buf.len()));
+                        return Ok((buf, from));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        super::sleep(IO_RETRY_SLEEP).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        pub fn handle(&self) -> RuntimeHandle {
+            self.handle.clone()
+        }
+    }
+
     fn select_native_for_policy(
         handle: RuntimeHandle,
         policy: StreamSessionPolicy,
@@ -3038,6 +4039,311 @@ pub mod net {
     }
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+pub mod io {
+    #![allow(async_fn_in_trait)]
+
+    use super::net;
+    use std::io;
+    use std::sync::Mutex;
+
+    pub trait AsyncRead {
+        async fn read_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)>;
+    }
+
+    pub trait AsyncWrite {
+        async fn write_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)>;
+    }
+
+    impl AsyncRead for net::TcpStream {
+        async fn read_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.recv_owned(buf).await
+        }
+    }
+
+    impl AsyncWrite for net::TcpStream {
+        async fn write_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.send_owned(buf).await
+        }
+    }
+
+    impl AsyncRead for net::UnixStream {
+        async fn read_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.recv_owned(buf).await
+        }
+    }
+
+    impl AsyncWrite for net::UnixStream {
+        async fn write_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.send_owned(buf).await
+        }
+    }
+
+    pub trait AsyncReadExt: AsyncRead {
+        async fn read_exact_owned(&self, mut dst: Vec<u8>) -> io::Result<Vec<u8>> {
+            let mut received = 0usize;
+            while received < dst.len() {
+                let remaining = dst.len().saturating_sub(received);
+                let (got, out) = self.read_owned(dst).await?;
+                dst = out;
+                if got == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ));
+                }
+                received = received.saturating_add(got.min(remaining));
+            }
+            Ok(dst)
+        }
+    }
+
+    impl<T: AsyncRead + ?Sized> AsyncReadExt for T {}
+
+    pub trait AsyncWriteExt: AsyncWrite {
+        async fn write_all_owned(&self, mut src: Vec<u8>) -> io::Result<Vec<u8>> {
+            let mut sent = 0usize;
+            while sent < src.len() {
+                let remaining = src.len().saturating_sub(sent);
+                let (wrote, out) = self.write_owned(src).await?;
+                src = out;
+                if wrote == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned zero",
+                    ));
+                }
+                sent = sent.saturating_add(wrote.min(remaining));
+            }
+            Ok(src)
+        }
+    }
+
+    impl<T: AsyncWrite + ?Sized> AsyncWriteExt for T {}
+
+    #[derive(Clone)]
+    pub struct ReadHalf<T: Clone> {
+        inner: T,
+    }
+
+    #[derive(Clone)]
+    pub struct WriteHalf<T: Clone> {
+        inner: T,
+    }
+
+    pub fn split<T: Clone>(io: T) -> (ReadHalf<T>, WriteHalf<T>) {
+        (ReadHalf { inner: io.clone() }, WriteHalf { inner: io })
+    }
+
+    impl<T> ReadHalf<T>
+    where
+        T: Clone,
+    {
+        pub fn into_inner(self) -> T {
+            self.inner
+        }
+    }
+
+    impl<T> WriteHalf<T>
+    where
+        T: Clone,
+    {
+        pub fn into_inner(self) -> T {
+            self.inner
+        }
+    }
+
+    impl<T> AsyncRead for ReadHalf<T>
+    where
+        T: AsyncRead + Clone,
+    {
+        async fn read_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.inner.read_owned(buf).await
+        }
+    }
+
+    impl<T> AsyncWrite for WriteHalf<T>
+    where
+        T: AsyncWrite + Clone,
+    {
+        async fn write_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            self.inner.write_owned(buf).await
+        }
+    }
+
+    pub async fn copy_to_vec<R>(
+        reader: &R,
+        dst: &mut Vec<u8>,
+        chunk_size: usize,
+    ) -> io::Result<usize>
+    where
+        R: AsyncRead + ?Sized,
+    {
+        let mut total = 0usize;
+        let chunk_size = chunk_size.max(1);
+        loop {
+            let (got, buf) = reader.read_owned(vec![0u8; chunk_size]).await?;
+            if got == 0 {
+                return Ok(total);
+            }
+            let got = got.min(buf.len());
+            dst.extend_from_slice(&buf[..got]);
+            total = total.saturating_add(got);
+        }
+    }
+
+    pub struct BufReader<R> {
+        inner: R,
+        capacity: usize,
+        stash: Mutex<Vec<u8>>,
+    }
+
+    impl<R> BufReader<R> {
+        pub fn new(inner: R) -> Self {
+            Self {
+                inner,
+                capacity: 8 * 1024,
+                stash: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn with_capacity(inner: R, capacity: usize) -> Self {
+            Self {
+                inner,
+                capacity: capacity.max(1),
+                stash: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl<R> AsyncRead for BufReader<R>
+    where
+        R: AsyncRead,
+    {
+        async fn read_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            {
+                let mut stash = self.stash.lock().expect("buf reader stash lock poisoned");
+                if !stash.is_empty() {
+                    let mut out = buf;
+                    let take = stash.len().min(out.len());
+                    out[..take].copy_from_slice(&stash[..take]);
+                    stash.drain(..take);
+                    return Ok((take, out));
+                }
+            }
+
+            let want = buf.len().max(self.capacity);
+            let (got, tmp) = self.inner.read_owned(vec![0u8; want]).await?;
+            let got = got.min(tmp.len());
+            let mut stash = self.stash.lock().expect("buf reader stash lock poisoned");
+            let mut out = buf;
+            let take = got.min(out.len());
+            out[..take].copy_from_slice(&tmp[..take]);
+            if got > take {
+                stash.extend_from_slice(&tmp[take..got]);
+            }
+            Ok((take, out))
+        }
+    }
+
+    pub struct BufWriter<W> {
+        inner: W,
+        capacity: usize,
+        pending: Mutex<Vec<u8>>,
+    }
+
+    impl<W> BufWriter<W> {
+        pub fn new(inner: W) -> Self {
+            Self {
+                inner,
+                capacity: 8 * 1024,
+                pending: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn with_capacity(inner: W, capacity: usize) -> Self {
+            Self {
+                inner,
+                capacity: capacity.max(1),
+                pending: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub async fn flush(&self) -> io::Result<()>
+        where
+            W: AsyncWrite,
+        {
+            let payload = {
+                let mut pending = self.pending.lock().expect("buf writer lock poisoned");
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                std::mem::take(&mut *pending)
+            };
+            let _ = self.inner.write_all_owned(payload).await?;
+            Ok(())
+        }
+    }
+
+    impl<W> AsyncWrite for BufWriter<W>
+    where
+        W: AsyncWrite,
+    {
+        async fn write_owned(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+            let input_len = buf.len();
+            let flush_payload = {
+                let mut pending = self.pending.lock().expect("buf writer lock poisoned");
+                pending.extend_from_slice(&buf);
+                if pending.len() >= self.capacity {
+                    Some(std::mem::take(&mut *pending))
+                } else {
+                    None
+                }
+            };
+            if let Some(payload) = flush_payload {
+                let _ = self.inner.write_all_owned(payload).await?;
+            }
+            Ok((input_len, buf))
+        }
+    }
+
+    pub mod framed {
+        use super::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+        use std::io;
+
+        pub struct LengthDelimited<R, W> {
+            reader: R,
+            writer: W,
+        }
+
+        impl<R, W> LengthDelimited<R, W>
+        where
+            R: AsyncRead,
+            W: AsyncWrite,
+        {
+            pub fn new(reader: R, writer: W) -> Self {
+                Self { reader, writer }
+            }
+
+            pub async fn write_frame(&mut self, payload: Vec<u8>) -> io::Result<()> {
+                let mut framed = Vec::with_capacity(4 + payload.len());
+                let len = payload.len() as u32;
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&payload);
+                let _ = self.writer.write_all_owned(framed).await?;
+                Ok(())
+            }
+
+            pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
+                let len_buf = self.reader.read_exact_owned(vec![0u8; 4]).await?;
+                let frame_len =
+                    u32::from_be_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
+                self.reader.read_exact_owned(vec![0u8; frame_len]).await
+            }
+        }
+    }
+}
+
 fn spawn_on_shared<F, T>(
     shared: &Arc<RuntimeShared>,
     shard: ShardId,
@@ -3078,7 +4384,8 @@ where
             shard,
             Command::Spawn(Box::pin(async move {
                 let local_join = {
-                    let Some(ctx) = ShardCtx::current().filter(|ctx| ctx.runtime_id() == runtime_id)
+                    let Some(ctx) =
+                        ShardCtx::current().filter(|ctx| ctx.runtime_id() == runtime_id)
                     else {
                         return;
                     };

@@ -4130,3 +4130,563 @@ README updated to reflect completed status:
 - reviewed done/not-done sections and adjusted wording:
   - "broader built-in fs/net surface" remains not done
   - added safe-wrapper/cookbook work for unsafe extension API to not-done backlog
+
+## Update: time/runtime utility parity comparison (Compio + monoio, io_uring fit adjusted) (2026-02-28)
+
+Revised the time/runtime parity recommendations to account for whether each gap
+is:
+
+- `Direct io_uring`: maps directly to io_uring operations.
+- `Hybrid`: io_uring covers the wait/I/O path, while policy/scheduling/control
+  remains user-space runtime logic.
+- `Not io_uring-native`: mostly scheduler/context/ergonomics API surface above
+  kernel I/O.
+
+Context:
+
+- This section is scoped to time/runtime utility APIs (not broader fs/net API
+  breadth).
+- Spargio today already has: `sleep`, `timeout`, `run`, `run_with`,
+  `run_local_on`, `spawn_local_on`, cancellation token, and task group support.
+
+### Compio parity gaps (time/runtime utility scope), io_uring fit, and recommendation
+
+1. Absolute-deadline and interval timer APIs
+   - Missing in Spargio:
+     - `sleep_until`
+     - `timeout_at`
+     - `interval` / `interval_at`
+     - `Interval::tick`
+   - io_uring fit:
+     - `Direct io_uring`:
+       - `sleep_until` via timeout op on the native lane.
+     - `Hybrid`:
+       - `timeout_at` as composition over deadline timer + future race.
+       - interval/tick as runtime policy on top of timer primitives.
+   - Recommendation:
+     - Add.
+   - Priority:
+     - High.
+   - Rationale:
+     - Strong functional value and clear alignment with io_uring timer path.
+
+2. Rich timer object controls
+   - Missing in Spargio:
+     - resettable/introspectable timer object shape (`deadline`/`reset`/
+       elapsed-style helpers).
+   - io_uring fit:
+     - `Hybrid` / mostly `Not io_uring-native` (API ergonomics and runtime timer
+       bookkeeping over timer ops).
+   - Recommendation:
+     - Add a minimal version later.
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Useful, but secondary to shipping base deadline/interval primitives.
+
+3. `spawn_blocking` bridge
+   - Missing in Spargio:
+     - explicit runtime blocking bridge API.
+   - io_uring fit:
+     - `Not io_uring-native` (thread-pool/runtime policy feature).
+   - Recommendation:
+     - Add with strict bounds and opt-in behavior.
+   - Priority:
+     - Medium-high.
+   - Rationale:
+     - Operationally important escape hatch, but not part of io_uring data path.
+
+4. Runtime control surface (`run`/`poll`/`poll_with`/`current_timeout`)
+   - Missing in Spargio:
+     - explicit low-level runtime control API set comparable to Compio.
+   - io_uring fit:
+     - `Hybrid`:
+       - polling/timeout plumbing can map to io_uring waits, but API shape is
+         mostly scheduler-control surface.
+   - Recommendation:
+     - Do not add full stable parity surface now; keep internal or debugging use.
+   - Priority:
+     - Low.
+   - Rationale:
+     - Limited end-user value and higher misuse/maintenance risk.
+
+5. Runtime context API (`enter`/current-runtime access)
+   - Missing in Spargio:
+     - explicit public context-enter/current-runtime model.
+   - io_uring fit:
+     - `Not io_uring-native` (TLS/context ergonomics).
+   - Recommendation:
+     - Defer.
+   - Priority:
+     - Low-medium.
+   - Rationale:
+     - Useful only for narrower extension patterns; easy to misuse if overexposed.
+
+6. `attach(fd)`-style extension-author hook
+   - Missing in Spargio:
+     - public attach hook for custom high-level wrappers.
+   - io_uring fit:
+     - `Hybrid`:
+       - could map to registration/fixed-file strategy, but behavior and benefit
+         are workload-dependent.
+   - Recommendation:
+     - Defer for now.
+   - Priority:
+     - Low.
+   - Rationale:
+     - unsafe extension path already exists; add attach semantics only if measured
+       wrapper use-cases require it.
+
+7. Builder knobs (`thread_affinity`, scheduler `event_interval`)
+   - Missing in Spargio:
+     - explicit builder options matching Compio naming/shape.
+   - io_uring fit:
+     - `Not io_uring-native` (scheduler/thread policy).
+   - Recommendation:
+     - Partial add, benchmark-gated.
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Can help production tuning, but belongs to controlled runtime policy work.
+
+### monoio parity gaps (time/runtime utility scope), io_uring fit, and recommendation
+
+1. Absolute-deadline and interval timer APIs
+   - Missing in Spargio:
+     - `sleep_until`
+     - `timeout_at`
+     - `interval` / `interval_at`
+     - `Interval::tick`
+   - io_uring fit:
+     - same split as Compio analysis: direct timer op base + hybrid interval
+       policy layer.
+   - Recommendation:
+     - Add.
+   - Priority:
+     - High.
+   - Rationale:
+     - Core utility breadth with direct io_uring timer alignment.
+
+2. Interval policy controls (`MissedTickBehavior`, interval metadata)
+   - Missing in Spargio:
+     - missed-tick policy controls and period inspection API.
+   - io_uring fit:
+     - `Not io_uring-native` (runtime policy semantics).
+   - Recommendation:
+     - Add later (after base interval API).
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Valuable for precision semantics, but not required for first parity slice.
+
+3. Resettable/introspectable `Sleep` object
+   - Missing in Spargio:
+     - `Sleep`-style object with `deadline` / `is_elapsed` / `reset`.
+   - io_uring fit:
+     - `Hybrid`:
+       - backed by timeout ops, but object semantics are runtime/user-space layer.
+   - Recommendation:
+     - Add later (minimal form).
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Power-user utility; should follow stable base timer/deadline APIs.
+
+4. `spawn_blocking` + blocking runtime configuration
+   - Missing in Spargio:
+     - blocking bridge and policy knobs.
+   - io_uring fit:
+     - `Not io_uring-native`.
+   - Recommendation:
+     - Add with constrained configuration.
+   - Priority:
+     - Medium-high.
+   - Rationale:
+     - Important operational bridge, but separate from io_uring core mechanics.
+
+### Net decision summary (io_uring-aware)
+
+Add now (direct io_uring base + essential hybrid policy):
+
+- `sleep_until`
+- `timeout_at`
+- `interval` / `interval_at` / `tick` (minimal first version)
+
+Add next (important, mostly non-kernel policy/runtime features):
+
+- `spawn_blocking` with bounded/opt-in policy
+- limited affinity tuning in builder
+
+Add later (power-user timer ergonomics):
+
+- interval missed-tick behavior controls
+- resettable/introspectable timer object (`Sleep`-style surface)
+
+Defer/avoid for now:
+
+- broad public low-level runtime polling/control API parity
+- explicit runtime context enter/current-runtime API
+- `attach(fd)` hook unless concrete, benchmark-backed wrapper demand emerges
+
+## Update: I/O surface parity comparison (Compio + monoio, io_uring fit adjusted) (2026-02-28)
+
+Revised the I/O parity recommendations to explicitly account for whether each
+gap is:
+
+- `Direct io_uring`: has a direct opcode path in current `io-uring` crate.
+- `Hybrid`: hot path can use io_uring, but setup/orchestration still uses
+  regular syscalls or user-space composition.
+- `Not io_uring-native`: mostly trait/adaptor/protocol surface above kernel I/O.
+
+Context:
+
+- This section is scoped to I/O API surface (fs/net/io traits/utilities), not
+  timer/runtime utilities.
+- Spargio today has:
+  - `fs::File` + `OpenOptions` and positional file ops (`read_at`, `write_at`,
+    `read_to_end_at`, `fsync`).
+  - `net::TcpStream` and `net::TcpListener` (session-policy aware APIs).
+  - unbound unsafe extension lane for custom raw io_uring operations.
+
+### Compio parity gaps (I/O surface scope), io_uring fit, and recommendation
+
+1. Filesystem path-level helpers and metadata/perms utility breadth
+   - Missing in Spargio:
+     - path-level helpers like `create_dir`, `create_dir_all`, `remove_file`,
+       `remove_dir`, `rename`, convenience `read`/`write`, and broader metadata/
+       permissions/symlink/hard-link helpers.
+   - io_uring fit:
+     - `Direct io_uring` candidates:
+       - `create_dir` (`MkDirAt`)
+       - `remove_file` / `remove_dir` (`UnlinkAt`)
+       - `rename` (`RenameAt`)
+       - metadata (`Statx`)
+       - symlink/hard-link (`SymlinkAt` / `LinkAt`)
+       - convenience `read`/`write` composed from `OpenAt/OpenAt2 + Read/Write + Close`
+     - `Hybrid` candidates:
+       - `create_dir_all` (userspace recursion + repeated mkdir op)
+       - richer convenience wrappers (`read_to_string`, recursive utilities)
+       - some permissions/canonicalization helpers that may require syscall or
+         userspace fallback paths depending on kernel support
+   - Recommendation:
+     - Add now for direct-op helpers.
+     - Add later for hybrid helpers.
+   - Priority:
+     - High for direct helpers; Medium for hybrid helpers.
+   - Rationale:
+     - This adds high-utility API breadth while staying aligned with Spargio's
+       io_uring-first performance model.
+
+2. Network protocol/socket family breadth
+   - Missing in Spargio:
+     - `UdpSocket`
+     - Unix domain sockets (`UnixStream`, `UnixListener`, `UnixDatagram`)
+   - io_uring fit:
+     - `Direct io_uring` hot path:
+       - `Socket`, `Accept`, `Connect`, `Send`, `Recv`, `SendMsg`, `RecvMsg`,
+         `Shutdown`
+     - `Hybrid` setup/control path:
+       - socket options, bind/listen, DNS/address resolution, feature probing
+   - Recommendation:
+     - Add.
+   - Priority:
+     - High for UDP; Medium-high for Unix sockets.
+   - Rationale:
+     - Strong fit for io_uring data path and large practical adoption win beyond
+       TCP-only coverage.
+
+3. Generic async I/O trait + adapter layer
+   - Missing in Spargio:
+     - Compio-style traits/extensions (`AsyncRead*` / `AsyncWrite*`) and common
+       adapters/utilities (`split`, buffered wrappers, framing/compat layers).
+   - io_uring fit:
+     - `Not io_uring-native` (user-space abstraction layer).
+   - Recommendation:
+     - Add, but as companion crate(s), not in core runtime crate.
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Important ergonomics/interoperability value, but no kernel-path
+       differentiation and substantial maintenance surface.
+
+4. Optional higher-level transport/integration modules
+   - Missing in Spargio:
+     - Compio optional module breadth (`process`, `signal`, `tls`, `ws`, `quic`).
+   - io_uring fit:
+     - Mostly `Not io_uring-native` as runtime-level feature sets; some pieces
+       may use io_uring underneath but are not core io_uring API-surface gaps.
+   - Recommendation:
+     - Defer in core; pursue as ecosystem crates after core fs/net/io parity
+       baseline is complete.
+   - Priority:
+     - Low.
+   - Rationale:
+     - Broad scope with weaker direct alignment to immediate io_uring runtime
+       differentiation.
+
+### monoio parity gaps (I/O surface scope), io_uring fit, and recommendation
+
+1. Filesystem path-level helper breadth
+   - Missing in Spargio:
+     - monoio-style helpers (`read`, `write`, `create_dir`, `create_dir_all`,
+       `remove_file`, `remove_dir`, `rename`) and metadata conveniences.
+   - io_uring fit:
+     - same split as above: direct-op coverage for core helpers, hybrid for
+       recursive/convenience wrappers.
+   - Recommendation:
+     - Add direct-op helpers now; phase in hybrid helpers later.
+   - Priority:
+     - High for direct-op helpers; Medium for hybrid helpers.
+   - Rationale:
+     - Baseline parity and migration ergonomics with strong io_uring alignment.
+
+2. Network breadth beyond TCP
+   - Missing in Spargio:
+     - `UdpSocket`
+     - Unix domain socket APIs.
+   - io_uring fit:
+     - direct-op hot path with hybrid setup path, same as Compio analysis.
+   - Recommendation:
+     - Add.
+   - Priority:
+     - High for UDP; Medium-high for Unix sockets.
+   - Rationale:
+     - Real-world protocol coverage with clear io_uring throughput/latency fit.
+
+3. I/O utility stack (traits + utility wrappers)
+   - Missing in Spargio:
+     - monoio-style utility stack (`copy`, split halves, buffered wrappers,
+       stream/sink adapters, cancelable helpers, zero-copy utility wrappers).
+   - io_uring fit:
+     - mostly `Not io_uring-native` (API composition layer).
+   - Recommendation:
+     - Add a practical subset after core direct-op I/O breadth lands; keep larger
+       utility surface outside core crate.
+   - Priority:
+     - Medium.
+   - Rationale:
+     - Good ergonomics payoff, but should follow direct io_uring-aligned API
+       expansion.
+
+### Net decision summary (io_uring-aware)
+
+Add now (direct io_uring or low-risk hybrid):
+
+- path-level fs helpers that map cleanly to io_uring opcodes
+  (`create_dir`, `remove_file`, `remove_dir`, `rename`, metadata, basic `read`/`write`)
+- UDP socket API
+
+Add next (hybrid or non-kernel surface with strong usability gain):
+
+- Unix domain socket API
+- foundational I/O trait/extensions and core helpers (`split`, `copy`) in
+  companion crate(s)
+
+Add later (mostly composition layers):
+
+- recursive/richer fs convenience helpers (`create_dir_all`, broader wrappers)
+- richer buffered/framed/compat layers
+
+Defer/avoid in core for now:
+
+- large optional integration surfaces (`process`, `signal`, `tls`, `ws`, `quic`)
+  until core io_uring-aligned fs/net parity goals are met
+
+## Update: parity execution sweep (time/runtime + I/O breadth) with red/green TDD (2026-02-28)
+
+Executed the requested implementation sweep for all previously marked
+`add now`, `add next`, and `add later` items in the time/runtime and I/O parity
+sections, then validated with full `uring-native` test pass.
+
+### Red phase
+
+Added failing tests first:
+
+1. Time/runtime primitives (`tests/primitives_tdd.rs`)
+   - `sleep_until_waits_for_deadline`
+   - `timeout_at_returns_err_when_deadline_expires`
+   - `interval_ticks_with_configurable_missed_tick_behavior`
+   - `interval_at_uses_requested_start_deadline`
+   - `sleep_object_supports_deadline_reset_and_elapsed_state`
+   - `runtime_handle_spawn_blocking_executes_closure`
+
+2. Runtime builder tuning (`tests/runtime_tdd.rs`)
+   - `runtime_builder_thread_affinity_option_builds_runtime`
+
+3. I/O breadth (`tests/ergonomics_tdd.rs`)
+   - `fs_path_helpers_cover_common_workflows`
+   - `fs_link_helpers_support_symlink_and_hard_link`
+   - `net_udp_socket_supports_send_recv_and_send_to_recv_from`
+   - `net_unix_stream_listener_and_datagram_cover_core_paths`
+   - `io_helpers_split_copy_and_framed_work`
+
+Red failures were expected:
+
+- unresolved time/runtime symbols (`sleep_until`, `timeout_at`, `interval*`,
+  `Sleep`, `MissedTickBehavior`, `spawn_blocking`, `thread_affinity`).
+- unresolved I/O symbols (`fs` path helpers, `UdpSocket`, `Unix*`, `io` module).
+
+### Green phase
+
+Implemented in `src/lib.rs`:
+
+1. Time/runtime utility breadth
+   - Added:
+     - `sleep_until(Instant)`
+     - `timeout_at(Instant, fut)`
+     - `Sleep` (`new`, `until`, `deadline`, `is_elapsed`, `reset`, `Future`)
+     - `interval(period)`, `interval_at(start, period)`
+     - `Interval::tick`, `Interval::period`,
+       `Interval::{missed_tick_behavior,set_missed_tick_behavior}`
+     - `MissedTickBehavior::{Burst, Delay, Skip}`
+
+2. Runtime utilities/tuning
+   - Added `RuntimeHandle::spawn_blocking(...) -> Result<JoinHandle<_>, RuntimeError>`.
+   - Added `RuntimeBuilder::thread_affinity(...)`.
+   - Wired per-shard thread affinity application during shard thread startup
+     (best-effort, Linux `sched_setaffinity`).
+
+3. Filesystem API breadth
+   - Added path-level async helpers in `spargio::fs`:
+     - `create_dir`, `create_dir_all`, `remove_file`, `remove_dir`, `rename`
+     - `hard_link`, `symlink`
+     - `metadata`, `symlink_metadata`, `set_permissions`, `canonicalize`
+     - convenience `read`, `read_to_string`, `write`
+   - Added internal blocking bridge helper in fs module using
+     `RuntimeHandle::spawn_blocking`.
+
+4. Network API breadth
+   - Added `spargio::net::UdpSocket`:
+     - `bind`, `from_std`, `local_addr`, `connect`
+     - `send`, `recv`, `send_to`, `recv_from`
+   - Added `spargio::net::UnixStream`:
+     - `connect`, `connect_with_session_policy`, `from_std`
+     - `send`/`recv`, owned buffer variants, `write_all`/`read_exact`
+   - Added `spargio::net::UnixListener`:
+     - `bind`, `from_std`, `local_addr`, `accept`
+   - Added `spargio::net::UnixDatagram`:
+     - `bind`, `from_std`, `local_addr`, `connect`
+     - `send`, `recv`, `send_to`, `recv_from`
+
+5. Foundational I/O utility layer
+   - Added `spargio::io` module:
+     - traits: `AsyncRead`, `AsyncWrite` + extension traits
+     - `split(...)` with `ReadHalf` / `WriteHalf`
+     - `copy_to_vec(...)`
+     - lightweight wrappers: `BufReader`, `BufWriter`
+     - framed helper: `io::framed::LengthDelimited::{new, write_frame, read_frame}`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --features uring-native --test primitives_tdd`
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo test --features uring-native --test runtime_tdd --test uring_native_tdd`
+- `cargo test --features uring-native`
+
+Result:
+
+- full `uring-native` test suite passes after the parity sweep.
+
+## Proposal: syscall migration to io_uring for fs path helpers (2026-02-28)
+
+Goal:
+
+- Remove remaining helper-thread `spawn_blocking(std::fs::...)` usage from the
+  high-value `spargio::fs` path APIs where direct io_uring opcodes exist.
+- Keep low-value/hard cases as compatibility paths for now.
+
+Proposed execution model:
+
+1. Add direct unbound native commands + opcodes for path operations:
+   - `MkDirAt` (`create_dir`)
+   - `UnlinkAt` (`remove_file`, `remove_dir` via `AT_REMOVEDIR`)
+   - `RenameAt` (`rename`)
+   - `LinkAt` (`hard_link`)
+   - `SymlinkAt` (`symlink`)
+2. Migrate corresponding `spargio::fs` helpers to native io_uring submission.
+3. Keep these deferred as compatibility wrappers:
+   - `create_dir_all`:
+     - recursive user-space semantics and error behavior matching require extra
+       traversal/orchestration logic; not a single direct opcode operation.
+   - `canonicalize`:
+     - path-resolution semantics are better handled by libc/kernel resolver
+       paths; no direct single-op parity target in current surface.
+   - `metadata`, `symlink_metadata`, `set_permissions`:
+     - current public return/argument types are std wrappers
+       (`std::fs::Metadata` / `Permissions`) not directly constructible from
+       raw `statx` payloads without additional compatibility syscall layers.
+4. Keep red/green TDD workflow:
+   - add failing native fs-op tests first,
+   - implement op plumbing + fs helper migration,
+   - run targeted tests then full `cargo test --features uring-native`.
+
+Acceptance criteria:
+
+- No helper-thread path for: `create_dir`, `remove_file`, `remove_dir`,
+  `rename`, `hard_link`, `symlink`.
+- Deferred items remain clearly documented as compatibility paths.
+- Full `uring-native` test suite remains green.
+
+## Update: syscall migration to io_uring (fs path helpers) implemented (Red/Green TDD) (2026-02-28)
+
+Implemented the proposal slice for direct-op fs path helpers, with explicit
+kernel-support fallback behavior for unsupported opcode errors.
+
+### Red phase
+
+Added failing tests first in `tests/uring_native_tdd.rs`:
+
+- `uring_native_unbound_fs_path_ops_cover_mkdir_rename_link_symlink_and_unlink`
+
+Observed expected red failure:
+
+- compile errors for missing `UringNativeAny` methods:
+  - `mkdir_at`
+  - `unlink_at`
+  - `rename_at`
+  - `link_at`
+  - `symlink_at`
+
+### Green phase
+
+Implemented native io_uring path-op helpers on `UringNativeAny` (in `src/lib.rs`)
+using the existing unsafe extension submission lane internally:
+
+- `mkdir_at(path, mode)` -> `opcode::MkDirAt`
+- `unlink_at(path, is_dir)` -> `opcode::UnlinkAt` (+ `AT_REMOVEDIR` for dirs)
+- `rename_at(from, to)` -> `opcode::RenameAt`
+- `link_at(original, link)` -> `opcode::LinkAt`
+- `symlink_at(target, linkpath)` -> `opcode::SymlinkAt`
+
+Then migrated high-level `spargio::fs` helpers to these native operations:
+
+- `create_dir`
+- `remove_file`
+- `remove_dir`
+- `rename`
+- `hard_link`
+- `symlink`
+
+Compatibility behavior kept intentionally:
+
+- For unsupported opcode errors (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`), the above
+  high-level helpers transparently fall back to prior blocking helper-thread
+  implementations to preserve functionality on older kernels.
+
+Deferred (unchanged, by proposal):
+
+- `create_dir_all`
+- `canonicalize`
+- `metadata`
+- `symlink_metadata`
+- `set_permissions`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --features uring-native --test uring_native_tdd`
+- `cargo test --features uring-native --test ergonomics_tdd`
+- `cargo test --features uring-native`

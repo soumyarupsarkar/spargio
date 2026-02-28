@@ -1,7 +1,7 @@
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 mod linux_uring_native_tests {
-    use libc;
     use io_uring::{opcode, types};
+    use libc;
     use spargio::{BackendKind, Runtime, RuntimeError};
     use std::fs::{File, OpenOptions};
     use std::io;
@@ -43,6 +43,13 @@ mod linux_uring_native_tests {
             Err(RuntimeError::IoUringInit(_)) => None,
             Err(err) => panic!("unexpected runtime init error: {err:?}"),
         }
+    }
+
+    fn is_unsupported_native_fs_path_op(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        )
     }
 
     #[test]
@@ -549,5 +556,72 @@ mod linux_uring_native_tests {
         .expect("submit unsafe read");
         assert_eq!(&out, b"unsafe");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_unbound_fs_path_ops_cover_mkdir_rename_link_symlink_and_unlink() {
+        let Some(rt) = try_build_io_uring_runtime_shards(1) else {
+            return;
+        };
+        let any = rt.handle().uring_native_unbound().expect("native any");
+
+        let base = unique_temp_path("uring-native-path-ops-dir");
+        let src = base.join("src.txt");
+        let renamed = base.join("dst.txt");
+        let hard = base.join("hard.txt");
+        let sym = base.join("sym.txt");
+
+        let mkdir = any.mkdir_at(&base, 0o755).await;
+        if let Err(err) = mkdir {
+            if is_unsupported_native_fs_path_op(&err) {
+                return;
+            }
+            panic!("mkdir_at failed unexpectedly: {err}");
+        }
+
+        std::fs::write(&src, b"path-op-data").expect("seed source");
+
+        let rename = any.rename_at(&src, &renamed).await;
+        if let Err(err) = rename {
+            let _ = std::fs::remove_file(&src);
+            let _ = std::fs::remove_dir(&base);
+            if is_unsupported_native_fs_path_op(&err) {
+                return;
+            }
+            panic!("rename_at failed unexpectedly: {err}");
+        }
+
+        let link = any.link_at(&renamed, &hard).await;
+        if let Err(err) = link {
+            let _ = std::fs::remove_file(&renamed);
+            let _ = std::fs::remove_dir(&base);
+            if is_unsupported_native_fs_path_op(&err) {
+                return;
+            }
+            panic!("link_at failed unexpectedly: {err}");
+        }
+
+        let symlink = any.symlink_at(&renamed, &sym).await;
+        if let Err(err) = symlink {
+            let _ = std::fs::remove_file(&hard);
+            let _ = std::fs::remove_file(&renamed);
+            let _ = std::fs::remove_dir(&base);
+            if is_unsupported_native_fs_path_op(&err) {
+                return;
+            }
+            panic!("symlink_at failed unexpectedly: {err}");
+        }
+
+        let hard_data = std::fs::read(&hard).expect("read hard link");
+        assert_eq!(&hard_data, b"path-op-data");
+        let target = std::fs::read_link(&sym).expect("read symlink");
+        assert_eq!(target, renamed);
+
+        any.unlink_at(&sym, false).await.expect("unlink symlink");
+        any.unlink_at(&hard, false).await.expect("unlink hard link");
+        any.unlink_at(&renamed, false)
+            .await
+            .expect("unlink renamed");
+        any.unlink_at(&base, true).await.expect("unlink dir");
     }
 }

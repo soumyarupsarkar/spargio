@@ -117,12 +117,15 @@ For performance, different workload shapes favor different runtimes.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
 - Work-stealing scheduler MVP with backpressure and runtime stats.
-- Runtime primitives: `sleep`, `timeout`, `CancellationToken`, and `TaskGroup` cooperative cancellation.
+- Runtime primitives: `sleep`, `sleep_until`, `timeout`, `timeout_at`, `Interval`/`interval_at`, `Sleep` (resettable deadline timer), `CancellationToken`, and `TaskGroup` cooperative cancellation.
 - Runtime entry ergonomics: async-first `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
+- Runtime utility bridge knobs: `RuntimeHandle::spawn_blocking(...)` and `RuntimeBuilder::thread_affinity(...)`.
 - Local `!Send` ergonomics: `run_local_on(...)` and `RuntimeHandle::spawn_local_on(...)` for shard-pinned local futures.
 - Unbound native API: `RuntimeHandle::uring_native_unbound() -> UringNativeAny` with file ops (`read_at`, `read_at_into`, `write_at`, `fsync`) and stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`), plus submission-time shard selector, FD affinity leases, and active op route tracking.
 - Low-level unsafe native extension API: `UringNativeAny::{submit_unsafe, submit_unsafe_on_shard}` for custom SQE/CQE workflows in external extensions.
-- Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` and `spargio::net::{TcpListener, TcpStream}`.
+- Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` plus path helpers (`create_dir*`, `rename`, `remove_*`, metadata/link helpers, `read`/`write`), and `spargio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream, UnixDatagram}`.
+- Native-first fs path-op lane on Linux io_uring for high-value helpers (`create_dir`, `remove_file`, `remove_dir`, `rename`, `hard_link`, `symlink`), with compatibility fallback on unsupported opcode kernels.
+- Foundational I/O utility layer: `spargio::io::{AsyncRead, AsyncWrite, split, copy_to_vec, BufReader, BufWriter}` and `io::framed::LengthDelimited`.
 - Native setup path on Linux io_uring lane: `open/connect/accept` are nonblocking and routed through native setup ops (no helper-thread `run_blocking` wrappers in public fs/net setup APIs).
 - Native timeout path on io_uring lane: `UringNativeAny::sleep(...)` and shard-context `spargio::sleep(...)` route through `IORING_OP_TIMEOUT`.
 - Async-first boundary APIs: `call`, `call_with_timeout`, `recv`, `recv_timeout`, and `BoundaryTicket::wait_timeout`.
@@ -133,9 +136,10 @@ For performance, different workload shapes favor different runtimes.
 
 ## What's Not Done Yet
 
-- Broader built-in filesystem and network native-op surface (beyond current MVP set, including richer open/metadata/fs management and broader socket operations).
+- Full higher-level ecosystem parity (`process`, `signal`, `tls`, `ws`, `quic`) and richer optional adapters beyond current core `io` utility layer.
 - Safe wrapper ecosystem and cookbook around the unsafe native extension API (patterns, invariants, and reusable extension crates).
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
+- Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `create_dir_all`, `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths.
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
 - Deeper documentation (`spargio` book / guides for API selection, placement strategy, and benchmark methodology).
