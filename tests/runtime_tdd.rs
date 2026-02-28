@@ -562,28 +562,40 @@ fn coalesced_hot_tag_absorbs_batch_under_tight_queue_capacity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coalesced_hot_count_accumulates_across_batches() {
+    const HOT_TAG: u16 = 61;
+    const BARRIER_TAG: u16 = 63;
+
     let rt = Runtime::builder()
         .shards(2)
-        .hot_msg_tag(61)
-        .coalesced_hot_msg_tag(61)
+        .hot_msg_tag(HOT_TAG)
+        .coalesced_hot_msg_tag(HOT_TAG)
         .build()
         .expect("runtime");
 
     let recv = rt
         .spawn_on(1, async {
-            let mut waited = 0usize;
+            let mut waited = 0u64;
             loop {
-                if let Some(total) = {
+                let next = {
                     let ctx = ShardCtx::current().expect("on shard");
-                    ctx.try_take_hot_count(61)
-                } {
-                    return total;
+                    ctx.next_event()
+                };
+                let event = next.await;
+                if let Event::RingMsg {
+                    tag: BARRIER_TAG, ..
+                } = event
+                {
+                    let total = {
+                        let ctx = ShardCtx::current().expect("on shard");
+                        ctx.try_take_hot_count(HOT_TAG)
+                    };
+                    return total.unwrap_or(0);
                 }
-                if waited >= 200 {
+                if waited >= 1_000 {
                     panic!("timed out waiting for coalesced hot count");
                 }
-                sleep(Duration::from_millis(5)).await;
-                waited += 5;
+                sleep(Duration::from_millis(1)).await;
+                waited += 1;
             }
         })
         .expect("spawn receiver");
@@ -595,10 +607,15 @@ async fn coalesced_hot_count_accumulates_across_batches() {
                 ctx.remote(1).expect("remote shard")
             };
             remote
-                .send_many_raw_nowait([(61, 1), (61, 2)])
+                .send_many_raw_nowait([(HOT_TAG, 1), (HOT_TAG, 2)])
                 .expect("send first batch");
             remote.flush().expect("flush ticket").await.expect("flush");
-            remote.send_raw_nowait(61, 3).expect("send second batch");
+            remote
+                .send_raw_nowait(HOT_TAG, 3)
+                .expect("send second batch");
+            remote
+                .send_raw_nowait(BARRIER_TAG, 1)
+                .expect("send barrier");
             remote.flush().expect("flush ticket").await.expect("flush");
         })
         .expect("spawn sender");
