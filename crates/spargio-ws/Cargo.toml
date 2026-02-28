@@ -1,0 +1,15 @@
+[package]
+name = "spargio-ws"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+description = "WebSocket companion crate for spargio (async-tungstenite bridge)"
+repository = "https://github.com/soumyarupsarkar/spargio"
+
+[dependencies]
+async-tungstenite = "0.29"
+spargio = { path = "../..", features = ["uring-native"] }
+spargio-protocols = { path = "../spargio-protocols", features = ["uring-native"] }
+
+[dev-dependencies]
+futures = "0.3"

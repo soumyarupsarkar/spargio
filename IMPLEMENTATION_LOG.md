@@ -5457,3 +5457,59 @@ Related compatibility improvement:
 Executed and passing:
 
 - `cargo test -p spargio-tls --test tls_tdd`
+
+## Update: Phase 3 implemented (WebSocket deep adapter bridge) with Red/Green TDD (2026-02-28)
+
+Executed a red-first WebSocket companion crate implementation over
+`async-tungstenite`.
+
+### Red tests added first
+
+- created new workspace crate: `crates/spargio-ws`
+- added `crates/spargio-ws/tests/ws_tdd.rs` with:
+  - `ws_client_connect_timeout_is_enforced`
+  - `ws_client_server_roundtrip_text_message`
+
+Observed expected red state:
+
+- unresolved API imports in `spargio_ws`:
+  - `WsOptions`
+  - `accept_with_options`
+  - `connect_socket_addr_with_options`
+
+### Implementation delivered
+
+Workspace wiring:
+
+- added `crates/spargio-ws` to root workspace members.
+- crate deps include:
+  - `async-tungstenite`
+  - `spargio` (`uring-native`)
+  - `spargio-protocols` (`uring-native` io adapter bridge)
+
+Public API:
+
+- options and wrappers:
+  - `WsOptions` (timeout + frame/message limit knobs)
+  - `WsConnector`
+  - `WsAcceptor`
+- stream aliases:
+  - `WsStream`
+  - `WsResponse`
+- functions:
+  - `connect`, `connect_with_options`
+  - `connect_socket_addr`, `connect_socket_addr_with_options`
+  - `accept`, `accept_with_options`
+
+Semantics:
+
+- handshake timeout enforced with `spargio::timeout(...)`.
+- timeout maps to `io::ErrorKind::TimedOut`.
+- tungstenite protocol errors map to `io::Error` for uniform bridge behavior.
+- uses `spargio-protocols::io_compat::FuturesTcpStream` transport adapter.
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test -p spargio-ws --test ws_tdd`
