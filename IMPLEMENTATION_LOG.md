@@ -4989,3 +4989,48 @@ Executed and passing:
 
 - `cargo test --features uring-native --test uring_native_tdd uring_native_safe_extension_statx_wraps_unsafe_submission`
 - `cargo test --features uring-native --test uring_native_tdd`
+
+## Update: Milestone M3 implemented (mdBook docs track) with Red/Green TDD (2026-02-28)
+
+Executed Milestone M3 scope with red-first docs tests, then book scaffold and
+CI integration. Root `README.md` content/length was intentionally left unchanged
+per current decision.
+
+### Red phase
+
+Added failing tests in `tests/docs_tdd.rs`:
+
+- `mdbook_scaffold_exists_with_summary`
+- `mdbook_summary_links_resolve_to_existing_files`
+
+Expected red failure:
+
+- missing `book/book.toml`
+- missing `book/src/SUMMARY.md` and chapter files.
+
+### Green phase
+
+Added in-repo mdBook scaffold:
+
+- `book/book.toml`
+- `book/src/SUMMARY.md`
+- initial chapters:
+  - `introduction.md`
+  - `runtime_entry.md`
+  - `placement.md`
+  - `io_surface.md`
+  - `native_extensions.md`
+  - `benchmarking.md`
+  - `migration.md`
+
+CI integration:
+
+- `.github/workflows/ci.yml` now installs `mdbook` and runs:
+  - `mdbook build book`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --test docs_tdd`
+- `mdbook build book`

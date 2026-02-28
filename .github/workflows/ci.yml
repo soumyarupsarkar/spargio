@@ -28,6 +28,12 @@ jobs:
       - name: Cargo bench --no-run
         run: cargo bench --no-run
 
+      - name: Install mdBook
+        run: cargo install --locked mdbook --version 0.4.40
+
+      - name: Build mdBook
+        run: mdbook build book
+
       - name: Fanout bench smoke
         run: ./scripts/bench_fanout_smoke.sh
 
