@@ -1,0 +1,17 @@
+[package]
+name = "spargio-tls"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+description = "TLS companion crate for spargio (rustls/futures-rustls bridge)"
+repository = "https://github.com/soumyarupsarkar/spargio"
+
+[dependencies]
+futures-rustls = "0.26"
+rustls = "0.23"
+spargio = { path = "../..", features = ["uring-native"] }
+spargio-protocols = { path = "../spargio-protocols", features = ["uring-native"] }
+
+[dev-dependencies]
+futures = "0.3"
+rcgen = "0.13"

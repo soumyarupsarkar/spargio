@@ -5392,3 +5392,68 @@ Executed and passing:
 - `cargo test -p spargio-process --test foundation_tdd`
 - `cargo test -p spargio-protocols --test foundation_tdd`
 - `cargo test -p spargio-protocols --features uring-native --test foundation_tdd`
+
+## Update: Phase 2 implemented (TLS deep adapter bridge) with Red/Green TDD (2026-02-28)
+
+Executed a red-first TLS companion crate implementation over
+`rustls` + `futures-rustls`.
+
+### Red tests added first
+
+- created new workspace crate: `crates/spargio-tls`
+- added `crates/spargio-tls/tests/tls_tdd.rs` with:
+  - `tls_connector_connect_socket_addr_timeout_is_enforced`
+  - `tls_connector_and_acceptor_interop_roundtrip`
+
+Observed expected red state:
+
+- unresolved API imports in `spargio_tls`:
+  - `HandshakeOptions`
+  - `TlsConnector`
+
+### Implementation delivered
+
+Workspace wiring:
+
+- added `crates/spargio-tls` to root workspace members.
+- crate deps include:
+  - `futures-rustls`
+  - `rustls`
+  - `spargio` (`uring-native`)
+  - `spargio-protocols` (`uring-native` io adapter bridge)
+
+Public API:
+
+- handshake options:
+  - `HandshakeOptions` (optional timeout)
+- connector/acceptor wrappers:
+  - `TlsConnector` with:
+    - `connect(...)`
+    - `connect_socket_addr(...)`
+  - `TlsAcceptor` with:
+    - `accept(...)`
+- free functions:
+  - `connect`, `connect_with_options`
+  - `connect_socket_addr`, `connect_socket_addr_with_options`
+  - `accept`, `accept_with_options`
+- stream aliases:
+  - `ClientTlsStream`
+  - `ServerTlsStream`
+
+Semantics:
+
+- TLS handshakes are timeout-governed via `spargio::timeout(...)`.
+- timeout maps to `io::ErrorKind::TimedOut`.
+- transport layer is a thin bridge over
+  `spargio-protocols::io_compat::FuturesTcpStream`.
+
+Related compatibility improvement:
+
+- implemented `Debug` for `spargio-protocols::io_compat::FuturesTcpStream`
+  to satisfy downstream stream debug bounds.
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test -p spargio-tls --test tls_tdd`

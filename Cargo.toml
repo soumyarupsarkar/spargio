@@ -38,6 +38,7 @@ members = [
   "crates/spargio-signal",
   "crates/spargio-protocols",
   "crates/spargio-process",
+  "crates/spargio-tls",
 ]
 resolver = "2"
 

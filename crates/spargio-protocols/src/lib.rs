@@ -160,6 +160,15 @@ pub mod io_compat {
         write_op: Option<WriteOp>,
     }
 
+    impl std::fmt::Debug for FuturesTcpStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FuturesTcpStream")
+                .field("fd", &self.inner.as_raw_fd())
+                .field("session_shard", &self.inner.session_shard())
+                .finish()
+        }
+    }
+
     impl FuturesTcpStream {
         pub fn new(inner: TcpStream) -> Self {
             Self {
