@@ -31,6 +31,16 @@ default = []
 macros = ["dep:spargio-macros"]
 uring-native = []
 
+[workspace]
+members = [
+  ".",
+  "spargio-macros",
+  "crates/spargio-signal",
+  "crates/spargio-protocols",
+  "crates/spargio-process",
+]
+resolver = "2"
+
 [[bench]]
 name = "ping_pong"
 harness = false

@@ -123,7 +123,9 @@ For performance, different workload shapes favor different runtimes.
 - Local `!Send` ergonomics: `run_local_on(...)` and `RuntimeHandle::spawn_local_on(...)` for shard-pinned local futures.
 - Unbound native API: `RuntimeHandle::uring_native_unbound() -> UringNativeAny` with file ops (`read_at`, `read_at_into`, `write_at`, `fsync`) and stream/socket ops (`recv`, `send`, `send_owned`, `recv_owned`, `send_all_batch`, `recv_multishot_segments`), plus submission-time shard selector, FD affinity leases, and active op route tracking.
 - Low-level unsafe native extension API: `UringNativeAny::{submit_unsafe, submit_unsafe_on_shard}` for custom SQE/CQE workflows in external extensions.
+- Safe native extension wrapper slice + cookbook: `spargio::extension::fs::{statx, statx_on_shard, statx_or_metadata}` plus `docs/native_extension_cookbook.md`.
 - Ergonomic fs/net APIs on top of native I/O: `spargio::fs::{OpenOptions, File}` plus path helpers (`create_dir*`, `rename`, `remove_*`, metadata/link helpers, `read`/`write`), and `spargio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream, UnixDatagram}`.
+- Measured metadata fast path helper: `spargio::fs::metadata_lite(...)` (`statx`-backed with fallback).
 - Native-first fs path-op lane on Linux io_uring for high-value helpers (`create_dir`, `remove_file`, `remove_dir`, `rename`, `hard_link`, `symlink`), with compatibility fallback on unsupported opcode kernels.
 - Foundational I/O utility layer: `spargio::io::{AsyncRead, AsyncWrite, split, copy_to_vec, BufReader, BufWriter}` and `io::framed::LengthDelimited`.
 - Native setup path on Linux io_uring lane: `open/connect/accept` are nonblocking and routed through native setup ops (no helper-thread `run_blocking` wrappers in public fs/net setup APIs).
@@ -132,17 +134,18 @@ For performance, different workload shapes favor different runtimes.
 - Explicit socket-address APIs that bypass DNS resolution: `connect_socket_addr*` and `bind_socket_addr`.
 - Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
 - Mixed-runtime boundary API: `spargio::boundary`.
+- Workspace companion crates: `spargio-signal`, `spargio-protocols` (TLS/WS/QUIC blocking-bridge integrations), and `spargio-process`.
+- In-repo long-form docs scaffold: `book/` (`mdBook`) with CI build gate.
 - Reference mixed-mode service example.
 
 ## What's Not Done Yet
 
-- Full higher-level ecosystem parity (`process`, `signal`, `tls`, `ws`, `quic`) and richer optional adapters beyond current core `io` utility layer.
-- Safe wrapper ecosystem and cookbook around the unsafe native extension API (patterns, invariants, and reusable extension crates).
+- Full production-grade higher-level ecosystem parity is still in progress; companion crates exist, but deeper protocol-specific adapters and maturity work remain (`process`, `signal`, `tls`, `ws`, `quic`).
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
-- Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `create_dir_all`, `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths.
+- Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `create_dir_all`, `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`metadata_lite` exists as native-first alternative).
 - Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
-- Deeper documentation (`spargio` book / guides for API selection, placement strategy, and benchmark methodology).
+- Expand `book/` coverage into deeper API-selection, placement, and operations guides.
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
 
 ## Contributor Quick Start

@@ -5098,3 +5098,86 @@ Executed and passing:
 
 - `cargo test --features uring-native --test ergonomics_tdd fs_path_helpers_cover_common_workflows`
 - `cargo bench --features uring-native --bench fs_api --no-run`
+
+## Update: Milestone M5 implemented (companion crates as workspace subcrates) with Red/Green TDD (2026-02-28)
+
+Executed Milestone M5 by wiring companion crates into the workspace and adding
+initial tested APIs for `signal`, protocol integrations (`tls/ws/quic`
+blocking bridges), and `process`.
+
+### Red phase
+
+Added failing workspace test in `tests/workspace_companions_tdd.rs`:
+
+- `workspace_lists_companion_subcrates`
+
+Expected red failure:
+
+- root `Cargo.toml` had no `[workspace]`.
+- companion crate paths were not present.
+
+### Green phase
+
+Workspace wiring:
+
+- root `Cargo.toml` now defines workspace members:
+  - `.`
+  - `spargio-macros`
+  - `crates/spargio-signal`
+  - `crates/spargio-protocols`
+  - `crates/spargio-process`
+
+Companion subcrates added:
+
+1. `spargio-signal`
+   - API:
+     - `signal(...) -> SignalStream`
+     - `ctrl_c() -> SignalStream`
+     - `SignalStream::recv().await`
+   - implementation:
+     - `signal-hook` listener thread + async-facing receive loop.
+   - tests:
+     - construction test
+     - raised-signal receive test.
+
+2. `spargio-protocols`
+   - API:
+     - `tls_blocking(...)`
+     - `ws_blocking(...)`
+     - `quic_blocking(...)`
+   - implementation:
+     - explicit `RuntimeHandle::spawn_blocking` bridges for protocol ecosystem
+       integration points.
+   - tests:
+     - closure execution test across all three helpers.
+
+3. `spargio-process`
+   - API:
+     - `status(handle, Command)`
+     - `output(handle, Command)`
+     - `CommandBuilder::{new,arg,args,status,output}`
+   - implementation:
+     - async process execution via runtime blocking bridge.
+   - tests:
+     - builder status path
+     - function status path.
+
+Companion docs/examples:
+
+- added crate-level docs and minimal example files under each companion crate.
+
+Repository status docs:
+
+- updated `README.md` done/not-done section to reflect:
+  - companion crates now present
+  - safe extension wrapper slice done
+  - `mdBook` scaffold done
+  - higher-level parity still maturing.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --test workspace_companions_tdd`
+- `cargo test --workspace`
+- `cargo test --workspace --features uring-native`

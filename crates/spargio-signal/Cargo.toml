@@ -1,0 +1,14 @@
+[package]
+name = "spargio-signal"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+description = "Signal companion crate for spargio"
+repository = "https://github.com/soumyarupsarkar/spargio"
+
+[dependencies]
+signal-hook = "0.3"
+spargio = { path = "../.." }
+
+[dev-dependencies]
+futures = "0.3"

@@ -8,7 +8,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_file(path);
         Ok::<_, std::io::Error>(meta)
     })
-    .await??;
+    .await
+    .map_err(|err| std::io::Error::other(format!("runtime error: {err:?}")))??;
 
     println!("size={} mode={:#o}", out.size, out.mode);
     Ok(())

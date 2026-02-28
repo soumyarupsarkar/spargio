@@ -751,6 +751,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,6 +815,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "spargio-process"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "spargio",
+]
+
+[[package]]
+name = "spargio-protocols"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "spargio",
+]
+
+[[package]]
+name = "spargio-signal"
+version = "0.3.0"
+dependencies = [
+ "futures",
+ "signal-hook",
+ "spargio",
 ]
 
 [[package]]
