@@ -21,11 +21,11 @@ Add `spargio` as a dependency:
 cargo add spargio --features macros,uring-native
 ```
 
-Then use it for `io_uring` IO operations and stealable task spawning:
+Then use it for `io_uring` I/O operations and stealable task spawning:
 ```rust
 use spargio::{fs::File, net::TcpListener, RuntimeHandle};
 
-#[spargio::main(backend = "io_uring", shards = 4)]
+#[spargio::main]
 async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
     std::fs::create_dir_all("ingest-out")?;
     let listener = TcpListener::bind(handle.clone(), "127.0.0.1:7001").await?;
@@ -185,6 +185,8 @@ async fn main() {
     // async body runs on Spargio runtime
 }
 ```
+
+This takes two optional arguments. Without them, `#[spargio::main]` uses sensible defaults: `io_uring` backend and shard count from available CPU parallelism. Use macro arguments only when you need explicit overrides.
 
 ## Repository Map
 
