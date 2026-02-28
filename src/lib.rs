@@ -4,6 +4,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_queue::SegQueue;
 use futures::channel::oneshot;
 use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -11,7 +12,6 @@ use futures::future::join_all;
 use futures::future::{Either, select};
 use futures::task::{AtomicWaker, LocalSpawnExt};
 use std::cell::RefCell;
-#[cfg(all(feature = "uring-native", target_os = "linux"))]
 use std::collections::HashMap;
 use std::collections::VecDeque;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -60,6 +60,7 @@ const MSG_RING_CQE_FLAG: u32 = 1 << 8;
 const IOURING_SUBMIT_BATCH: usize = 64;
 #[cfg(target_os = "linux")]
 const DOORBELL_TAG: u16 = u16::MAX;
+const HOT_MSG_TAG_COUNT: usize = 65_536;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_OP_USER_BIT: u64 = 1 << 63;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -735,6 +736,9 @@ pub struct RuntimeBuilder {
     backend: BackendKind,
     ring_entries: u32,
     msg_ring_queue_capacity: usize,
+    hot_msg_tags: Vec<u16>,
+    coalesced_hot_msg_tags: Vec<u16>,
+    hot_counter_wake_threshold: u64,
     stealable_queue_capacity: usize,
     steal_budget: usize,
     #[cfg(target_os = "linux")]
@@ -749,6 +753,9 @@ impl Default for RuntimeBuilder {
             backend: BackendKind::IoUring,
             ring_entries: 256,
             msg_ring_queue_capacity: 4096,
+            hot_msg_tags: Vec::new(),
+            coalesced_hot_msg_tags: Vec::new(),
+            hot_counter_wake_threshold: 1,
             stealable_queue_capacity: 4096,
             steal_budget: 64,
             #[cfg(target_os = "linux")]
@@ -784,6 +791,37 @@ impl RuntimeBuilder {
 
     pub fn msg_ring_queue_capacity(mut self, capacity: usize) -> Self {
         self.msg_ring_queue_capacity = capacity.max(1);
+        self
+    }
+
+    pub fn hot_msg_tag(mut self, tag: u16) -> Self {
+        self.hot_msg_tags.push(tag);
+        self
+    }
+
+    pub fn hot_msg_tags<I>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.hot_msg_tags.extend(tags);
+        self
+    }
+
+    pub fn coalesced_hot_msg_tag(mut self, tag: u16) -> Self {
+        self.coalesced_hot_msg_tags.push(tag);
+        self
+    }
+
+    pub fn coalesced_hot_msg_tags<I>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.coalesced_hot_msg_tags.extend(tags);
+        self
+    }
+
+    pub fn hot_counter_wake_threshold(mut self, threshold: u64) -> Self {
+        self.hot_counter_wake_threshold = threshold.max(1);
         self
     }
 
@@ -856,6 +894,13 @@ impl RuntimeBuilder {
             receivers.push(rx);
         }
         let stealable_inboxes = build_stealable_inboxes(self.shards);
+        let mut hot_msg_tag_bits = build_hot_msg_tag_lookup(&self.hot_msg_tags);
+        for &tag in &self.coalesced_hot_msg_tags {
+            hot_msg_tag_bits[usize::from(tag)] = true;
+        }
+        let hot_msg_tags = Arc::new(hot_msg_tag_bits);
+        let coalesced_hot_msg_tags =
+            Arc::new(build_hot_msg_tag_lookup(&self.coalesced_hot_msg_tags));
         let stats = Arc::new(RuntimeStatsInner::new(self.shards));
 
         let shared = Arc::new(RuntimeShared {
@@ -911,6 +956,8 @@ impl RuntimeBuilder {
                     {
                         let remotes_for_shard = remotes.clone();
                         let stealable_deques = stealable_inboxes.clone();
+                        let hot_msg_tags = hot_msg_tags.clone();
+                        let coalesced_hot_msg_tags = coalesced_hot_msg_tags.clone();
                         let thread_name = format!("{}-{}", self.thread_prefix, idx);
                         let runtime_id = shared.runtime_id;
                         let backend = ShardBackend::IoUring(IoUringDriver::new(
@@ -918,6 +965,7 @@ impl RuntimeBuilder {
                             ring,
                             ring_fds.clone(),
                             payload_queues.clone(),
+                            coalesced_hot_msg_tags.clone(),
                             stats.clone(),
                             self.msg_ring_queue_capacity,
                         ));
@@ -930,6 +978,9 @@ impl RuntimeBuilder {
                                 rx,
                                 remotes_for_shard,
                                 stealable_deques,
+                                hot_msg_tags,
+                                coalesced_hot_msg_tags,
+                                self.hot_counter_wake_threshold,
                                 self.steal_budget,
                                 backend,
                                 stats,
@@ -3162,6 +3213,23 @@ impl RemoteShard {
         Ok(())
     }
 
+    pub fn send_raw_direct_nowait(&self, tag: u16, val: u32) -> Result<(), SendError> {
+        self.send_many_raw_direct_nowait(std::iter::once((tag, val)))
+    }
+
+    pub fn send_many_raw_direct_nowait<I>(&self, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
+        if let Some(ctx) = current {
+            return ctx.enqueue_local_send_many_direct(self.id, msgs);
+        }
+
+        // Outside runtime threads we cannot submit to io_uring directly.
+        self.send_many_raw_nowait(msgs)
+    }
+
     fn send_raw_inner(
         &self,
         tag: u16,
@@ -3225,6 +3293,8 @@ struct ShardCtxInner {
     runtime_id: u64,
     shard_id: ShardId,
     event_state: Arc<EventState>,
+    hot_event_state: Arc<EventState>,
+    hot_counter_state: Arc<HotCounterState>,
     spawner: LocalSpawner,
     remotes: Vec<RemoteShard>,
     local_commands: Rc<RefCell<VecDeque<LocalCommand>>>,
@@ -3260,6 +3330,22 @@ impl ShardCtx {
         I: IntoIterator<Item = (u16, u32)>,
     {
         self.enqueue_local_send_many(target, msgs)
+    }
+
+    pub fn send_raw_direct_nowait(
+        &self,
+        target: ShardId,
+        tag: u16,
+        val: u32,
+    ) -> Result<(), SendError> {
+        self.enqueue_local_send_many_direct(target, std::iter::once((tag, val)))
+    }
+
+    pub fn send_many_raw_direct_nowait<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        self.enqueue_local_send_many_direct(target, msgs)
     }
 
     pub fn send_many_nowait<M, I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
@@ -3319,6 +3405,26 @@ impl ShardCtx {
             .local_commands
             .borrow_mut()
             .push_back(LocalCommand::SubmitRingMsgBatch { target, messages });
+        Ok(())
+    }
+
+    fn enqueue_local_send_many_direct<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        if usize::from(target) >= self.inner.remotes.len() {
+            return Err(SendError::Closed);
+        }
+
+        let messages = msgs.into_iter().collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        self.inner
+            .local_commands
+            .borrow_mut()
+            .push_back(LocalCommand::SubmitRingMsgDirectBatch { target, messages });
         Ok(())
     }
 
@@ -3448,6 +3554,23 @@ impl ShardCtx {
             state: self.inner.event_state.clone(),
         }
     }
+
+    pub fn next_hot_event(&self) -> NextEvent {
+        NextEvent {
+            state: self.inner.hot_event_state.clone(),
+        }
+    }
+
+    pub fn next_hot_count(&self, tag: u16) -> NextHotCount {
+        NextHotCount {
+            state: self.inner.hot_counter_state.clone(),
+            tag,
+        }
+    }
+
+    pub fn try_take_hot_count(&self, tag: u16) -> Option<u64> {
+        self.inner.hot_counter_state.try_take(tag)
+    }
 }
 
 #[derive(Debug)]
@@ -3563,6 +3686,20 @@ impl Future for NextEvent {
     }
 }
 
+pub struct NextHotCount {
+    state: Arc<HotCounterState>,
+    tag: u16,
+}
+
+impl Future for NextHotCount {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.state.poll_take(this.tag, cx)
+    }
+}
+
 enum LocalCommand {
     SubmitRingMsg {
         target: ShardId,
@@ -3571,6 +3708,10 @@ enum LocalCommand {
         ack: Option<oneshot::Sender<Result<(), SendError>>>,
     },
     SubmitRingMsgBatch {
+        target: ShardId,
+        messages: Vec<(u16, u32)>,
+    },
+    SubmitRingMsgDirectBatch {
         target: ShardId,
         messages: Vec<(u16, u32)>,
     },
@@ -3972,39 +4113,131 @@ enum Command {
 
 #[derive(Default)]
 struct EventState {
-    inner: Mutex<EventQueue>,
-}
-
-#[derive(Default)]
-struct EventQueue {
-    queue: VecDeque<Event>,
-    waiters: Vec<Waker>,
+    queue: SegQueue<Event>,
+    waiters: Mutex<Vec<Waker>>,
 }
 
 impl EventState {
     fn push(&self, event: Event) {
+        self.queue.push(event);
+        self.wake_waiters();
+    }
+
+    fn push_many<I>(&self, events: I)
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        let mut count = 0usize;
+        for event in events {
+            self.queue.push(event);
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        self.wake_waiters();
+    }
+
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Event> {
+        if let Some(event) = self.queue.pop() {
+            return Poll::Ready(event);
+        }
+
+        {
+            let mut waiters = self.waiters.lock().expect("event lock poisoned");
+            if let Some(event) = self.queue.pop() {
+                return Poll::Ready(event);
+            }
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+        }
+
+        if let Some(event) = self.queue.pop() {
+            return Poll::Ready(event);
+        }
+
+        Poll::Pending
+    }
+
+    fn wake_waiters(&self) {
         let waiters = {
-            let mut inner = self.inner.lock().expect("event lock poisoned");
-            inner.queue.push_back(event);
-            inner.waiters.drain(..).collect::<Vec<_>>()
+            let mut waiters = self.waiters.lock().expect("event lock poisoned");
+            std::mem::take(&mut *waiters)
         };
 
         for w in waiters {
             w.wake();
         }
     }
+}
 
-    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Event> {
-        let mut inner = self.inner.lock().expect("event lock poisoned");
-        if let Some(event) = inner.queue.pop_front() {
-            return Poll::Ready(event);
+struct HotCounterState {
+    wake_threshold: u64,
+    inner: Mutex<HotCounterInner>,
+}
+
+#[derive(Default)]
+struct HotCounterInner {
+    counts: HashMap<u16, u64>,
+    waiters: HashMap<u16, Vec<Waker>>,
+}
+
+impl HotCounterState {
+    fn new(wake_threshold: u64) -> Self {
+        Self {
+            wake_threshold: wake_threshold.max(1),
+            inner: Mutex::new(HotCounterInner::default()),
+        }
+    }
+
+    fn add_many<I>(&self, updates: I)
+    where
+        I: IntoIterator<Item = (u16, u64)>,
+    {
+        let mut wake = Vec::new();
+        {
+            let mut inner = self.inner.lock().expect("hot counter lock poisoned");
+            for (tag, delta) in updates {
+                if delta == 0 {
+                    continue;
+                }
+                let before = inner.counts.get(&tag).copied().unwrap_or(0);
+                let after = before.saturating_add(delta);
+                inner.counts.insert(tag, after);
+
+                let should_wake =
+                    before == 0 || (before < self.wake_threshold && after >= self.wake_threshold);
+                if should_wake {
+                    if let Some(waiters) = inner.waiters.remove(&tag) {
+                        wake.extend(waiters);
+                    }
+                }
+            }
+        }
+        for w in wake {
+            w.wake();
+        }
+    }
+
+    fn poll_take(&self, tag: u16, cx: &mut Context<'_>) -> Poll<u64> {
+        let mut inner = self.inner.lock().expect("hot counter lock poisoned");
+        if let Some(value) = inner.counts.remove(&tag) {
+            if value > 0 {
+                return Poll::Ready(value);
+            }
         }
 
-        if !inner.waiters.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.waiters.push(cx.waker().clone());
+        let waiters = inner.waiters.entry(tag).or_default();
+        if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
         }
-
         Poll::Pending
+    }
+
+    fn try_take(&self, tag: u16) -> Option<u64> {
+        let mut inner = self.inner.lock().expect("hot counter lock poisoned");
+        inner.counts.remove(&tag).filter(|value| *value > 0)
     }
 }
 
@@ -4034,14 +4267,31 @@ impl ShardBackend {
         }
     }
 
-    fn poll(&mut self, event_state: &EventState) {
+    fn poll(
+        &mut self,
+        event_state: &EventState,
+        hot_event_state: &EventState,
+        hot_counter_state: &HotCounterState,
+        hot_msg_tags: &[bool],
+        coalesced_hot_msg_tags: &[bool],
+    ) {
         #[cfg(target_os = "linux")]
         {
-            self.driver_mut().reap(event_state);
+            self.driver_mut().reap(
+                event_state,
+                hot_event_state,
+                hot_counter_state,
+                hot_msg_tags,
+                coalesced_hot_msg_tags,
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = event_state;
+            let _ = hot_event_state;
+            let _ = hot_counter_state;
+            let _ = hot_msg_tags;
+            let _ = coalesced_hot_msg_tags;
         }
     }
 
@@ -4073,6 +4323,80 @@ impl ShardBackend {
             if let Some(ack) = ack {
                 let _ = ack.send(Err(SendError::Closed));
             }
+        }
+    }
+
+    fn submit_ring_msg_batch(
+        &mut self,
+        _from: ShardId,
+        target: ShardId,
+        messages: Vec<(u16, u32)>,
+        _command_txs: &[Sender<Command>],
+        stats: &RuntimeStatsInner,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+
+        stats
+            .ring_msgs_submitted
+            .fetch_add(messages.len() as u64, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            let (accepted, err) = self.driver_mut().submit_ring_msg_batch(target, &messages);
+            if err.is_some() {
+                let failed = messages.len().saturating_sub(accepted);
+                if failed > 0 {
+                    stats
+                        .ring_msgs_failed
+                        .fetch_add(failed as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            stats
+                .ring_msgs_failed
+                .fetch_add(messages.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn submit_ring_msg_direct_batch(
+        &mut self,
+        _from: ShardId,
+        target: ShardId,
+        messages: Vec<(u16, u32)>,
+        _command_txs: &[Sender<Command>],
+        stats: &RuntimeStatsInner,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+
+        stats
+            .ring_msgs_submitted
+            .fetch_add(messages.len() as u64, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            let (accepted, err) = self
+                .driver_mut()
+                .submit_ring_msg_direct_batch(target, &messages);
+            if err.is_some() {
+                let failed = messages.len().saturating_sub(accepted);
+                if failed > 0 {
+                    stats
+                        .ring_msgs_failed
+                        .fetch_add(failed as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            stats
+                .ring_msgs_failed
+                .fetch_add(messages.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -4539,6 +4863,7 @@ struct IoUringDriver {
     ring: IoUring,
     ring_fds: Arc<Vec<RawFd>>,
     payload_queues: PayloadQueues,
+    coalesced_hot_msg_tags: Arc<Vec<bool>>,
     send_waiters: Slab<oneshot::Sender<Result<(), SendError>>>,
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     native_ops: Slab<NativeIoOp>,
@@ -4563,6 +4888,7 @@ impl IoUringDriver {
         ring: IoUring,
         ring_fds: Arc<Vec<RawFd>>,
         payload_queues: PayloadQueues,
+        coalesced_hot_msg_tags: Arc<Vec<bool>>,
         stats: Arc<RuntimeStatsInner>,
         payload_queue_capacity: usize,
     ) -> Self {
@@ -4571,6 +4897,7 @@ impl IoUringDriver {
             ring,
             ring_fds,
             payload_queues,
+            coalesced_hot_msg_tags,
             send_waiters: Slab::new(),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
             native_ops: Slab::new(),
@@ -4627,6 +4954,27 @@ impl IoUringDriver {
         self.submit_ring_msg_nowait(target, tag, val)
     }
 
+    fn submit_ring_msg_direct_batch(
+        &mut self,
+        target: ShardId,
+        messages: &[(u16, u32)],
+    ) -> (usize, Option<SendError>) {
+        if messages.is_empty() {
+            return (0, None);
+        }
+
+        let mut accepted = 0usize;
+        for &(tag, val) in messages {
+            match self.submit_ring_msg_direct_nowait(target, tag, val) {
+                Ok(()) => accepted += 1,
+                Err(err) => {
+                    return (accepted, Some(err));
+                }
+            }
+        }
+        (accepted, None)
+    }
+
     fn submit_ring_msg_ticketed(
         &mut self,
         target: ShardId,
@@ -4674,6 +5022,79 @@ impl IoUringDriver {
         Ok(())
     }
 
+    fn submit_ring_msg_direct_nowait(
+        &mut self,
+        target: ShardId,
+        tag: u16,
+        val: u32,
+    ) -> Result<(), SendError> {
+        let target_fd = self.target_fd(target)?;
+        let payload = pack_msg_userdata(self.shard_id, tag);
+        let val_i32 = i32::from_ne_bytes(val.to_ne_bytes());
+        let entry = opcode::MsgRingData::new(
+            types::Fd(target_fd),
+            val_i32,
+            payload,
+            Some(MSG_RING_CQE_FLAG),
+        )
+        .build()
+        .user_data(0)
+        .flags(io_uring::squeue::Flags::SKIP_SUCCESS);
+        self.push_entry(entry)?;
+        self.mark_submission_pending()
+    }
+
+    fn submit_ring_msg_batch(
+        &mut self,
+        target: ShardId,
+        messages: &[(u16, u32)],
+    ) -> (usize, Option<SendError>) {
+        if messages.is_empty() {
+            return (0, None);
+        }
+
+        let (accepted, was_empty) = {
+            let Some(per_source) = self.payload_queues.get(usize::from(target)) else {
+                return (0, Some(SendError::Closed));
+            };
+            let Some(queue) = per_source.get(usize::from(self.shard_id)) else {
+                return (0, Some(SendError::Closed));
+            };
+
+            let mut queue = queue.lock().expect("payload queue lock poisoned");
+            let was_empty = queue.is_empty();
+            let mut accepted = 0usize;
+            for &(tag, val) in messages {
+                if self.enqueue_payload_locked(&mut queue, tag, val).is_err() {
+                    break;
+                }
+                accepted += 1;
+            }
+            (accepted, was_empty)
+        };
+
+        if accepted == 0 {
+            self.stats
+                .ring_msgs_backpressure
+                .fetch_add(messages.len() as u64, Ordering::Relaxed);
+            return (0, Some(SendError::Backpressure));
+        }
+
+        if was_empty && self.submit_doorbell(target).is_err() {
+            self.rollback_last_payloads(target, accepted);
+            return (0, Some(SendError::Closed));
+        }
+
+        if accepted < messages.len() {
+            self.stats
+                .ring_msgs_backpressure
+                .fetch_add((messages.len() - accepted) as u64, Ordering::Relaxed);
+            return (accepted, Some(SendError::Backpressure));
+        }
+
+        (accepted, None)
+    }
+
     fn enqueue_payload(&self, target: ShardId, tag: u16, val: u32) -> Result<bool, SendError> {
         let Some(per_source) = self.payload_queues.get(usize::from(target)) else {
             return Err(SendError::Closed);
@@ -4683,18 +5104,68 @@ impl IoUringDriver {
         };
 
         let mut queue = queue.lock().expect("payload queue lock poisoned");
-        if queue.len() >= self.payload_queue_capacity {
+        let was_empty = queue.is_empty();
+        if self.enqueue_payload_locked(&mut queue, tag, val).is_err() {
             self.stats
                 .ring_msgs_backpressure
                 .fetch_add(1, Ordering::Relaxed);
             return Err(SendError::Backpressure);
         }
-        let was_empty = queue.is_empty();
-        queue.push_back(DoorbellPayload { tag, val });
         Ok(was_empty)
     }
 
+    fn enqueue_payload_locked(
+        &self,
+        queue: &mut VecDeque<DoorbellPayload>,
+        tag: u16,
+        val: u32,
+    ) -> Result<(), SendError> {
+        if !is_hot_msg_tag(self.coalesced_hot_msg_tags.as_ref(), tag) {
+            if queue.len() >= self.payload_queue_capacity {
+                return Err(SendError::Backpressure);
+            }
+            queue.push_back(DoorbellPayload { tag, val });
+            return Ok(());
+        }
+
+        if let Some(last) = queue.back().copied().filter(|last| last.tag == tag) {
+            let max = u64::from(u32::MAX);
+            let total = u64::from(last.val).saturating_add(u64::from(val));
+            let overflow = total.saturating_sub(max);
+            let extra_slots = if overflow == 0 {
+                0
+            } else {
+                ((overflow - 1) / max + 1) as usize
+            };
+            if queue.len().saturating_add(extra_slots) > self.payload_queue_capacity {
+                return Err(SendError::Backpressure);
+            }
+
+            if let Some(last_mut) = queue.back_mut() {
+                last_mut.val = total.min(max) as u32;
+            }
+
+            let mut remaining = overflow;
+            while remaining > 0 {
+                let chunk = remaining.min(max) as u32;
+                queue.push_back(DoorbellPayload { tag, val: chunk });
+                remaining -= u64::from(chunk);
+            }
+            return Ok(());
+        }
+
+        if queue.len() >= self.payload_queue_capacity {
+            return Err(SendError::Backpressure);
+        }
+        queue.push_back(DoorbellPayload { tag, val });
+        Ok(())
+    }
+
     fn rollback_last_payload(&self, target: ShardId) {
+        self.rollback_last_payloads(target, 1);
+    }
+
+    fn rollback_last_payloads(&self, target: ShardId, count: usize) {
         let Some(per_source) = self.payload_queues.get(usize::from(target)) else {
             return;
         };
@@ -4703,7 +5174,11 @@ impl IoUringDriver {
         };
 
         let mut queue = queue.lock().expect("payload queue lock poisoned");
-        let _ = queue.pop_back();
+        for _ in 0..count {
+            if queue.pop_back().is_none() {
+                break;
+            }
+        }
     }
 
     fn submit_doorbell(&mut self, target: ShardId) -> Result<(), SendError> {
@@ -5832,7 +6307,14 @@ impl IoUringDriver {
         Ok(())
     }
 
-    fn reap(&mut self, event_state: &EventState) {
+    fn reap(
+        &mut self,
+        event_state: &EventState,
+        hot_event_state: &EventState,
+        hot_counter_state: &HotCounterState,
+        hot_msg_tags: &[bool],
+        coalesced_hot_msg_tags: &[bool],
+    ) {
         if self.flush_submissions().is_err() {
             return;
         }
@@ -5859,13 +6341,27 @@ impl IoUringDriver {
         }
 
         for from in doorbells {
-            self.drain_payload_queue(from, event_state);
+            self.drain_payload_queue(
+                from,
+                event_state,
+                hot_event_state,
+                hot_counter_state,
+                hot_msg_tags,
+                coalesced_hot_msg_tags,
+            );
         }
-        for (from, tag, val) in msg_events {
+        if !msg_events.is_empty() {
             self.stats
                 .ring_msgs_completed
-                .fetch_add(1, Ordering::Relaxed);
-            event_state.push(Event::RingMsg { from, tag, val });
+                .fetch_add(msg_events.len() as u64, Ordering::Relaxed);
+            push_ring_msg_batch(
+                event_state,
+                hot_event_state,
+                hot_counter_state,
+                hot_msg_tags,
+                coalesced_hot_msg_tags,
+                msg_events,
+            );
         }
         for (user_data, result, _flags) in waiter_completions {
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -5898,7 +6394,15 @@ impl IoUringDriver {
         }
     }
 
-    fn drain_payload_queue(&self, from: ShardId, event_state: &EventState) {
+    fn drain_payload_queue(
+        &self,
+        from: ShardId,
+        event_state: &EventState,
+        hot_event_state: &EventState,
+        hot_counter_state: &HotCounterState,
+        hot_msg_tags: &[bool],
+        coalesced_hot_msg_tags: &[bool],
+    ) {
         let Some(per_source) = self.payload_queues.get(usize::from(self.shard_id)) else {
             return;
         };
@@ -5914,13 +6418,16 @@ impl IoUringDriver {
         self.stats
             .ring_msgs_completed
             .fetch_add(drained.len() as u64, Ordering::Relaxed);
-        for payload in drained {
-            event_state.push(Event::RingMsg {
-                from,
-                tag: payload.tag,
-                val: payload.val,
-            });
-        }
+        push_ring_msg_batch(
+            event_state,
+            hot_event_state,
+            hot_counter_state,
+            hot_msg_tags,
+            coalesced_hot_msg_tags,
+            drained
+                .into_iter()
+                .map(|payload| (from, payload.tag, payload.val)),
+        );
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -6186,6 +6693,14 @@ fn build_stealable_inboxes(shards: usize) -> StealableInboxes {
     Arc::new(queues)
 }
 
+fn build_hot_msg_tag_lookup(tags: &[u16]) -> Vec<bool> {
+    let mut lookup = vec![false; HOT_MSG_TAG_COUNT];
+    for &tag in tags {
+        lookup[usize::from(tag)] = true;
+    }
+    lookup
+}
+
 #[cfg(target_os = "linux")]
 fn build_payload_queues(shards: usize) -> PayloadQueues {
     let mut by_target = Vec::with_capacity(shards);
@@ -6197,6 +6712,72 @@ fn build_payload_queues(shards: usize) -> PayloadQueues {
         by_target.push(by_source);
     }
     Arc::new(by_target)
+}
+
+#[inline]
+fn is_hot_msg_tag(hot_msg_tags: &[bool], tag: u16) -> bool {
+    hot_msg_tags.get(usize::from(tag)).copied().unwrap_or(false)
+}
+
+#[inline]
+fn push_ring_msg(
+    event_state: &EventState,
+    hot_event_state: &EventState,
+    hot_counter_state: &HotCounterState,
+    hot_msg_tags: &[bool],
+    coalesced_hot_msg_tags: &[bool],
+    from: ShardId,
+    tag: u16,
+    val: u32,
+) {
+    if is_hot_msg_tag(coalesced_hot_msg_tags, tag) {
+        hot_counter_state.add_many(std::iter::once((tag, u64::from(val))));
+    } else if is_hot_msg_tag(hot_msg_tags, tag) {
+        hot_event_state.push(Event::RingMsg { from, tag, val });
+    } else {
+        event_state.push(Event::RingMsg { from, tag, val });
+    }
+}
+
+fn push_ring_msg_batch<I>(
+    event_state: &EventState,
+    hot_event_state: &EventState,
+    hot_counter_state: &HotCounterState,
+    hot_msg_tags: &[bool],
+    coalesced_hot_msg_tags: &[bool],
+    messages: I,
+) where
+    I: IntoIterator<Item = (ShardId, u16, u32)>,
+{
+    let mut regular = Vec::new();
+    let mut hot = Vec::new();
+    let mut coalesced_sums: HashMap<u16, u64> = HashMap::new();
+    for (from, tag, val) in messages {
+        if is_hot_msg_tag(hot_msg_tags, tag) {
+            if is_hot_msg_tag(coalesced_hot_msg_tags, tag) {
+                if let Some(sum) = coalesced_sums.get_mut(&tag) {
+                    *sum = sum.saturating_add(u64::from(val));
+                } else {
+                    coalesced_sums.insert(tag, u64::from(val));
+                }
+            } else {
+                hot.push(Event::RingMsg { from, tag, val });
+            }
+        } else {
+            regular.push(Event::RingMsg { from, tag, val });
+        }
+    }
+
+    if !coalesced_sums.is_empty() {
+        hot_counter_state.add_many(coalesced_sums);
+    }
+
+    if !regular.is_empty() {
+        event_state.push_many(regular);
+    }
+    if !hot.is_empty() {
+        hot_event_state.push_many(hot);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6283,6 +6864,9 @@ fn run_shard(
     rx: Receiver<Command>,
     remotes: Vec<RemoteShard>,
     stealable_deques: StealableInboxes,
+    hot_msg_tags: Arc<Vec<bool>>,
+    coalesced_hot_msg_tags: Arc<Vec<bool>>,
+    hot_counter_wake_threshold: u64,
     steal_budget: usize,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
@@ -6290,12 +6874,16 @@ fn run_shard(
     let mut pool = LocalPool::new();
     let spawner = pool.spawner();
     let event_state = Arc::new(EventState::default());
+    let hot_event_state = Arc::new(EventState::default());
+    let hot_counter_state = Arc::new(HotCounterState::new(hot_counter_wake_threshold));
     let local_commands = Rc::new(RefCell::new(VecDeque::new()));
     let ctx = ShardCtx {
         inner: Rc::new(ShardCtxInner {
             runtime_id,
             shard_id,
             event_state: event_state.clone(),
+            hot_event_state: hot_event_state.clone(),
+            hot_counter_state: hot_counter_state.clone(),
             spawner: spawner.clone(),
             remotes,
             local_commands: local_commands.clone(),
@@ -6333,7 +6921,13 @@ fn run_shard(
             &spawner,
             &stats,
         );
-        backend.poll(&event_state);
+        backend.poll(
+            &event_state,
+            &hot_event_state,
+            &hot_counter_state,
+            &hot_msg_tags,
+            &coalesced_hot_msg_tags,
+        );
 
         let mut drained = stealable_drained;
         loop {
@@ -6346,6 +6940,10 @@ fn run_shard(
                         shard_id,
                         &spawner,
                         &event_state,
+                        &hot_event_state,
+                        &hot_counter_state,
+                        &hot_msg_tags,
+                        &coalesced_hot_msg_tags,
                         &stats,
                         &local_commands,
                     );
@@ -6401,7 +6999,13 @@ fn run_shard(
             &spawner,
             &stats,
         );
-        backend.poll(&event_state);
+        backend.poll(
+            &event_state,
+            &hot_event_state,
+            &hot_counter_state,
+            &hot_msg_tags,
+            &coalesced_hot_msg_tags,
+        );
     }
 
     while let Ok(cmd) = rx.try_recv() {
@@ -6429,6 +7033,10 @@ fn handle_command(
     _shard_id: ShardId,
     spawner: &LocalSpawner,
     event_state: &EventState,
+    hot_event_state: &EventState,
+    hot_counter_state: &HotCounterState,
+    hot_msg_tags: &[bool],
+    coalesced_hot_msg_tags: &[bool],
     stats: &RuntimeStatsInner,
     _local_commands: &RefCell<VecDeque<LocalCommand>>,
 ) -> bool {
@@ -6443,7 +7051,16 @@ fn handle_command(
             val,
             ack,
         } => {
-            event_state.push(Event::RingMsg { from, tag, val });
+            push_ring_msg(
+                event_state,
+                hot_event_state,
+                hot_counter_state,
+                hot_msg_tags,
+                coalesced_hot_msg_tags,
+                from,
+                tag,
+                val,
+            );
             stats.ring_msgs_completed.fetch_add(1, Ordering::Relaxed);
             if let Some(ack) = ack {
                 let _ = ack.send(Ok(()));
@@ -6561,9 +7178,16 @@ fn drain_local_commands(
                 ack,
             } => backend.submit_ring_msg(shard_id, target, tag, val, ack, command_txs, stats),
             LocalCommand::SubmitRingMsgBatch { target, messages } => {
-                for (tag, val) in messages {
-                    backend.submit_ring_msg(shard_id, target, tag, val, None, command_txs, stats);
-                }
+                backend.submit_ring_msg_batch(shard_id, target, messages, command_txs, stats);
+            }
+            LocalCommand::SubmitRingMsgDirectBatch { target, messages } => {
+                backend.submit_ring_msg_direct_batch(
+                    shard_id,
+                    target,
+                    messages,
+                    command_txs,
+                    stats,
+                );
             }
             LocalCommand::SubmitStealableWake { target } => {
                 backend.submit_stealable_wake(target, command_txs, stats)

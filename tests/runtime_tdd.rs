@@ -1,5 +1,6 @@
 use futures::executor::block_on;
-use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_with};
+use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_with, sleep};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Control {
@@ -152,6 +153,45 @@ fn send_raw_nowait_delivers_event() {
 }
 
 #[test]
+fn send_raw_direct_nowait_delivers_event() {
+    let rt = Runtime::builder().shards(2).build().expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_event()
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_raw_direct_nowait(78, 6)
+                .expect("direct send nowait");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    block_on(send).expect("sender join");
+    let event = block_on(recv).expect("receiver join");
+    assert_eq!(
+        event,
+        Event::RingMsg {
+            from: 0,
+            tag: 78,
+            val: 6
+        }
+    );
+}
+
+#[test]
 fn send_many_raw_nowait_delivers_in_order() {
     let rt = Runtime::builder().shards(2).build().expect("runtime");
 
@@ -205,6 +245,415 @@ fn send_many_raw_nowait_delivers_in_order() {
             }
         ]
     );
+}
+
+#[test]
+fn send_many_raw_direct_nowait_delivers_in_order() {
+    let rt = Runtime::builder().shards(2).build().expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                let event = {
+                    let ctx = ShardCtx::current().expect("on shard");
+                    ctx.next_event()
+                }
+                .await;
+                out.push(event);
+            }
+            out
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_many_raw_direct_nowait([(20, 4), (21, 5), (22, 6)])
+                .expect("direct send many");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    block_on(send).expect("sender join");
+    let events = block_on(recv).expect("receiver join");
+    assert_eq!(
+        events,
+        vec![
+            Event::RingMsg {
+                from: 0,
+                tag: 20,
+                val: 4
+            },
+            Event::RingMsg {
+                from: 0,
+                tag: 21,
+                val: 5
+            },
+            Event::RingMsg {
+                from: 0,
+                tag: 22,
+                val: 6
+            }
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_msg_tag_routes_to_hot_event_lane() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(55)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_hot_event()
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote.send_raw_nowait(55, 9).expect("send nowait");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let event = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(
+        event,
+        Event::RingMsg {
+            from: 0,
+            tag: 55,
+            val: 9
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_hot_msg_tag_remains_on_regular_event_lane() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(55)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_event()
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote.send_raw_nowait(56, 10).expect("send nowait");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let event = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(
+        event,
+        Event::RingMsg {
+            from: 0,
+            tag: 56,
+            val: 10
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coalesced_hot_msg_tag_aggregates_batch_values() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(57)
+        .coalesced_hot_msg_tag(57)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_hot_count(57)
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_many_raw_nowait([(57, 1), (57, 2), (57, 3)])
+                .expect("send many");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let event = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(event, 6);
+
+    let second = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_hot_count(57)
+            };
+            next.await
+        })
+        .expect("spawn second receiver");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), second)
+            .await
+            .is_err(),
+        "expected coalesced lane to emit a single event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_coalesced_hot_msg_tag_preserves_batch_events() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(58)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                let event = {
+                    let ctx = ShardCtx::current().expect("on shard");
+                    ctx.next_hot_event()
+                }
+                .await;
+                out.push(event);
+            }
+            out
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_many_raw_nowait([(58, 1), (58, 2), (58, 3)])
+                .expect("send many");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let events = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(
+        events,
+        vec![
+            Event::RingMsg {
+                from: 0,
+                tag: 58,
+                val: 1
+            },
+            Event::RingMsg {
+                from: 0,
+                tag: 58,
+                val: 2
+            },
+            Event::RingMsg {
+                from: 0,
+                tag: 58,
+                val: 3
+            }
+        ]
+    );
+}
+
+#[test]
+fn coalesced_hot_tag_absorbs_batch_under_tight_queue_capacity() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .msg_ring_queue_capacity(1)
+        .hot_msg_tag(59)
+        .coalesced_hot_msg_tag(59)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_hot_count(59)
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_many_raw_nowait([(59, 1), (59, 2), (59, 3)])
+                .expect("coalesced batch should fit in tight queue");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    block_on(send).expect("sender join");
+    let count = block_on(recv).expect("receiver join");
+    assert_eq!(count, 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coalesced_hot_count_accumulates_across_batches() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(61)
+        .coalesced_hot_msg_tag(61)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let mut waited = 0usize;
+            loop {
+                if let Some(total) = {
+                    let ctx = ShardCtx::current().expect("on shard");
+                    ctx.try_take_hot_count(61)
+                } {
+                    return total;
+                }
+                if waited >= 200 {
+                    panic!("timed out waiting for coalesced hot count");
+                }
+                sleep(Duration::from_millis(5)).await;
+                waited += 5;
+            }
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote
+                .send_many_raw_nowait([(61, 1), (61, 2)])
+                .expect("send first batch");
+            remote.flush().expect("flush ticket").await.expect("flush");
+            remote.send_raw_nowait(61, 3).expect("send second batch");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let total = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(total, 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_counter_threshold_does_not_starve_first_update() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .hot_msg_tag(62)
+        .coalesced_hot_msg_tag(62)
+        .hot_counter_wake_threshold(128)
+        .build()
+        .expect("runtime");
+
+    let recv = rt
+        .spawn_on(1, async {
+            let next = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.next_hot_count(62)
+            };
+            next.await
+        })
+        .expect("spawn receiver");
+
+    let send = rt
+        .spawn_on(0, async {
+            let remote = {
+                let ctx = ShardCtx::current().expect("on shard");
+                ctx.remote(1).expect("remote shard")
+            };
+            remote.send_raw_nowait(62, 1).expect("send nowait");
+            remote.flush().expect("flush ticket").await.expect("flush");
+        })
+        .expect("spawn sender");
+
+    tokio::time::timeout(Duration::from_secs(1), send)
+        .await
+        .expect("sender timeout")
+        .expect("sender join");
+    let count = tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("receiver timeout")
+        .expect("receiver join");
+    assert_eq!(count, 1);
 }
 
 #[test]

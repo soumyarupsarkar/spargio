@@ -1,7 +1,12 @@
 #[cfg(unix)]
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
-use futures::{StreamExt, channel::mpsc, executor::block_on, future::join_all};
+use futures::{
+    StreamExt,
+    channel::mpsc,
+    executor::block_on,
+    future::{Either, join_all, select},
+};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use libc;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -69,6 +74,27 @@ const PIPELINE_HEAVY_CPU_ITERS: usize = 4000;
 const PIPELINE_LIGHT_CPU_ITERS: usize = 150;
 #[cfg(unix)]
 const PIPELINE_TOTAL_FRAMES: usize = PIPELINE_STREAMS * PIPELINE_FRAMES_PER_STREAM;
+#[cfg(unix)]
+const KEYED_HOTSPOT_STEPS: usize = HOTSPOT_ROTATION_STEPS;
+#[cfg(unix)]
+const KEYED_HOTSPOT_HEAVY_FRAMES: usize = HOTSPOT_ROTATION_HEAVY_FRAMES;
+#[cfg(unix)]
+const KEYED_HOTSPOT_LIGHT_FRAMES: usize = HOTSPOT_ROTATION_LIGHT_FRAMES;
+#[cfg(unix)]
+const KEYED_HOTSPOT_FRAME_BYTES: usize = HOTSPOT_ROTATION_FRAME_BYTES;
+#[cfg(unix)]
+const KEYED_HOTSPOT_WINDOW: usize = HOTSPOT_ROTATION_WINDOW;
+#[cfg(unix)]
+const KEYED_HOTSPOT_OWNER_SHARDS: usize = 2;
+#[cfg(unix)]
+const KEYED_DISPATCHES_PER_FRAME: usize = 16;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const KEYED_DISPATCH_TAG: u16 = 0x4B44;
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+const KEYED_STOP_TAG: u16 = 0x4B45;
+#[cfg(unix)]
+const KEYED_HOTSPOT_TOTAL_FRAMES: usize = KEYED_HOTSPOT_STEPS
+    * (KEYED_HOTSPOT_HEAVY_FRAMES + ((IMBALANCED_STREAMS - 1) * KEYED_HOTSPOT_LIGHT_FRAMES));
 
 #[cfg(unix)]
 fn imbalanced_frames_for_stream(idx: usize, heavy_frames: usize, light_frames: usize) -> usize {
@@ -218,6 +244,15 @@ enum TokioNetCmd {
         light_iters: usize,
         reply: std_mpsc::Sender<u64>,
     },
+    EchoKeyedHotspot {
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        owner_shards: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
     Shutdown {
         reply: std_mpsc::Sender<()>,
     },
@@ -335,6 +370,27 @@ impl TokioNetHarness {
                                 .await;
                                 let _ = reply.send(value);
                             }
+                            TokioNetCmd::EchoKeyedHotspot {
+                                steps,
+                                heavy_frames,
+                                light_frames,
+                                payload,
+                                window,
+                                owner_shards,
+                                reply,
+                            } => {
+                                let value = tokio_echo_keyed_hotspot_rotation(
+                                    &mut streams,
+                                    steps,
+                                    heavy_frames,
+                                    light_frames,
+                                    payload,
+                                    window,
+                                    owner_shards,
+                                )
+                                .await;
+                                let _ = reply.send(value);
+                            }
                             TokioNetCmd::Shutdown { reply } => {
                                 let _ = reply.send(());
                                 break;
@@ -441,6 +497,30 @@ impl TokioNetHarness {
             })
             .expect("send echo pipeline hotspot cmd");
         rx.recv().expect("echo pipeline hotspot reply")
+    }
+
+    fn echo_keyed_hotspot_rotation(
+        &mut self,
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        owner_shards: usize,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(TokioNetCmd::EchoKeyedHotspot {
+                steps,
+                heavy_frames,
+                light_frames,
+                payload,
+                window,
+                owner_shards,
+                reply: tx,
+            })
+            .expect("send echo keyed hotspot cmd");
+        rx.recv().expect("echo keyed hotspot reply")
     }
 
     fn shutdown(&mut self) {
@@ -708,6 +788,81 @@ async fn tokio_echo_pipeline_hotspot(
     checksum
 }
 
+#[cfg(unix)]
+async fn tokio_echo_keyed_hotspot_rotation(
+    streams: &mut Vec<tokio::net::TcpStream>,
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+    owner_shards: usize,
+) -> u64 {
+    let owner_count = owner_shards.max(1);
+    let mut owner_txs = Vec::with_capacity(owner_count);
+    let mut owner_joins = tokio::task::JoinSet::new();
+    for _ in 0..owner_count {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        owner_txs.push(tx);
+        owner_joins.spawn(async move {
+            let mut sum = 0u64;
+            while let Some(v) = rx.recv().await {
+                sum = sum.wrapping_add(v as u64);
+            }
+            sum
+        });
+    }
+    let owner_txs = std::sync::Arc::new(owner_txs);
+
+    let stream_count = streams.len();
+    let moved = std::mem::take(streams);
+    let mut joins = tokio::task::JoinSet::new();
+    for (stream_idx, mut stream) in moved.into_iter().enumerate() {
+        let owner_txs = owner_txs.clone();
+        joins.spawn(async move {
+            let mut sum = 0u64;
+            for step in 0..steps {
+                let frames = hotspot_rotation_frames_for_step(
+                    stream_idx,
+                    step,
+                    stream_count,
+                    heavy_frames,
+                    light_frames,
+                );
+                if frames == 0 {
+                    continue;
+                }
+                sum = sum.wrapping_add(
+                    tokio_echo_windowed(&mut stream, frames, payload_len, window).await,
+                );
+                let owner = step % owner_txs.len().max(1);
+                let tx = &owner_txs[owner];
+                for _ in 0..frames {
+                    for _ in 0..KEYED_DISPATCHES_PER_FRAME {
+                        tx.send(1).expect("tokio keyed owner channel closed");
+                    }
+                }
+            }
+            (stream, sum)
+        });
+    }
+
+    let mut checksum = 0u64;
+    let mut restored = Vec::with_capacity(stream_count);
+    while let Some(outcome) = joins.join_next().await {
+        let (stream, value) = outcome.expect("tokio keyed hotspot stream join");
+        restored.push(stream);
+        checksum = checksum.wrapping_add(value);
+    }
+    *streams = restored;
+
+    drop(owner_txs);
+    while let Some(outcome) = owner_joins.join_next().await {
+        checksum = checksum.wrapping_add(outcome.expect("tokio keyed owner join"));
+    }
+    checksum
+}
+
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 #[derive(Clone, Copy)]
 enum SpargioStreamInitMode {
@@ -765,6 +920,15 @@ enum SpargioNetCmd {
         light_iters: usize,
         reply: std_mpsc::Sender<u64>,
     },
+    EchoKeyedHotspot {
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        owner_shards: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
     Shutdown {
         reply: std_mpsc::Sender<()>,
     },
@@ -792,6 +956,8 @@ impl SpargioNetHarness {
         let runtime = match Runtime::builder()
             .backend(BackendKind::IoUring)
             .shards(2)
+            .hot_msg_tags([KEYED_DISPATCH_TAG, KEYED_STOP_TAG])
+            .coalesced_hot_msg_tag(KEYED_DISPATCH_TAG)
             .io_uring_throughput_mode(None)
             .build()
         {
@@ -799,6 +965,8 @@ impl SpargioNetHarness {
             Err(RuntimeError::IoUringInit(_)) => match Runtime::builder()
                 .backend(BackendKind::IoUring)
                 .shards(2)
+                .hot_msg_tags([KEYED_DISPATCH_TAG, KEYED_STOP_TAG])
+                .coalesced_hot_msg_tag(KEYED_DISPATCH_TAG)
                 .build()
             {
                 Ok(rt) => rt,
@@ -927,6 +1095,28 @@ impl SpargioNetHarness {
                             .await;
                             let _ = reply.send(value);
                         }
+                        SpargioNetCmd::EchoKeyedHotspot {
+                            steps,
+                            heavy_frames,
+                            light_frames,
+                            payload,
+                            window,
+                            owner_shards,
+                            reply,
+                        } => {
+                            let value = spargio_echo_keyed_hotspot_rotation(
+                                worker_handle.clone(),
+                                &streams,
+                                steps,
+                                heavy_frames,
+                                light_frames,
+                                payload,
+                                window,
+                                owner_shards,
+                            )
+                            .await;
+                            let _ = reply.send(value);
+                        }
                         SpargioNetCmd::Shutdown { reply } => {
                             let _ = reply.send(());
                             break;
@@ -1033,6 +1223,30 @@ impl SpargioNetHarness {
             })
             .expect("send spargio pipeline hotspot cmd");
         rx.recv().expect("spargio pipeline hotspot reply")
+    }
+
+    fn echo_keyed_hotspot_rotation(
+        &mut self,
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload_len: usize,
+        window: usize,
+        owner_shards: usize,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .unbounded_send(SpargioNetCmd::EchoKeyedHotspot {
+                steps,
+                heavy_frames,
+                light_frames,
+                payload: payload_len,
+                window,
+                owner_shards,
+                reply: tx,
+            })
+            .expect("send spargio keyed hotspot cmd");
+        rx.recv().expect("spargio keyed hotspot reply")
     }
 
     fn shutdown(&mut self) {
@@ -1369,6 +1583,161 @@ async fn spargio_echo_pipeline_hotspot(
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_send_keyed_dispatch_messages(
+    remote: &spargio::RemoteShard,
+    mut count: usize,
+    batch_size: usize,
+) {
+    let batch_size = batch_size.max(1);
+    while count > 0 {
+        let chunk = count.min(batch_size);
+        let msgs = std::iter::repeat((KEYED_DISPATCH_TAG, 1u32)).take(chunk);
+        match remote.send_many_raw_nowait(msgs) {
+            Ok(()) => {
+                count -= chunk;
+            }
+            Err(spargio::SendError::Backpressure) => {
+                let ticket = remote
+                    .send_raw(KEYED_DISPATCH_TAG, 1)
+                    .expect("send keyed dispatch backpressure fallback");
+                ticket
+                    .await
+                    .expect("await keyed dispatch backpressure fallback");
+                count -= 1;
+            }
+            Err(spargio::SendError::Closed) => {
+                panic!("send keyed dispatch failed: shard closed");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn spargio_echo_keyed_hotspot_rotation(
+    handle: RuntimeHandle,
+    streams: &[SpargioBenchStream],
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+    owner_shards: usize,
+) -> u64 {
+    let owner_count = owner_shards.max(1).min(handle.shard_count().max(1));
+    let stream_count = streams.len();
+
+    let mut owner_joins = Vec::with_capacity(owner_count);
+    for owner_idx in 0..owner_count {
+        let join = handle
+            .spawn_pinned(owner_idx as spargio::ShardId, async move {
+                if stream_count == 0 {
+                    return 0u64;
+                }
+                let mut stop_seen = 0usize;
+                let mut sum = 0u64;
+                while stop_seen < stream_count {
+                    let hot_count = {
+                        spargio::ShardCtx::current()
+                            .expect("spargio keyed owner shard context")
+                            .next_hot_count(KEYED_DISPATCH_TAG)
+                    };
+                    let next = {
+                        spargio::ShardCtx::current()
+                            .expect("spargio keyed owner shard context")
+                            .next_hot_event()
+                    };
+                    match select(Box::pin(hot_count), Box::pin(next)).await {
+                        Either::Left((count, _)) => {
+                            sum = sum.wrapping_add(count);
+                        }
+                        Either::Right((spargio::Event::RingMsg { tag, val, .. }, _)) => {
+                            if tag == KEYED_STOP_TAG {
+                                stop_seen += 1;
+                            } else if tag == KEYED_DISPATCH_TAG {
+                                sum = sum.wrapping_add(val as u64);
+                            }
+                        }
+                    }
+                }
+                while let Some(count) = spargio::ShardCtx::current()
+                    .expect("spargio keyed owner shard context")
+                    .try_take_hot_count(KEYED_DISPATCH_TAG)
+                {
+                    sum = sum.wrapping_add(count);
+                }
+                sum
+            })
+            .expect("spawn spargio keyed owner");
+        owner_joins.push(join);
+    }
+
+    let mut stream_joins = Vec::with_capacity(stream_count);
+    for (stream_idx, bench_stream) in streams.iter().cloned().enumerate() {
+        let stream = bench_stream.stream;
+        let stream_for_spawn = stream.clone();
+        let keyed_remotes = (0..owner_count)
+            .map(|owner| {
+                handle
+                    .remote(owner as spargio::ShardId)
+                    .expect("spargio keyed owner remote")
+            })
+            .collect::<Vec<_>>();
+        let fut = async move {
+            let mut sum = 0u64;
+            for step in 0..steps {
+                let frames = hotspot_rotation_frames_for_step(
+                    stream_idx,
+                    step,
+                    stream_count,
+                    heavy_frames,
+                    light_frames,
+                );
+                if frames == 0 {
+                    continue;
+                }
+                sum = sum.wrapping_add(
+                    spargio_echo_windowed(
+                        &stream,
+                        frames,
+                        payload_len,
+                        window,
+                        SpargioRecvMode::ReadExact,
+                    )
+                    .await,
+                );
+                let owner_idx = step % keyed_remotes.len().max(1);
+                spargio_send_keyed_dispatch_messages(
+                    &keyed_remotes[owner_idx],
+                    frames.saturating_mul(KEYED_DISPATCHES_PER_FRAME),
+                    window.saturating_mul(2),
+                )
+                .await;
+            }
+            for remote in &keyed_remotes {
+                let ticket = remote
+                    .send_raw(KEYED_STOP_TAG, 1)
+                    .expect("send spargio keyed owner stop");
+                ticket.await.expect("await spargio keyed owner stop");
+            }
+            sum
+        };
+        let join = stream_for_spawn
+            .spawn_on_session(&handle, fut)
+            .expect("spawn spargio keyed hotspot stream");
+        stream_joins.push(join);
+    }
+
+    let mut checksum = 0u64;
+    for join in stream_joins {
+        checksum = checksum.wrapping_add(join.await.expect("spargio keyed hotspot stream join"));
+    }
+    for join in owner_joins {
+        checksum = checksum.wrapping_add(join.await.expect("spargio keyed owner join"));
+    }
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 enum CompioNetCmd {
     EchoRtt {
         rounds: usize,
@@ -1403,6 +1772,15 @@ enum CompioNetCmd {
         rotate_every: usize,
         heavy_iters: usize,
         light_iters: usize,
+        reply: std_mpsc::Sender<u64>,
+    },
+    EchoKeyedHotspot {
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        owner_shards: usize,
         reply: std_mpsc::Sender<u64>,
     },
     Shutdown {
@@ -1524,6 +1902,27 @@ impl CompioNetHarness {
                                 .await;
                                 let _ = reply.send(value);
                             }
+                            CompioNetCmd::EchoKeyedHotspot {
+                                steps,
+                                heavy_frames,
+                                light_frames,
+                                payload,
+                                window,
+                                owner_shards,
+                                reply,
+                            } => {
+                                let value = compio_echo_keyed_hotspot_rotation(
+                                    &mut streams,
+                                    steps,
+                                    heavy_frames,
+                                    light_frames,
+                                    payload,
+                                    window,
+                                    owner_shards,
+                                )
+                                .await;
+                                let _ = reply.send(value);
+                            }
                             CompioNetCmd::Shutdown { reply } => {
                                 let _ = reply.send(());
                                 break;
@@ -1636,6 +2035,30 @@ impl CompioNetHarness {
             })
             .expect("send compio pipeline hotspot cmd");
         rx.recv().expect("compio pipeline hotspot reply")
+    }
+
+    fn echo_keyed_hotspot_rotation(
+        &mut self,
+        steps: usize,
+        heavy_frames: usize,
+        light_frames: usize,
+        payload: usize,
+        window: usize,
+        owner_shards: usize,
+    ) -> u64 {
+        let (tx, rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(CompioNetCmd::EchoKeyedHotspot {
+                steps,
+                heavy_frames,
+                light_frames,
+                payload,
+                window,
+                owner_shards,
+                reply: tx,
+            })
+            .expect("send compio keyed hotspot cmd");
+        rx.recv().expect("compio keyed hotspot reply")
     }
 
     fn shutdown(&mut self) {
@@ -1911,6 +2334,64 @@ async fn compio_echo_pipeline_hotspot(
         checksum = checksum.wrapping_add(value);
     }
     *streams = restored;
+    checksum
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+async fn compio_echo_keyed_hotspot_rotation(
+    streams: &mut Vec<compio::net::TcpStream>,
+    steps: usize,
+    heavy_frames: usize,
+    light_frames: usize,
+    payload_len: usize,
+    window: usize,
+    owner_shards: usize,
+) -> u64 {
+    let owner_count = owner_shards.max(1);
+    let moved = std::mem::take(streams);
+    let stream_count = moved.len();
+    let mut work = Vec::with_capacity(stream_count);
+    for (stream_idx, mut stream) in moved.into_iter().enumerate() {
+        work.push(async move {
+            let mut sum = 0u64;
+            let mut owner_sums = vec![0u64; owner_count];
+            for step in 0..steps {
+                let frames = hotspot_rotation_frames_for_step(
+                    stream_idx,
+                    step,
+                    stream_count,
+                    heavy_frames,
+                    light_frames,
+                );
+                if frames == 0 {
+                    continue;
+                }
+                sum = sum.wrapping_add(
+                    compio_echo_windowed(&mut stream, frames, payload_len, window).await,
+                );
+                let owner = step % owner_count;
+                owner_sums[owner] = owner_sums[owner]
+                    .wrapping_add((frames.saturating_mul(KEYED_DISPATCHES_PER_FRAME)) as u64);
+            }
+            (stream, sum, owner_sums)
+        });
+    }
+
+    let mut checksum = 0u64;
+    let mut restored = Vec::with_capacity(stream_count);
+    let mut owner_totals = vec![0u64; owner_count];
+    for (stream, value, owner_sums) in join_all(work).await {
+        restored.push(stream);
+        checksum = checksum.wrapping_add(value);
+        for (idx, owner_sum) in owner_sums.into_iter().enumerate() {
+            owner_totals[idx] = owner_totals[idx].wrapping_add(owner_sum);
+        }
+    }
+    *streams = restored;
+
+    for owner_sum in owner_totals {
+        checksum = checksum.wrapping_add(owner_sum);
+    }
     checksum
 }
 
@@ -2228,13 +2709,98 @@ fn bench_net_pipeline_hotspot_rotation(c: &mut Criterion) {
 }
 
 #[cfg(unix)]
+fn bench_net_keyed_hotspot_rotation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("net_keyed_hotspot_rotation_4k");
+    group.throughput(Throughput::Bytes(
+        (KEYED_HOTSPOT_TOTAL_FRAMES * KEYED_HOTSPOT_FRAME_BYTES) as u64,
+    ));
+
+    let warmup_steps = (KEYED_HOTSPOT_STEPS / 8).max(1);
+    let warmup_heavy = (KEYED_HOTSPOT_HEAVY_FRAMES / 4).max(1);
+    let warmup_light = KEYED_HOTSPOT_LIGHT_FRAMES.max(1);
+
+    let mut tokio = TokioNetHarness::new();
+    black_box(tokio.echo_keyed_hotspot_rotation(
+        warmup_steps,
+        warmup_heavy,
+        warmup_light,
+        KEYED_HOTSPOT_FRAME_BYTES,
+        KEYED_HOTSPOT_WINDOW,
+        KEYED_HOTSPOT_OWNER_SHARDS,
+    ));
+    group.bench_function("tokio_tcp_keyed_router_hotspot", |b| {
+        b.iter(|| {
+            black_box(tokio.echo_keyed_hotspot_rotation(
+                KEYED_HOTSPOT_STEPS,
+                KEYED_HOTSPOT_HEAVY_FRAMES,
+                KEYED_HOTSPOT_LIGHT_FRAMES,
+                KEYED_HOTSPOT_FRAME_BYTES,
+                KEYED_HOTSPOT_WINDOW,
+                KEYED_HOTSPOT_OWNER_SHARDS,
+            ))
+        })
+    });
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioNetHarness::new_distributed() {
+        black_box(spargio.echo_keyed_hotspot_rotation(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            KEYED_HOTSPOT_FRAME_BYTES,
+            KEYED_HOTSPOT_WINDOW,
+            KEYED_HOTSPOT_OWNER_SHARDS,
+        ));
+        group.bench_function("spargio_tcp_keyed_router_hotspot", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_keyed_hotspot_rotation(
+                    KEYED_HOTSPOT_STEPS,
+                    KEYED_HOTSPOT_HEAVY_FRAMES,
+                    KEYED_HOTSPOT_LIGHT_FRAMES,
+                    KEYED_HOTSPOT_FRAME_BYTES,
+                    KEYED_HOTSPOT_WINDOW,
+                    KEYED_HOTSPOT_OWNER_SHARDS,
+                ))
+            })
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut compio) = CompioNetHarness::new() {
+        black_box(compio.echo_keyed_hotspot_rotation(
+            warmup_steps,
+            warmup_heavy,
+            warmup_light,
+            KEYED_HOTSPOT_FRAME_BYTES,
+            KEYED_HOTSPOT_WINDOW,
+            KEYED_HOTSPOT_OWNER_SHARDS,
+        ));
+        group.bench_function("compio_tcp_keyed_router_hotspot", |b| {
+            b.iter(|| {
+                black_box(compio.echo_keyed_hotspot_rotation(
+                    KEYED_HOTSPOT_STEPS,
+                    KEYED_HOTSPOT_HEAVY_FRAMES,
+                    KEYED_HOTSPOT_LIGHT_FRAMES,
+                    KEYED_HOTSPOT_FRAME_BYTES,
+                    KEYED_HOTSPOT_WINDOW,
+                    KEYED_HOTSPOT_OWNER_SHARDS,
+                ))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(unix)]
 criterion_group!(
     benches,
     bench_net_echo_rtt,
     bench_net_stream_throughput,
     bench_net_stream_imbalanced,
     bench_net_stream_hotspot_rotation,
-    bench_net_pipeline_hotspot_rotation
+    bench_net_pipeline_hotspot_rotation,
+    bench_net_keyed_hotspot_rotation
 );
 #[cfg(unix)]
 criterion_main!(benches);

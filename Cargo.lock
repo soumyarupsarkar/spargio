@@ -779,6 +779,7 @@ dependencies = [
  "compio",
  "criterion",
  "crossbeam-channel",
+ "crossbeam-queue",
  "futures",
  "io-uring",
  "libc",

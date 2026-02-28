@@ -3450,3 +3450,459 @@ Effect:
 - Refactor is functionally complete and fully green.
 - This specific change is mostly neutral on these two benchmark shapes
   (small movement within run-to-run noise).
+
+## Update: keyed-hotspot benchmark follow-up (event-queue/msg path optimization backlog)
+
+Context:
+
+- Added `net_keyed_hotspot_rotation_4k` in `benches/net_api.rs` to stress
+  rotating hotspot network I/O plus keyed cross-shard dispatch.
+- Current snapshot (`--sample-size 12`):
+  - `tokio_tcp_keyed_router_hotspot`: `9.2375-9.3226 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `10.061-10.254 ms`
+- Interpretation: Tokio is still faster on this shape; likely overhead comes from
+  per-message payload queueing, doorbell signaling, and event queue handling in
+  Spargio’s ring-msg path.
+
+Planned optimization ideas (highest ROI first):
+
+1. Batch payload enqueue under one lock (high ROI, low risk)
+- Problem: `SubmitRingMsgBatch` currently loops through per-message submit calls.
+- Cost: lock/unlock and per-item queue overhead in `enqueue_payload` for each msg.
+- Plan:
+  - add a true backend/io_uring batch enqueue path:
+    - one queue lock
+    - append all payloads
+    - one doorbell when queue transitions empty -> non-empty.
+- Expected impact: reduce keyed-hotspot dispatch overhead materially.
+
+2. Batch `EventState` delivery (high ROI, low-medium risk)
+- Problem: `drain_payload_queue` pushes one event at a time, each with lock+wake.
+- Plan:
+  - add `EventState::push_many(...)`
+  - queue drained ring-msg events in one critical section
+  - wake waiters once per drained batch.
+- Expected impact: lower owner-side event ingestion overhead.
+
+3. Lower synchronization cost in `EventState` (medium ROI, medium risk)
+- Problem: current queue uses mutex-protected `VecDeque` and per-push wake path.
+- Plan options:
+  - switch to lighter mutex implementation (e.g. `parking_lot`)
+  - split producer-consumer queue/waker paths to reduce contention.
+- Expected impact: lower overhead for high ring-msg event rates.
+
+4. Fast path for hot internal ring-msg tags (medium ROI, medium-high risk)
+- Problem: hot dispatch tags share same generic `EventState` path as all events.
+- Plan:
+  - route selected internal tags to dedicated per-shard mailboxes
+  - keep `next_event()` for general API compatibility
+  - use msg_ring as wake/doorbell only for these hot lanes.
+- Expected impact: better keyed-router style throughput under hotspot churn.
+
+5. Direct msg payload mode for tiny control messages (exploratory, medium-high risk)
+- Problem: payload-queue + doorbell indirection adds overhead for tiny values.
+- Plan:
+  - where semantics allow, encode tiny payloads directly in `MSG_RING` CQEs
+    (skip intermediate payload queue).
+- Expected impact: reduced dispatch overhead for control-heavy micro-messages.
+
+Validation plan for each change:
+
+- Re-run:
+  - `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 12`
+  - `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 12`
+- Track regression guardrails on:
+  - `net_stream_throughput_4k_window32`
+  - `net_stream_imbalanced_4k_hot1_light7`
+
+## Update: keyed-hotspot optimization pass (batching complete, lock-free payload A/B reverted)
+
+Implemented in this pass:
+
+1. `SubmitRingMsgBatch` now uses a true backend batch path
+- `ShardBackend::submit_ring_msg_batch(...)` submits one batch call.
+- `IoUringDriver::submit_ring_msg_batch(...)` enqueues in one queue lock section,
+  sends at most one doorbell for empty->non-empty transitions, and accounts
+  partial acceptance/backpressure once per batch.
+
+2. Event ingress now batches queue+wake
+- Added `EventState::push_many(...)` and used it from:
+  - io_uring CQE ring-msg reap path
+  - payload-queue drain path
+- `ring_msgs_completed` accounting now aggregates by batch where applicable.
+
+3. Lowered `EventState` synchronization overhead
+- Replaced mutex-protected event queue with `crossbeam_queue::SegQueue<Event>`.
+- Kept waiter registration under a small mutex (`Vec<Waker>`).
+- `push/push_many` now perform lock-free queue push and only lock to drain waiters.
+
+4. Ran a lock-free payload-queue A/B and reverted it
+- Experiment: replaced per-target/per-source payload queues with bounded
+  `ArrayQueue`.
+- Outcome:
+  - no keyed-hotspot improvement
+  - rotating-stream hotspot regressed
+- Decision: reverted payload-queue `ArrayQueue` experiment; retained
+  event-queue synchronization changes above.
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --tests`
+
+Benchmarks (post-revert baseline, `--sample-size 12`):
+
+- `net_keyed_hotspot_rotation_4k/tokio_tcp_keyed_router_hotspot`: `9.3457-9.3879 ms`
+- `net_keyed_hotspot_rotation_4k/spargio_tcp_keyed_router_hotspot`: `10.008-10.062 ms`
+
+- `net_stream_hotspot_rotation_4k/tokio_tcp_8streams_rotating_hotspot`: `8.8285-8.9134 ms`
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`: `9.3247-9.5191 ms`
+- `net_stream_hotspot_rotation_4k/compio_tcp_8streams_rotating_hotspot`: `16.668-16.808 ms`
+
+- `net_pipeline_hotspot_rotation_4k_window32/tokio_tcp_pipeline_hotspot`: `26.305-26.569 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`: `29.010-29.400 ms`
+- `net_pipeline_hotspot_rotation_4k_window32/compio_tcp_pipeline_hotspot`: `50.682-51.536 ms`
+
+Interpretation:
+
+- Batching and event-ingress improvements are in place and stable.
+- Main remaining gap on keyed-hotspot is not from payload queue lock granularity.
+- Highest-ROI remaining ideas are:
+  - hot-tag/internal mailbox fast path
+  - direct tiny-control-message `MSG_RING` payload mode (selective bypass of doorbell queue)
+
+## Update: direct `MSG_RING` control API (opt-in) + validation
+
+Implemented:
+
+- Added opt-in direct message APIs that bypass the payload queue/doorbell path:
+  - `RemoteShard::send_raw_direct_nowait(...)`
+  - `RemoteShard::send_many_raw_direct_nowait(...)`
+  - `ShardCtx::send_raw_direct_nowait(...)`
+  - `ShardCtx::send_many_raw_direct_nowait(...)`
+- Runtime wiring:
+  - new local command `SubmitRingMsgDirectBatch`
+  - backend handler `submit_ring_msg_direct_batch(...)`
+  - io_uring submit path `submit_ring_msg_direct_nowait(...)` (one `MSG_RING` SQE per message)
+
+Red/Green tests added:
+
+- `send_raw_direct_nowait_delivers_event`
+- `send_many_raw_direct_nowait_delivers_in_order`
+
+Validation:
+
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --test runtime_tdd`
+- `cargo test --features uring-native --tests`
+
+Notes:
+
+- This direct path is intentionally opt-in and currently best suited for low-volume,
+  tiny control messages.
+- Attempting to swap keyed-hotspot benchmark traffic to direct mode increased runtime
+  significantly (high per-message SQE overhead under that specific load), so benchmark
+  default was reverted to the stable batched payload-queue path.
+
+Post-change benchmark sanity snapshot:
+
+- `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `tokio_tcp_keyed_router_hotspot`: `9.2793-9.3288 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `9.9952-10.249 ms`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+  - `tokio_tcp_8streams_rotating_hotspot`: `8.7510-8.8628 ms`
+  - `spargio_tcp_8streams_rotating_hotspot`: `9.3289-9.6232 ms`
+  - `compio_tcp_8streams_rotating_hotspot`: `16.771-16.908 ms`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+  - `tokio_tcp_pipeline_hotspot`: `26.193-26.447 ms`
+  - `spargio_tcp_pipeline_hotspot`: `28.856-28.982 ms`
+  - `compio_tcp_pipeline_hotspot`: `50.464-51.058 ms`
+
+## Update: hot-tag mailbox lane (msg routing fast path) for keyed dispatch
+
+Implemented:
+
+- Runtime builder hot-tag routing configuration:
+  - `RuntimeBuilder::hot_msg_tag(tag)`
+  - `RuntimeBuilder::hot_msg_tags(iter)`
+- Added dedicated shard-local hot event lane:
+  - `ShardCtx::next_hot_event()`
+  - internal `hot_event_state` alongside regular `event_state`
+- Routed incoming ring messages by tag at ingestion time:
+  - io_uring CQE ring-msg path
+  - payload-queue drain path
+  - external `InjectRawMessage` path
+- Keyed benchmark wiring:
+  - benchmark runtime now enables hot tags for `KEYED_DISPATCH_TAG`/`KEYED_STOP_TAG`
+  - keyed owner tasks consume via `next_hot_event()`
+
+Red/Green TDD:
+
+- Added tests:
+  - `hot_msg_tag_routes_to_hot_event_lane`
+  - `non_hot_msg_tag_remains_on_regular_event_lane`
+- Existing direct-message tests retained and passing.
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --tests`
+
+Benchmark snapshot after this change:
+
+- `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `tokio_tcp_keyed_router_hotspot`: `9.4113-9.5537 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `9.9657-10.005 ms`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+  - `tokio_tcp_8streams_rotating_hotspot`: `8.6508-8.7692 ms`
+  - `spargio_tcp_8streams_rotating_hotspot`: `9.4165-9.5420 ms`
+  - `compio_tcp_8streams_rotating_hotspot`: `16.692-16.835 ms`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+  - `tokio_tcp_pipeline_hotspot`: `26.336-26.504 ms`
+  - `spargio_tcp_pipeline_hotspot`: `29.244-29.392 ms`
+  - `compio_tcp_pipeline_hotspot`: `50.869-51.357 ms`
+
+Interpretation:
+
+- Hot-tag lane is now functional and benchmarked.
+- Keyed hotspot remains close to prior best range but still behind Tokio.
+- Next likely high-ROI step remains value-coalescing for hot dispatch tags
+  (aggregate frequent tiny hot-tag increments before queueing/wake).
+
+## Update: coalesced-hot-tag ingestion (batch value aggregation)
+
+Implemented:
+
+- Added explicit coalesced-hot-tag config:
+  - `RuntimeBuilder::coalesced_hot_msg_tag(tag)`
+  - `RuntimeBuilder::coalesced_hot_msg_tags(iter)`
+- Coalesced tags are automatically treated as hot tags.
+- Extended ring-msg ingest path to coalesce same `(from, tag)` values within each
+  ingest batch before queueing hot events:
+  - io_uring CQE ring-msg batch
+  - payload-queue drain batch
+  - coalescing emits one or more `Event::RingMsg` with summed `val`
+    (chunked safely if sum exceeds `u32::MAX`).
+- Keyed benchmark harness now enables:
+  - hot tags: `KEYED_DISPATCH_TAG`, `KEYED_STOP_TAG`
+  - coalesced hot tag: `KEYED_DISPATCH_TAG`
+
+Red/Green TDD:
+
+- Added tests:
+  - `coalesced_hot_msg_tag_aggregates_batch_values`
+  - `non_coalesced_hot_msg_tag_preserves_batch_events`
+- Existing hot-lane tests retained and passing.
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --tests`
+
+Benchmark snapshot after coalescing:
+
+- `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `tokio_tcp_keyed_router_hotspot`: `9.3593-9.4503 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `9.8008-10.002 ms`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+  - `tokio_tcp_8streams_rotating_hotspot`: `8.7586-8.8332 ms`
+  - `spargio_tcp_8streams_rotating_hotspot`: `9.4692-9.6138 ms`
+  - `compio_tcp_8streams_rotating_hotspot`: `16.851-17.197 ms`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+  - `tokio_tcp_pipeline_hotspot`: `26.303-26.520 ms`
+  - `spargio_tcp_pipeline_hotspot`: `29.011-29.267 ms`
+  - `compio_tcp_pipeline_hotspot`: `50.880-51.315 ms`
+
+Interpretation:
+
+- Coalescing improved keyed-hotspot path modestly and safely, with no material
+  regression on stream/pipeline guardrails.
+- Remaining keyed-hotspot gap appears to come from broader per-event control-path
+  overhead, not just duplicate dispatch-value churn.
+
+## Update: enqueue-time coalescing for coalesced-hot tags (queue-pressure reduction)
+
+Implemented:
+
+- `IoUringDriver` now carries coalesced-hot-tag lookup and applies it while
+  writing payload queues (not only at ingest time).
+- For coalesced-hot tags, enqueue path now merges with the queue tail when
+  `(tail.tag == tag)`, including safe overflow chunking.
+- This allows tight-capacity queues to absorb bursty tiny dispatch increments
+  without immediate backpressure.
+
+Red/Green TDD:
+
+- Added `coalesced_hot_tag_absorbs_batch_under_tight_queue_capacity`:
+  - runtime with `msg_ring_queue_capacity(1)`
+  - coalesced hot tag burst `(59,1),(59,2),(59,3)`
+  - verifies success and single hot event with `val=6`
+- Full suite remains green.
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --tests`
+
+Benchmark snapshot after enqueue-time coalescing:
+
+- `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `tokio_tcp_keyed_router_hotspot`: `9.3417-9.4771 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `9.5432-9.6410 ms`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+  - `tokio_tcp_8streams_rotating_hotspot`: `8.7407-8.8063 ms`
+  - `spargio_tcp_8streams_rotating_hotspot`: `9.3352-9.4076 ms`
+  - `compio_tcp_8streams_rotating_hotspot`: `16.536-16.814 ms`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+  - `tokio_tcp_pipeline_hotspot`: `26.361-26.744 ms`
+  - `spargio_tcp_pipeline_hotspot`: `29.060-29.326 ms`
+  - `compio_tcp_pipeline_hotspot`: `50.503-51.418 ms`
+
+Interpretation:
+
+- Keyed-hotspot improved materially again; this slice appears higher ROI than
+  ingest-only coalescing.
+- Stream/pipeline guardrails remained stable.
+
+## Update: completed remaining keyed-hotspot optimization slices (counter lane + adaptive wake policy)
+
+Completed slices:
+
+1. Cross-batch hot-counter accumulation
+- Coalesced hot tags are now aggregated into shard-local counters (`u16 -> u64`)
+  instead of being emitted as per-message hot events.
+- Aggregation persists across ingest batches and drains, not only within a single
+  batch callback.
+
+2. Hot-counter consume fast path
+- Added consume API:
+  - `ShardCtx::next_hot_count(tag) -> Future<Output = u64>`
+  - `ShardCtx::try_take_hot_count(tag) -> Option<u64>`
+- Keyed benchmark owner path now consumes dispatch volume via `next_hot_count`
+  and only uses `next_hot_event` for stop/control tags.
+- This removes event-object overhead for coalesced dispatch traffic.
+
+3. Adaptive dispatch/wake policy + hardening
+- Added tuning knob:
+  - `RuntimeBuilder::hot_counter_wake_threshold(u64)`
+- Wake policy for waiting hot-counter consumers:
+  - wake on 0->nonzero transition
+  - or on crossing threshold from below.
+- Added hardening tests:
+  - `coalesced_hot_count_accumulates_across_batches`
+  - `hot_counter_threshold_does_not_starve_first_update`
+  - existing coalescing/hot-lane tests retained.
+- Kept benchmark gate reruns on:
+  - keyed hotspot (target KPI)
+  - stream hotspot (guardrail)
+  - pipeline hotspot (guardrail)
+
+Validation:
+
+- `cargo fmt`
+- `cargo check --features uring-native`
+- `cargo test --features uring-native --tests`
+
+Benchmark gate snapshot (post-slices):
+
+- `cargo bench --features uring-native --bench net_api -- net_keyed_hotspot_rotation_4k --sample-size 12`
+  - `tokio_tcp_keyed_router_hotspot`: `9.3712-9.4256 ms`
+  - `spargio_tcp_keyed_router_hotspot`: `9.5867-9.7558 ms`
+- `cargo bench --features uring-native --bench net_api -- net_stream_hotspot_rotation_4k --sample-size 10`
+  - `tokio_tcp_8streams_rotating_hotspot`: `8.7801-8.8376 ms`
+  - `spargio_tcp_8streams_rotating_hotspot`: `9.3909-9.4505 ms`
+  - `compio_tcp_8streams_rotating_hotspot`: `16.640-17.098 ms`
+- `cargo bench --features uring-native --bench net_api -- net_pipeline_hotspot_rotation_4k_window32 --sample-size 10`
+  - `tokio_tcp_pipeline_hotspot`: `26.380-26.482 ms`
+  - `spargio_tcp_pipeline_hotspot`: `28.856-29.242 ms`
+  - `compio_tcp_pipeline_hotspot`: `50.770-51.273 ms`
+
+Outcome:
+
+- Remaining planned slices for this keyed-hotspot track are now implemented.
+- Spargio is now very close to Tokio on keyed-hotspot in this harness, with stable
+  guardrails on other hotspot shapes.
+
+## Update: keyed hotspot benchmark now includes Compio
+
+Added `compio` variant to `net_keyed_hotspot_rotation_4k`:
+
+- new bench case: `compio_tcp_keyed_router_hotspot`
+- wired through `CompioNetCmd::EchoKeyedHotspot`, harness command handling, and
+  `compio_echo_keyed_hotspot_rotation(...)`.
+
+Sanity run (`--sample-size 10`):
+
+- `tokio_tcp_keyed_router_hotspot`: `9.2799-9.3554 ms`
+- `spargio_tcp_keyed_router_hotspot`: `9.5718-9.7460 ms`
+- `compio_tcp_keyed_router_hotspot`: `16.652-16.712 ms`
+
+## Update: full benchmark refresh + README sync (2026-02-27)
+
+Ran the full benchmark suite with current `uring-native` implementation and
+updated README benchmark tables/interpretation to match.
+
+Commands:
+
+- `cargo bench --features uring-native --bench ping_pong -- --sample-size 12`
+- `cargo bench --features uring-native --bench fanout_fanin -- --sample-size 12`
+- `cargo bench --features uring-native --bench fs_api -- --sample-size 12`
+- `cargo bench --features uring-native --bench net_api -- --sample-size 12`
+
+Snapshot:
+
+- Coordination (Tokio vs Spargio):
+  - `steady_ping_pong_rtt`: Tokio `1.4911-1.5024 ms`, Spargio `394.83-396.21 us`
+  - `steady_one_way_send_drain`: Tokio `68.607-70.859 us`, Spargio `49.232-50.110 us`
+  - `cold_start_ping_pong`: Tokio `553.31-561.83 us`, Spargio `284.23-287.50 us`
+  - `fanout_fanin_balanced`: Tokio `1.4534-1.4631 ms`, Spargio `1.3426-1.3480 ms`
+  - `fanout_fanin_skewed`: Tokio `2.4026-2.4220 ms`, Spargio `1.9979-2.0032 ms`
+
+- Native API (Tokio vs Spargio vs Compio):
+  - `fs_read_rtt_4k`: Tokio `1.6174-1.6565 ms`, Spargio `1.0008-1.0188 ms`, Compio `1.4782-1.4978 ms`
+  - `fs_read_throughput_4k_qd32`: Tokio `7.8804-8.1672 ms`, Spargio `6.1570-6.2793 ms`, Compio `4.0877-5.0803 ms`
+  - `net_echo_rtt_256b`: Tokio `7.7462-7.9687 ms`, Spargio `5.4356-5.5084 ms`, Compio `6.4541-6.5632 ms`
+  - `net_stream_throughput_4k_window32`: Tokio `11.142-11.247 ms`, Spargio `10.745-10.813 ms`, Compio `7.0631-7.1570 ms`
+
+- Imbalanced native API:
+  - `net_stream_imbalanced_4k_hot1_light7`: Tokio `13.584-13.799 ms`, Spargio `13.191-13.375 ms`, Compio `12.283-12.414 ms`
+  - `net_stream_hotspot_rotation_4k`: Tokio `8.7891-8.8560 ms`, Spargio `9.3683-9.4526 ms`, Compio `16.870-16.982 ms`
+  - `net_pipeline_hotspot_rotation_4k_window32`: Tokio `26.415-26.654 ms`, Spargio `29.113-29.517 ms`, Compio `50.648-51.210 ms`
+  - `net_keyed_hotspot_rotation_4k`: Tokio `9.3152-9.4912 ms`, Spargio `9.5691-9.7957 ms`, Compio `16.781-16.994 ms`
+
+Interpretation updates reflected in README:
+
+- Spargio retains clear lead on coordination-heavy and low-depth latency cases.
+- Compio retains lead on sustained balanced stream throughput and static-hotspot imbalance.
+- Tokio remains ahead in rotating-hotspot stream/pipeline; keyed routing is near parity.
+
+## Note: do the network optimizations fit Spargio's value proposition?
+
+Question:
+
+- Do the network optimizations we added to close the Tokio gap actually make sense
+  for Spargio, and are they realistic for users to adopt?
+
+Answer:
+
+- Yes, primarily when they reduce cross-shard coordination cost (coalesced hot
+  tags, hot-counter fast path, adaptive wake policy, keyed ownership routing).
+  These directly support Spargio's core value proposition: efficient
+  `io_uring` + `msg_ring` work-stealing/steering under coordination-heavy load.
+- These optimizations are most relevant for keyable/skewed multi-stream
+  workloads (tenant/session/partition keyed routing), where steering and
+  aggregation reduce dispatch overhead.
+- They should remain opt-in tuning for advanced users. Default paths should
+  stay simple and semantically conservative when applications need per-message
+  event fidelity and straightforward observability.
+
+Follow-up planned:
+
+- Add user-facing documentation for these knobs (what each knob does, semantic
+  trade-offs, recommended workload shapes, and safe defaults), plus a short
+  tuning guide in README/docs.
