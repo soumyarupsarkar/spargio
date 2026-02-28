@@ -5638,3 +5638,48 @@ Executed and passing:
 - `cargo test -p spargio-signal --test maturity_tdd`
 - `cargo test -p spargio-process`
 - `cargo test -p spargio-signal`
+
+## Update: Phase 6 implemented (hardening + operations lanes) with Red/Green TDD (2026-02-28)
+
+Executed an operations-focused hardening slice for companion crates and CI
+coverage.
+
+### Red tests added first
+
+- added root test file: `tests/companion_ops_tdd.rs`
+  - `companion_ci_smoke_script_exists_and_targets_companion_crates`
+  - `ci_workflow_has_companion_matrix_lane`
+
+Observed expected red state:
+
+- missing `scripts/companion_ci_smoke.sh`
+- missing `companion-matrix` CI job wiring in `.github/workflows/ci.yml`
+
+### Implementation delivered
+
+Companion smoke script:
+
+- added `scripts/companion_ci_smoke.sh`:
+  - `cargo test -p spargio-protocols --features uring-native`
+  - `cargo test -p spargio-tls --test tls_tdd`
+  - `cargo test -p spargio-ws --test ws_tdd`
+  - `cargo test -p spargio-quic --test quic_tdd`
+  - `cargo test -p spargio-process`
+  - `cargo test -p spargio-signal`
+
+CI workflow hardening:
+
+- added `companion-matrix` job in `.github/workflows/ci.yml` that runs:
+  - `./scripts/companion_ci_smoke.sh`
+
+Operational intent:
+
+- catch protocol bridge drift and companion crate regressions in a dedicated CI
+  lane, independent of core runtime test jobs.
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test --test companion_ops_tdd`
+- `./scripts/companion_ci_smoke.sh`
