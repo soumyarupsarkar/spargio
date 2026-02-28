@@ -5683,3 +5683,55 @@ Executed and passing:
 
 - `cargo test --test companion_ops_tdd`
 - `./scripts/companion_ci_smoke.sh`
+
+## Update: Phase 7 implemented (docs + polish) with validation (2026-02-28)
+
+Executed documentation/polish updates to reflect delivered companion-crate
+work and provide explicit API-selection guidance.
+
+### README updates
+
+Updated done/not-done sections to match current implementation state:
+
+- done:
+  - companion crate suite now explicitly includes:
+    - `spargio-process`
+    - `spargio-signal`
+    - `spargio-protocols` (legacy blocking bridge)
+    - `spargio-tls`
+    - `spargio-ws`
+    - `spargio-quic`
+  - companion hardening lane (`scripts/companion_ci_smoke.sh` + CI job).
+  - docs scaffold note updated to include protocol/API-selection coverage.
+- not done:
+  - clarified remaining maturity gaps as advanced tuning/surface depth and
+    long-window operational hardening, not absence of companion crates.
+
+Companion dependency polish:
+
+- pinned `spargio-tls` rustls/futures-rustls features to a single crypto
+  provider (`ring`) to avoid workspace-wide TLS/QUIC provider ambiguity during
+  unified test runs.
+
+### mdBook coverage expansion
+
+Added new chapters:
+
+- `book/src/companion_protocols.md`
+  - direct upstream vs `spargio-*` adapter selection guidance.
+  - explicit scope boundary (thin adapters, no protocol engine rewrite).
+- `book/src/companion_stability.md`
+  - semver/deprecation baseline policy for companion crates.
+  - CI/operations expectations for compatibility maintenance.
+
+Updated:
+
+- `book/src/SUMMARY.md` links to new chapters.
+- `book/src/migration.md` includes protocol companion migration guidance.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --test docs_tdd`
+- `mdbook build book`

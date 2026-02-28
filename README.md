@@ -134,19 +134,20 @@ For performance, different workload shapes favor different runtimes.
 - Explicit socket-address APIs that bypass DNS resolution: `connect_socket_addr*` and `bind_socket_addr`.
 - Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
 - Mixed-runtime boundary API: `spargio::boundary`.
-- Workspace companion crates: `spargio-signal`, `spargio-protocols` (TLS/WS/QUIC blocking-bridge integrations), and `spargio-process`.
-- In-repo long-form docs scaffold: `book/` (`mdBook`) with CI build gate.
+- Companion crate suite: `spargio-process`, `spargio-signal`, `spargio-protocols` (legacy blocking bridge helpers), `spargio-tls` (rustls/futures-rustls adapter), `spargio-ws` (async-tungstenite adapter), and `spargio-quic` (quinn bridge).
+- Companion hardening lane: `scripts/companion_ci_smoke.sh` plus CI `companion-matrix` job.
+- In-repo long-form docs scaffold: `book/` (`mdBook`) with protocol/API-selection and migration chapters.
 - Reference mixed-mode service example.
 
 ## What's Not Done Yet
 
-- Full production-grade higher-level ecosystem parity is still in progress; companion crates exist, but deeper protocol-specific adapters and maturity work remain (`process`, `signal`, `tls`, `ws`, `quic`).
+- Full production-grade higher-level ecosystem parity is still in progress; companion crates now provide practical bridges, but deeper protocol-specific maturity remains (broader TLS/WS/QUIC tuning surfaces, richer process stdio orchestration, and stronger long-window soak/failure coverage).
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `create_dir_all`, `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`metadata_lite` exists as native-first alternative).
-- Production hardening: stress/soak/failure injection, deeper observability, and long-window p95/p99 gates.
+- Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
 - Expand `book/` coverage into deeper API-selection, placement, and operations guides.
-- Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) as a separate large-investment track.
+- Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) is explicitly deprioritized for now (backlog-only, not planned right now).
 
 ## Contributor Quick Start
 
@@ -164,6 +165,7 @@ Benchmark helpers:
 ./scripts/bench_ping_guardrail.sh
 ./scripts/bench_fanout_guardrail.sh
 ./scripts/bench_kpi_guardrail.sh
+./scripts/companion_ci_smoke.sh
 ```
 
 Reference app:
