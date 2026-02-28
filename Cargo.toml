@@ -40,6 +40,7 @@ members = [
   "crates/spargio-process",
   "crates/spargio-tls",
   "crates/spargio-ws",
+  "crates/spargio-quic",
 ]
 resolver = "2"
 

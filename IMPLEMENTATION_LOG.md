@@ -5513,3 +5513,58 @@ Semantics:
 Executed and passing:
 
 - `cargo test -p spargio-ws --test ws_tdd`
+
+## Update: Phase 4 implemented (QUIC companion bridge, quinn-first) with Red/Green TDD (2026-02-28)
+
+Executed a red-first `quinn` companion bridge implementation focused on
+runtime integration and execution semantics.
+
+### Red tests added first
+
+- created new workspace crate: `crates/spargio-quic`
+- added `crates/spargio-quic/tests/quic_tdd.rs` with:
+  - `quic_bridge_runs_async_work`
+  - `quic_bridge_timeout_is_enforced`
+
+Observed expected red state:
+
+- unresolved API imports in `spargio_quic`:
+  - `QuicBridge`
+  - `QuicOptions`
+
+### Implementation delivered
+
+Workspace wiring:
+
+- added `crates/spargio-quic` to root workspace members.
+- crate deps include:
+  - `quinn`
+  - `tokio` (current-thread runtime execution lane)
+  - `spargio`
+
+Public API:
+
+- options and wrappers:
+  - `QuicOptions` (optional timeout)
+  - `QuicBridge`
+- execution entrypoints:
+  - `run(...)`
+  - `run_with_options(...)`
+  - `QuicBridge::run(...)`
+  - `QuicBridge::with_endpoint(...)` (quinn endpoint lifecycle bridge helper)
+- explicit re-export:
+  - `pub use quinn;`
+
+Semantics:
+
+- bridge executes async quinn workflows on a Tokio current-thread runtime built
+  inside `RuntimeHandle::spawn_blocking(...)`.
+- timeout enforced via `spargio::timeout(...)` -> `io::ErrorKind::TimedOut`.
+- runtime rejection/cancel mapped to `io::Error` consistently with companion
+  bridge behavior.
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
