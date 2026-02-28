@@ -539,6 +539,28 @@ where
     outcome
 }
 
+/// Runs a top-level local (`!Send`) async job on a specific shard.
+///
+/// The `entry` closure is sent to `shard` and invoked there with that shard's
+/// [`ShardCtx`], allowing the returned future to be `!Send`.
+pub async fn run_local_on<F, Fut, T>(
+    builder: RuntimeBuilder,
+    shard: ShardId,
+    entry: F,
+) -> Result<T, RuntimeError>
+where
+    F: FnOnce(ShardCtx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    let mut runtime = builder.build()?;
+    let handle = runtime.handle();
+    let join = handle.spawn_local_on(shard, entry)?;
+    let outcome = join.await.map_err(|_| RuntimeError::Closed);
+    runtime.shutdown().await;
+    outcome
+}
+
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     inner: Arc<CancellationState>,
@@ -1143,6 +1165,24 @@ impl RuntimeHandle {
 
     pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
         self.inner.remotes.get(usize::from(shard)).cloned()
+    }
+
+    pub fn spawn_local_on<F, Fut, T>(
+        &self,
+        shard: ShardId,
+        init: F,
+    ) -> Result<JoinHandle<T>, RuntimeError>
+    where
+        F: FnOnce(ShardCtx) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        self.inner
+            .shared
+            .stats
+            .spawn_pinned_submitted
+            .fetch_add(1, Ordering::Relaxed);
+        spawn_local_on_shared(&self.inner.shared, shard, init)
     }
 
     pub fn spawn_pinned<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
@@ -2933,6 +2973,41 @@ where
             shard,
             Command::Spawn(Box::pin(async move {
                 let out = fut.await;
+                let _ = tx.send(out);
+            })),
+        )
+        .map_err(|_| RuntimeError::InvalidShard(shard))?;
+
+    Ok(JoinHandle { rx: Some(rx) })
+}
+
+fn spawn_local_on_shared<F, Fut, T>(
+    shared: &Arc<RuntimeShared>,
+    shard: ShardId,
+    init: F,
+) -> Result<JoinHandle<T>, RuntimeError>
+where
+    F: FnOnce(ShardCtx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    let runtime_id = shared.runtime_id;
+    shared
+        .send_to(
+            shard,
+            Command::Spawn(Box::pin(async move {
+                let local_join = {
+                    let Some(ctx) = ShardCtx::current().filter(|ctx| ctx.runtime_id() == runtime_id)
+                    else {
+                        return;
+                    };
+                    let fut = init(ctx.clone());
+                    ctx.spawn_local(fut)
+                };
+                let Ok(out) = local_join.await else {
+                    return;
+                };
                 let _ = tx.send(out);
             })),
         )

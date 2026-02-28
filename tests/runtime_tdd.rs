@@ -1,5 +1,10 @@
 use futures::executor::block_on;
-use spargio::{BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_with, sleep};
+use spargio::{
+    BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_local_on, run_with,
+    sleep,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -730,6 +735,49 @@ async fn run_with_propagates_builder_errors() {
         .await
         .expect_err("invalid runtime config");
     assert!(matches!(err, RuntimeError::InvalidConfig(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_local_on_accepts_non_send_future() {
+    let out = match run_local_on(
+        Runtime::builder().shards(1).backend(BackendKind::IoUring),
+        0,
+        |ctx| {
+            let local = Rc::new(RefCell::new(40usize));
+            async move {
+                assert_eq!(ctx.shard_id(), 0);
+                *local.borrow_mut() += 2;
+                *local.borrow()
+            }
+        },
+    )
+    .await
+    {
+        Ok(out) => out,
+        #[cfg(target_os = "linux")]
+        Err(RuntimeError::IoUringInit(_)) | Err(RuntimeError::UnsupportedBackend(_)) => return,
+        Err(err) => panic!("unexpected run_local_on error: {err:?}"),
+    };
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn runtime_handle_spawn_local_on_accepts_non_send_future() {
+    let rt = Runtime::builder().shards(2).build().expect("runtime");
+    let handle = rt.handle();
+    let join = handle
+        .spawn_local_on(1, |ctx| {
+            let local = Rc::new(RefCell::new(5usize));
+            async move {
+                assert_eq!(ctx.shard_id(), 1);
+                *local.borrow_mut() += 1;
+                (ctx.shard_id(), *local.borrow())
+            }
+        })
+        .expect("spawn local on");
+    let (shard, out) = block_on(join).expect("join");
+    assert_eq!(shard, 1);
+    assert_eq!(out, 6);
 }
 
 #[test]

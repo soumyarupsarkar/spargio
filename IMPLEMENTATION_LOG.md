@@ -3939,3 +3939,128 @@ Outcome:
 
 - Removed known flake in `uring-native` test suite.
 - No runtime behavior change; this was a test synchronization fix.
+
+## Update: Compio parity audit snapshot (2026-02-28)
+
+Captured a focused feature-parity snapshot against current Compio docs and
+our current public `spargio` surface, with emphasis on practical user-facing
+gaps.
+
+### I/O API breadth: present vs missing
+
+Current Spargio public I/O surface:
+
+- `fs`: `OpenOptions` + `File` with `open/create/from_std`, positional
+  `read_at`/`read_at_into`/`write_at`/`write_all_at`, `read_to_end_at`, `fsync`.
+- `net`: TCP-only (`TcpStream`, `TcpListener`) including session-policy connect/accept,
+  owned buffer APIs, and multishot segment receive helpers.
+- runtime-native unbound lane methods routed through `io_uring`.
+
+Compared with Compio's documented surface, notable missing breadth in Spargio:
+
+1. Filesystem path-level helpers and metadata APIs
+   - examples: `create_dir`, `create_dir_all`, `hard_link`, `metadata`,
+     `remove_dir`, `remove_file`, `rename`, `set_permissions`, `symlink`,
+     `symlink_metadata`, convenience `read`/`write`.
+2. Broader network protocol/socket families
+   - UDP and Unix domain socket APIs (`UdpSocket`, `UnixListener`,
+     `UnixStream`, `UnixDatagram`) are not currently in Spargio public API.
+3. Generic async I/O trait/adaptor layer
+   - no public Spargio equivalent to Compio `io` traits and adapters
+     (`AsyncRead`/`AsyncWrite` families, buffered wrappers, compat/framed utilities).
+4. Higher-level transport/runtime-integrated modules
+   - no Spargio public modules corresponding to Compio optional
+     `process`/`signal`/`tls`/`ws`/`quic` ecosystem crates.
+
+This aligns with existing README scope note:
+
+- "Broader filesystem and network native-op surface ... not done yet."
+
+### Core runtime parity: what is still missing in Spargio
+
+Core runtime is functional and differentiated (shards, placement APIs,
+work-stealing MVP, timers, cancellation/task group, boundary APIs), but gaps
+remain versus broader runtime ecosystems:
+
+1. Backend/platform breadth
+   - `BackendKind` is currently `IoUring` only.
+2. Top-level `!Send` ergonomics
+   - public runtime handle spawn paths require `Send`; `!Send` execution is
+     currently available only via shard-local `ShardCtx::spawn_local(...)`.
+3. Time/runtime utility breadth
+   - currently minimal top-level primitives (`sleep`, `timeout`) rather than a
+     fuller interval/deadline utility set.
+4. Production hardening/tuning depth
+   - advanced stealing policy tuning and long-window hardening/observability are
+     still listed as pending in project docs.
+
+Conclusion:
+
+- Spargio currently has partial feature overlap with Compio for core
+  fs/tcp runtime workflows, but does not yet have Compio-level I/O breadth.
+- Current project direction remains valid: keep differentiating on
+  cross-shard coordination + placement/stealing, while closing practical
+  fs/net/runtime-surface gaps incrementally.
+
+## Update: `!Send` ergonomics slice (`run_local_on` + `spawn_local_on`) (2026-02-28)
+
+Captured and implemented the proposal discussed in review:
+
+- add a first-class local-entry helper that can run `!Send` futures on a chosen shard.
+- add a handle-level construct-on-shard API so callers can build `!Send` futures
+  on target shard context without requiring a prior `ShardCtx` hop.
+
+### Red phase
+
+Added failing tests in `tests/runtime_tdd.rs`:
+
+- `run_local_on_accepts_non_send_future`
+- `runtime_handle_spawn_local_on_accepts_non_send_future`
+
+Red failure signals:
+
+- unresolved import: `spargio::run_local_on`
+- missing method: `RuntimeHandle::spawn_local_on`
+
+### Green phase
+
+Implemented public APIs in `src/lib.rs`:
+
+1. New top-level entry helper
+   - `run_local_on(builder, shard, entry)`
+   - signature accepts `entry: FnOnce(ShardCtx) -> Fut + Send`, with `Fut: Future + 'static`
+     (no `Send` bound on `Fut`), and `T: Send`.
+2. New runtime-handle API
+   - `RuntimeHandle::spawn_local_on(shard, init)`
+   - same construct-on-shard shape and `!Send` future support.
+3. Internal spawn path
+   - added `spawn_local_on_shared(...)`.
+   - implementation routes through existing shard command channel (`Command::Spawn`)
+     and, on the target shard, constructs the future using live `ShardCtx`,
+     then executes it via `ctx.spawn_local(...)`.
+
+Design notes:
+
+- No new scheduler lane or command type was required.
+- `!Send` is enabled by constructing the future on the shard and running it via
+  local spawner; cross-thread transfer only carries the `Send` initializer closure.
+- Return type remains `JoinHandle<T>` with `T: Send` for cross-thread join safety.
+
+### Validation
+
+Commands run:
+
+- `cargo test --features uring-native --test runtime_tdd run_local_on_accepts_non_send_future`
+- `cargo test --features uring-native --test runtime_tdd runtime_handle_spawn_local_on_accepts_non_send_future`
+- `cargo test --features uring-native --test runtime_tdd`
+
+Result:
+
+- both new tests pass.
+- full `runtime_tdd` suite passes (`24 passed`).
+
+### Outcome
+
+- Spargio now supports a direct top-level local entry and handle-level local
+  spawn path for `!Send` futures, reducing friction for shard-local state
+  patterns (`Rc`, `RefCell`, etc.) while preserving existing shard-safety model.
