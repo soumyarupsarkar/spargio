@@ -4934,3 +4934,58 @@ Executed and passing:
 
 - `cargo test --test boundary_tdd --test slices_tdd --test bench_tail_guardrail_tdd`
 - `cargo test --test stress_tdd -- --ignored`
+
+## Update: Milestone M2 implemented (safe extension wrappers + cookbook) with Red/Green TDD (2026-02-28)
+
+Executed Milestone M2 scope with red-first tests and wrapper/docs delivery.
+
+### Red phase
+
+Added failing test in `tests/uring_native_tdd.rs`:
+
+- `uring_native_safe_extension_statx_wraps_unsafe_submission`
+
+Expected red failure:
+
+- unresolved safe wrapper API:
+  - `spargio::extension::fs::statx_on_shard`
+  - `spargio::extension::fs::StatxOptions`
+  - `spargio::extension::fs::statx_or_metadata`.
+
+### Green phase
+
+Implemented a first safe-wrapper extension surface in `src/lib.rs`:
+
+- new module: `spargio::extension::fs`
+- new safe APIs:
+  - `statx(native, path)`
+  - `statx_on_shard(native, shard, path, options)`
+  - `statx_or_metadata(handle, path)` (kernel-support fallback)
+- new typed outputs/options:
+  - `StatxMetadata`
+  - `StatxOptions`
+
+Implementation details:
+
+- wrappers encapsulate all `unsafe` usage internally and keep extension state
+  owned until CQE completion (`CString` + output buffer in owned state struct).
+- unsupported native-op errors (`EINVAL`/`ENOSYS`/`EOPNOTSUPP`) fall back to
+  blocking `std::fs::metadata` through `RuntimeHandle::spawn_blocking`.
+- explicit-shard and selector-driven variants both provided.
+
+Cookbook/docs/examples:
+
+- added `docs/native_extension_cookbook.md`:
+  - ownership/lifetime pattern
+  - affinity pattern
+  - fallback pattern
+  - explicit safety checklist for extension authors.
+- added example `examples/native_extension_statx.rs` showing end-to-end usage
+  with no user-facing `unsafe`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --features uring-native --test uring_native_tdd uring_native_safe_extension_statx_wraps_unsafe_submission`
+- `cargo test --features uring-native --test uring_native_tdd`

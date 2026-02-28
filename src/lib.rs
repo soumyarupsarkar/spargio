@@ -4443,6 +4443,208 @@ pub mod io {
     }
 }
 
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+pub mod extension {
+    pub mod fs {
+        use super::super::{RuntimeError, RuntimeHandle, ShardId, UringCqe, UringNativeAny};
+        use io_uring::{opcode, types};
+        use std::ffi::CString;
+        use std::io;
+        use std::mem::MaybeUninit;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct StatxMetadata {
+            pub mask: u32,
+            pub mode: u16,
+            pub nlink: u32,
+            pub uid: u32,
+            pub gid: u32,
+            pub size: u64,
+            pub atime_sec: i64,
+            pub mtime_sec: i64,
+            pub ctime_sec: i64,
+            pub btime_sec: i64,
+        }
+
+        impl StatxMetadata {
+            fn from_raw(raw: libc::statx) -> Self {
+                Self {
+                    mask: raw.stx_mask,
+                    mode: raw.stx_mode,
+                    nlink: raw.stx_nlink,
+                    uid: raw.stx_uid,
+                    gid: raw.stx_gid,
+                    size: raw.stx_size,
+                    atime_sec: raw.stx_atime.tv_sec,
+                    mtime_sec: raw.stx_mtime.tv_sec,
+                    ctime_sec: raw.stx_ctime.tv_sec,
+                    btime_sec: raw.stx_btime.tv_sec,
+                }
+            }
+
+            fn from_metadata(meta: std::fs::Metadata) -> Self {
+                Self {
+                    mask: 0,
+                    mode: (meta.mode() & 0o7777) as u16,
+                    nlink: u32::try_from(meta.nlink()).unwrap_or(u32::MAX),
+                    uid: meta.uid(),
+                    gid: meta.gid(),
+                    size: meta.len(),
+                    atime_sec: meta.atime(),
+                    mtime_sec: meta.mtime(),
+                    ctime_sec: meta.ctime(),
+                    btime_sec: 0,
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct StatxOptions {
+            pub flags: i32,
+            pub mask: u32,
+        }
+
+        impl Default for StatxOptions {
+            fn default() -> Self {
+                Self {
+                    flags: libc::AT_STATX_SYNC_AS_STAT,
+                    mask: libc::STATX_BASIC_STATS,
+                }
+            }
+        }
+
+        impl StatxOptions {
+            pub fn flags(mut self, flags: i32) -> Self {
+                self.flags = flags;
+                self
+            }
+
+            pub fn mask(mut self, mask: u32) -> Self {
+                self.mask = mask;
+                self
+            }
+        }
+
+        pub async fn statx(
+            native: &UringNativeAny,
+            path: impl AsRef<Path>,
+        ) -> io::Result<StatxMetadata> {
+            statx_on_shard(
+                native,
+                native.select_shard(None).map_err(runtime_error_to_io)?,
+                path,
+                StatxOptions::default(),
+            )
+            .await
+        }
+
+        pub async fn statx_on_shard(
+            native: &UringNativeAny,
+            shard: ShardId,
+            path: impl AsRef<Path>,
+            options: StatxOptions,
+        ) -> io::Result<StatxMetadata> {
+            let c_path = super::super::path_to_cstring_for_native_ops(path.as_ref())?;
+            let state = StatxState {
+                path: c_path,
+                statx: MaybeUninit::zeroed(),
+                options,
+            };
+
+            let result = unsafe {
+                native
+                    .submit_unsafe_on_shard(
+                        shard,
+                        state,
+                        |state| {
+                            Ok(opcode::Statx::new(
+                                types::Fd(libc::AT_FDCWD),
+                                state.path.as_ptr(),
+                                state.statx.as_mut_ptr().cast::<types::statx>(),
+                            )
+                            .flags(state.options.flags)
+                            .mask(state.options.mask)
+                            .build())
+                        },
+                        |state, cqe| {
+                            cqe_to_io_result(cqe)?;
+                            // Kernel writes the output struct before CQE completion.
+                            let raw = state.statx.assume_init();
+                            Ok(StatxMetadata::from_raw(raw))
+                        },
+                    )
+                    .await
+            };
+            result
+        }
+
+        pub async fn statx_or_metadata(
+            handle: RuntimeHandle,
+            path: impl AsRef<Path>,
+        ) -> io::Result<StatxMetadata> {
+            let path = path.as_ref().to_path_buf();
+            let native = handle.uring_native_unbound().map_err(runtime_error_to_io)?;
+            match statx(&native, &path).await {
+                Ok(meta) => Ok(meta),
+                Err(err) if is_unsupported_native_statx(&err) => {
+                    let path_for_blocking = path.clone();
+                    let join = handle
+                        .spawn_blocking(move || std::fs::metadata(path_for_blocking))
+                        .map_err(runtime_error_to_io)?;
+                    let metadata = join.await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "blocking metadata task canceled")
+                    })??;
+                    Ok(StatxMetadata::from_metadata(metadata))
+                }
+                Err(err) => Err(err),
+            }
+        }
+
+        #[derive(Debug)]
+        struct StatxState {
+            path: CString,
+            statx: MaybeUninit<libc::statx>,
+            options: StatxOptions,
+        }
+
+        fn cqe_to_io_result(cqe: UringCqe) -> io::Result<()> {
+            if cqe.result < 0 {
+                return Err(io::Error::from_raw_os_error(-cqe.result));
+            }
+            Ok(())
+        }
+
+        fn is_unsupported_native_statx(err: &io::Error) -> bool {
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            )
+        }
+
+        fn runtime_error_to_io(err: RuntimeError) -> io::Error {
+            match err {
+                RuntimeError::InvalidConfig(msg) => {
+                    io::Error::new(io::ErrorKind::InvalidInput, msg)
+                }
+                RuntimeError::ThreadSpawn(io) => io,
+                RuntimeError::InvalidShard(shard) => {
+                    io::Error::new(io::ErrorKind::NotFound, format!("invalid shard {shard}"))
+                }
+                RuntimeError::Closed => io::Error::new(io::ErrorKind::BrokenPipe, "runtime closed"),
+                RuntimeError::Overloaded => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "runtime overloaded")
+                }
+                RuntimeError::UnsupportedBackend(msg) => {
+                    io::Error::new(io::ErrorKind::Unsupported, msg)
+                }
+                RuntimeError::IoUringInit(io) => io,
+            }
+        }
+    }
+}
+
 fn spawn_on_shared<F, T>(
     shared: &Arc<RuntimeShared>,
     shard: ShardId,

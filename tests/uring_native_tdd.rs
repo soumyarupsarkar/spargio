@@ -559,6 +559,47 @@ mod linux_uring_native_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_native_safe_extension_statx_wraps_unsafe_submission() {
+        let Some(rt) = try_build_io_uring_runtime_shards(2) else {
+            return;
+        };
+        let path = unique_temp_path("uring-native-safe-ext-statx");
+        std::fs::write(&path, b"safe-extension-data").expect("seed");
+
+        let any = rt.handle().uring_native_unbound().expect("native any");
+        let shard = any.select_shard(None).expect("select shard");
+        let direct = spargio::extension::fs::statx_on_shard(
+            &any,
+            shard,
+            &path,
+            spargio::extension::fs::StatxOptions::default(),
+        )
+        .await;
+
+        let direct = match direct {
+            Ok(value) => value,
+            Err(err) if is_unsupported_native_fs_path_op(&err) => {
+                let fallback = spargio::extension::fs::statx_or_metadata(rt.handle(), &path)
+                    .await
+                    .expect("fallback metadata");
+                assert_eq!(fallback.size, b"safe-extension-data".len() as u64);
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            Err(err) => panic!("statx_on_shard failed unexpectedly: {err}"),
+        };
+
+        assert_eq!(direct.size, b"safe-extension-data".len() as u64);
+        assert!(direct.mode != 0, "mode should be populated");
+
+        let fallback = spargio::extension::fs::statx_or_metadata(rt.handle(), &path)
+            .await
+            .expect("fallback metadata");
+        assert_eq!(fallback.size, direct.size);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uring_native_unbound_fs_path_ops_cover_mkdir_rename_link_symlink_and_unlink() {
         let Some(rt) = try_build_io_uring_runtime_shards(1) else {
             return;
