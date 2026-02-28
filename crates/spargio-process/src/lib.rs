@@ -6,7 +6,8 @@
 use spargio::{RuntimeError, RuntimeHandle};
 use std::ffi::OsStr;
 use std::io;
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Child, Command, ExitStatus, Output};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub async fn status(handle: &RuntimeHandle, command: Command) -> io::Result<ExitStatus> {
@@ -45,6 +46,29 @@ pub async fn output_with_options(
         "process output task timed out",
     )
     .await
+}
+
+pub async fn spawn(handle: &RuntimeHandle, command: Command) -> io::Result<ChildHandle> {
+    spawn_with_options(handle, command, CommandOptions::default()).await
+}
+
+pub async fn spawn_with_options(
+    handle: &RuntimeHandle,
+    mut command: Command,
+    options: CommandOptions,
+) -> io::Result<ChildHandle> {
+    let child = run_blocking(
+        handle,
+        options,
+        move || command.spawn(),
+        "process spawn task canceled",
+        "process spawn task timed out",
+    )
+    .await?;
+    Ok(ChildHandle {
+        handle: handle.clone(),
+        child: Arc::new(Mutex::new(Some(child))),
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -110,6 +134,117 @@ impl CommandBuilder {
         options: CommandOptions,
     ) -> io::Result<Output> {
         output_with_options(handle, self.command, options).await
+    }
+
+    pub async fn spawn(self, handle: &RuntimeHandle) -> io::Result<ChildHandle> {
+        spawn(handle, self.command).await
+    }
+
+    pub async fn spawn_with_options(
+        self,
+        handle: &RuntimeHandle,
+        options: CommandOptions,
+    ) -> io::Result<ChildHandle> {
+        spawn_with_options(handle, self.command, options).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ChildHandle {
+    handle: RuntimeHandle,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl ChildHandle {
+    pub fn id(&self) -> Option<u32> {
+        let guard = self.child.lock().expect("child lock poisoned");
+        guard.as_ref().map(Child::id)
+    }
+
+    pub async fn wait(&self) -> io::Result<ExitStatus> {
+        self.wait_with_options(CommandOptions::default()).await
+    }
+
+    pub async fn wait_with_options(&self, options: CommandOptions) -> io::Result<ExitStatus> {
+        self.run_with_child(
+            options,
+            |child| child.wait(),
+            "process wait task canceled",
+            "process wait task timed out",
+        )
+        .await
+    }
+
+    pub async fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        self.run_with_child(
+            CommandOptions::default(),
+            |child| child.try_wait(),
+            "process try_wait task canceled",
+            "process try_wait task timed out",
+        )
+        .await
+    }
+
+    pub async fn kill(&self) -> io::Result<()> {
+        self.run_with_child(
+            CommandOptions::default(),
+            |child| child.kill(),
+            "process kill task canceled",
+            "process kill task timed out",
+        )
+        .await
+    }
+
+    pub async fn output(&self) -> io::Result<Output> {
+        self.output_with_options(CommandOptions::default()).await
+    }
+
+    pub async fn output_with_options(&self, options: CommandOptions) -> io::Result<Output> {
+        let child = self.take_child()?;
+        let handle = self.handle.clone();
+        run_blocking(
+            &handle,
+            options,
+            move || child.wait_with_output(),
+            "process output task canceled",
+            "process output task timed out",
+        )
+        .await
+    }
+
+    fn take_child(&self) -> io::Result<Child> {
+        let mut guard = self.child.lock().expect("child lock poisoned");
+        guard
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "child already consumed"))
+    }
+
+    async fn run_with_child<T, F>(
+        &self,
+        options: CommandOptions,
+        f: F,
+        canceled_msg: &'static str,
+        timeout_msg: &'static str,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Child) -> io::Result<T> + Send + 'static,
+    {
+        let child = self.child.clone();
+        run_blocking(
+            &self.handle,
+            options,
+            move || {
+                let mut guard = child.lock().expect("child lock poisoned");
+                let child = guard.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "child already consumed")
+                })?;
+                f(child)
+            },
+            canceled_msg,
+            timeout_msg,
+        )
+        .await
     }
 }
 

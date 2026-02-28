@@ -29,8 +29,8 @@ fn quic_bridge_timeout_is_enforced() {
         .shards(1)
         .build()
         .expect("runtime");
-    let bridge =
-        QuicBridge::new().with_options(QuicOptions::default().with_timeout(Duration::from_millis(5)));
+    let bridge = QuicBridge::new()
+        .with_options(QuicOptions::default().with_timeout(Duration::from_millis(5)));
 
     let err = block_on(async {
         bridge

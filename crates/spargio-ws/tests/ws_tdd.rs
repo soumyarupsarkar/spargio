@@ -1,6 +1,6 @@
 use async_tungstenite::tungstenite::Message;
-use futures::executor::block_on;
 use futures::StreamExt;
+use futures::executor::block_on;
 use spargio::net::TcpListener;
 use spargio_ws::{WsOptions, accept_with_options, connect_socket_addr_with_options};
 use std::io;

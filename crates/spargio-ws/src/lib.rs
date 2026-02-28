@@ -83,7 +83,11 @@ impl WsConnector {
         self.options
     }
 
-    pub async fn connect<R>(&self, stream: TcpStream, request: R) -> io::Result<(WsStream, WsResponse)>
+    pub async fn connect<R>(
+        &self,
+        stream: TcpStream,
+        request: R,
+    ) -> io::Result<(WsStream, WsResponse)>
     where
         R: IntoClientRequest + Unpin,
     {
@@ -139,7 +143,11 @@ pub async fn connect_with_options<R>(
 where
     R: IntoClientRequest + Unpin,
 {
-    let fut = client_async_with_config(request, FuturesTcpStream::new(stream), Some(options.config()));
+    let fut = client_async_with_config(
+        request,
+        FuturesTcpStream::new(stream),
+        Some(options.config()),
+    );
     run_handshake(options.timeout(), fut, "ws client handshake timed out").await
 }
 

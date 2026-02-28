@@ -5568,3 +5568,73 @@ Semantics:
 Executed and passing:
 
 - `cargo test -p spargio-quic --test quic_tdd`
+
+## Update: Phase 5 implemented (process/signal maturity pass) with Red/Green TDD (2026-02-28)
+
+Executed a red-first process/signal maturity pass expanding lifecycle and
+subscription ergonomics.
+
+### Red tests added first
+
+Process:
+
+- `crates/spargio-process/tests/maturity_tdd.rs`
+  - `command_builder_spawn_and_wait_lifecycle`
+  - `spawned_child_wait_timeout_is_enforced`
+
+Signal:
+
+- `crates/spargio-signal/tests/maturity_tdd.rs`
+  - `signal_hub_broadcasts_to_multiple_subscribers`
+  - `signal_stream_recv_timeout_returns_none`
+  - `ctrl_c_stream_still_constructs`
+
+Observed expected red state:
+
+- missing process APIs:
+  - `CommandBuilder::spawn`
+  - spawned child wait timeout APIs
+- missing signal APIs:
+  - `SignalHub`
+  - `SignalStream::recv_timeout`
+
+### Implementation delivered
+
+`spargio-process` maturity additions:
+
+- added spawn APIs:
+  - `spawn(...)`
+  - `spawn_with_options(...)`
+  - `CommandBuilder::{spawn, spawn_with_options}`
+- added `ChildHandle` with lifecycle methods:
+  - `id()`
+  - `wait()`
+  - `wait_with_options(...)`
+  - `try_wait()`
+  - `kill()`
+  - `output()`
+  - `output_with_options(...)`
+- all blocking process operations routed through shared timeout/cancel-aware
+  `run_blocking(...)` semantics.
+
+`spargio-signal` maturity additions:
+
+- introduced `SignalHub`:
+  - `SignalHub::new(...)`
+  - `SignalHub::subscribe()`
+- `SignalStream` now supports:
+  - `recv()`
+  - `recv_timeout(...)`
+  - `recv_matching(...)`
+  - `try_recv()`
+- `signal(...)` now composes via `SignalHub` + `subscribe`, preserving prior
+  API behavior while enabling broadcast-style subscriptions.
+
+### Green validation
+
+Executed and passing:
+
+- `cargo test -p spargio-process --test maturity_tdd`
+- `cargo test -p spargio-signal --test maturity_tdd`
+- `cargo test -p spargio-process`
+- `cargo test -p spargio-signal`
