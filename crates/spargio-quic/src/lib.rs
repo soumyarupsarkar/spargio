@@ -1552,14 +1552,22 @@ async fn native_proto_driver_loop(
                 reply,
             } => {
                 commands_processed = commands_processed.saturating_add(1);
-                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                let mut should_drive = false;
+                let mut result = if let Some(conn) = connections.get_mut(&connection_id) {
                     conn.state.closed = true;
                     conn.pending_uni_accept.clear();
                     conn.pending_bi_accept.clear();
                     conn.pending_datagrams.clear();
-                    if let Some(handle) = handle_by_connection_id.remove(&connection_id) {
-                        proto_connections.remove(&handle);
-                        proto_connection_events.remove(&handle);
+                    if let Some(handle) = handle_by_connection_id.get(&connection_id).copied() {
+                        if let Some(proto_connection) = proto_connections.get_mut(&handle) {
+                            let now_std = native_proto_now(epoch, now);
+                            proto_connection.close(
+                                now_std,
+                                quinn_proto::VarInt::from_u32(0),
+                                bytes::Bytes::new(),
+                            );
+                            should_drive = true;
+                        }
                     }
                     Ok(())
                 } else {
@@ -1568,6 +1576,28 @@ async fn native_proto_driver_loop(
                         format!("unknown native proto connection {connection_id}"),
                     ))
                 };
+                if result.is_ok() && should_drive {
+                    let now_std = native_proto_now(epoch, now);
+                    if let Err(err) = drive_native_proto_connections(
+                        now_std,
+                        &mut endpoint,
+                        &mut proto_connections,
+                        &mut proto_connection_events,
+                        &mut pending_transmits,
+                        max_pending_transmits,
+                        fault_spec,
+                        &mut fault_stats,
+                        &mut stats,
+                        &mut events,
+                        &mut scratch,
+                    ) {
+                        result = Err(err);
+                    }
+                }
+                if let Some(handle) = handle_by_connection_id.remove(&connection_id) {
+                    proto_connections.remove(&handle);
+                    proto_connection_events.remove(&handle);
+                }
                 let _ = reply.send(result);
             }
             NativeProtoCommand::ConnectionState {

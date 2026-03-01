@@ -7117,3 +7117,40 @@ Executed and passing:
 - `cargo test -p spargio-quic --test native_cutover_tdd`
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
+
+## Update: R2 continuation (proto close-path emit on connected handles) with Red/Green TDD (2026-03-01)
+
+Implemented close-path progression for `connect_for_test` protocol-backed
+connections so `close_connection_for_test(...)` produces close transmits before
+connection teardown.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_close_connection_for_test_emits_close_transmit_for_proto_connection`
+
+Red expectation:
+
+- close command removed proto connection state immediately, so draining transmits
+  after close yielded no close packet output.
+
+### Green phase
+
+Updated `NativeProtoCommand::CloseConnectionForTest` handling in
+`crates/spargio-quic/src/lib.rs`:
+
+- for protocol-backed connection IDs:
+  - call `quinn_proto::Connection::close(...)` with an app close code/reason.
+  - run `drive_native_proto_connections(...)` to flush close-path transmits.
+  - then remove handle mappings and stored protocol state.
+- retained synthetic-connection cleanup behavior for non-proto test handles.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_close_connection_for_test_emits_close_transmit_for_proto_connection`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`

@@ -839,6 +839,35 @@ fn native_proto_driver_connect_for_test_open_bi_respects_proto_stream_credit() {
 }
 
 #[test]
+fn native_proto_driver_close_connection_for_test_emits_close_transmit_for_proto_connection() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (_server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let connection_id = driver
+            .connect_for_test(client_config, localhost_addr(5562), "localhost")
+            .await
+            .expect("connect for test");
+        let _ = driver.drain_transmits(64).await.expect("drain initial");
+
+        driver
+            .close_connection_for_test(connection_id)
+            .await
+            .expect("close connection");
+        let close_transmits = driver.drain_transmits(64).await.expect("drain close");
+        assert!(
+            !close_transmits.is_empty(),
+            "closing a protocol-backed connection should emit close transmits"
+        );
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)
