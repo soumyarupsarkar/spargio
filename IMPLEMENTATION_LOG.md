@@ -5037,6 +5037,7 @@ Executed and passing:
 - `cargo test --test docs_tdd`
 - `mdbook build book`
 
+
 ## Update: Milestone M4 implemented (measured core refinements) with Red/Green TDD (2026-02-28)
 
 Executed a low-risk, measured refinement for one deferred fs area without
@@ -5735,3 +5736,408 @@ Executed and passing:
 
 - `cargo test --test docs_tdd`
 - `mdbook build book`
+
+## Update: QUIC final-form target and acceptance checklist (2026-03-01)
+
+Decision recorded: favor the long-term QUIC integration shape based on a
+native `quinn-proto` driver owned by Spargio, instead of a permanent Tokio
+bridge path.
+
+### Target architecture (long-term form)
+
+- endpoint ownership is shard-affine and explicit (one owning execution
+  context per UDP socket/endpoint lifecycle).
+- packet I/O is driven by Spargio runtime tasks with `io_uring` as preferred
+  backend where it is a clear win; retain fallback paths where kernel/platform
+  constraints require.
+- timers, pacing, loss-recovery wakeups, and cancellation are mapped to
+  Spargio primitives (no embedded Tokio runtime per operation).
+- high-level API is provided by `spargio-quic`; protocol core comes from
+  `quinn-proto` with Spargio-managed driver loops.
+
+### Acceptance checklist
+
+1. Runtime/driver correctness
+- no `spawn_blocking + tokio::runtime::Builder` path in steady-state QUIC I/O.
+- endpoint driver loop integrates send/recv/timer progression without busy spin.
+- cancellation and drop semantics are deterministic for endpoint, connections,
+  streams, and datagrams.
+
+2. API completeness
+- endpoint lifecycle: bind, client connect, server accept, graceful close, and
+  draining shutdown.
+- stream surface: open/accept uni + bi streams, ordered reads/writes, finish,
+  reset/stop semantics.
+- datagram surface: send/recv with documented size/error behavior.
+- configuration surface: TLS config, ALPN, transport tuning pass-through,
+  version-negotiation visibility.
+
+3. Ergonomics and placement
+- session-local (`!Send`-friendly) handles for fast same-thread workflows.
+- explicit cross-thread handoff wrapper for `Send`-required hops.
+- clear docs for shard/session ownership and expected placement behavior.
+
+4. Performance and resource behavior
+- benchmark lane compares current bridge baseline vs native driver for
+  throughput, tail latency, and CPU under representative profiles.
+- no material regressions in memory growth under long-lived high-concurrency
+  workloads.
+- backpressure behavior validated (bounded queues and predictable overload
+  failure modes).
+
+5. Interop and reliability
+- interoperability matrix includes at least quinn and one non-quinn QUIC peer.
+- fault-injection coverage for loss/reorder/duplication/timeout and migration
+  edge cases where supported.
+- soak tests validate stability across long-duration connection churn.
+
+6. Observability and operations
+- counters/histograms for handshake outcomes, retransmits, PTO events, stream
+  errors, and datagram drops.
+- structured events for connection lifecycle and terminal error reasons.
+- CI lane covers native-QUIC smoke + targeted regression suite.
+
+7. Migration and compatibility
+- bridge mode retained only as transitional compatibility path until native
+  coverage reaches checklist thresholds.
+- migration docs describe API parity status and behavior deltas between bridge
+  and native modes.
+
+### Add-now vs later guidance
+
+- add now: runtime/driver skeleton, endpoint lifecycle parity, stream basics,
+  cancellation guarantees, smoke+interop tests, and baseline metrics.
+- add next: datagram depth, transport tuning breadth, richer observability,
+  backpressure tuning, and broader fault injection.
+- add later: advanced features requiring significant protocol-policy surface
+  (only when demand and maintenance budget justify).
+
+## Update: QUIC add-now/add-next implementation slice delivered with Red/Green TDD (2026-03-01)
+
+Implemented the currently sensible "add now" and selected "add next" items in
+`spargio-quic`, while preserving backward-compatible bridge entrypoints and
+keeping the long-term `quinn-proto` native-driver direction as the target.
+
+### Red phase
+
+Expanded `crates/spargio-quic/tests/quic_tdd.rs` with failing tests for:
+
+- endpoint lifecycle + stream exchange:
+  - `quic_endpoint_connects_and_exchanges_uni_stream_data`
+- datagram surface + metrics:
+  - `quic_endpoint_datagram_roundtrip_updates_metrics`
+- bounded in-flight backpressure:
+  - `quic_endpoint_accept_backpressure_is_enforced`
+- `!Send` local ergonomics + explicit send handoff:
+  - `quic_connection_local_to_send_handoff_preserves_identity`
+- metrics snapshot baseline:
+  - `quic_endpoint_metrics_snapshot_has_expected_counters`
+
+Observed expected red state:
+
+- missing `QuicEndpoint`, `QuicEndpointOptions`, and `QuicMetricsSnapshot`
+- missing local/send connection wrappers and endpoint/connection APIs
+- missing QUIC test cert dependencies
+
+### Green phase
+
+Implemented new `spargio-quic` API surface in `crates/spargio-quic/src/lib.rs`:
+
+Runtime/driver and cancellation behavior:
+
+- replaced per-operation `spawn_blocking + tokio runtime build` with a shared
+  persistent bridge executor (`OnceLock`-backed Tokio multithread runtime).
+- bridge task timeouts now abort in-flight join handles on timeout.
+- retained existing `QuicBridge::{run, with_endpoint}` and free `run*` APIs.
+
+Endpoint and connection API completeness:
+
+- added `QuicEndpoint`:
+  - constructors:
+    - `server(...)`
+    - `server_with_options(...)`
+    - `client(...)`
+    - `client_with_options(...)`
+    - `from_endpoint*`
+  - lifecycle/config:
+    - `local_addr()`
+    - `set_default_client_config(...)`
+    - `set_server_config(...)`
+    - `close(...)`
+    - `wait_idle().await`
+  - connection paths:
+    - `connect(...)`
+    - `connect_with(...)`
+    - `accept().await`
+- added `QuicConnection`:
+  - stream ops:
+    - `open_uni/open_bi`
+    - `accept_uni/accept_bi`
+  - datagram ops:
+    - `send_datagram(...)`
+    - `read_datagram().await`
+  - lifecycle/introspection:
+    - `close(...)`
+    - `closed().await`
+    - `stable_id()`
+    - `stats()`
+    - `max_datagram_size()`
+    - `datagram_send_buffer_space()`
+
+Ergonomics and placement:
+
+- added explicit send-handoff wrapper: `QuicSendConnection`.
+- added local `!Send` wrapper: `LocalQuicConnection` (`Rc`-backed).
+- added conversion helpers:
+  - `QuicConnection::to_local()`
+  - `QuicConnection::to_send_handle()`
+  - `LocalQuicConnection::to_send_handle()`
+
+Backpressure and observability:
+
+- added `QuicEndpointOptions` with:
+  - `connect_timeout`
+  - `accept_timeout`
+  - `operation_timeout`
+  - `max_inflight_ops`
+- added bounded in-flight guardrails (`WouldBlock` on limit saturation).
+- added per-endpoint metrics with snapshots:
+  - `QuicMetrics`
+  - `QuicMetricsSnapshot`
+  - counters include connect/accept starts/success/fail/timeouts, stream and
+    datagram activity, close events, operation timeouts, and backpressure hits.
+
+Cargo updates:
+
+- `crates/spargio-quic/Cargo.toml`:
+  - Tokio features now include `rt-multi-thread` (shared executor runtime).
+  - test deps added: `rcgen`, `rustls`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
+### Notes on long-term direction
+
+- This slice removes the highest-friction bridge behavior (per-call runtime
+  creation) and adds the targeted API/ergonomics/metrics groundwork.
+- The deeper final-form goal remains: replace bridge-centric data-path handling
+  with a native shard-owned `quinn-proto` endpoint driver over Spargio
+  primitives.
+
+## Update: Native `quinn-proto` next-step breakdown (2026-03-01)
+
+Added concrete execution plan for the next major step: moving QUIC data-plane
+ownership from bridge mode to a Spargio-native `quinn-proto` endpoint driver.
+
+### Phase N1: Driver skeleton and ownership model
+
+Scope:
+
+- add a shard-affine endpoint task that owns `quinn_proto::Endpoint`.
+- define command mailbox + response channels for app API calls.
+- define stable internal IDs for endpoint/connection/stream handles.
+
+Red tests first:
+
+- endpoint task boots and accepts command loop.
+- commands are rejected after endpoint shutdown with deterministic errors.
+- connection/stream IDs remain stable across handle clones.
+
+Green acceptance:
+
+- no Tokio runtime creation per endpoint operation.
+- one owner task per endpoint socket lifecycle.
+
+### Phase N2: UDP ingress/egress integration
+
+Scope:
+
+- wire native UDP recv/send loops to feed `Endpoint::handle(...)`.
+- emit and send all required transmits from endpoint/connection progression.
+- support bounded batching and clear overload behavior.
+
+Red tests first:
+
+- received UDP datagram drives handshake progress.
+- generated transmits are flushed and peer receives expected payload.
+- bounded queue overflow yields deterministic backpressure errors.
+
+Green acceptance:
+
+- no busy-spin loops.
+- sustained traffic does not leak buffers/queues.
+
+### Phase N3: Timer and wake progression
+
+Scope:
+
+- map `poll_timeout`/`handle_timeout` onto Spargio timers.
+- implement endpoint wake scheduling for retransmit/PTO/deadline updates.
+
+Red tests first:
+
+- timeout-driven retransmit path is exercised under packet loss.
+- stale timer update does not regress newer deadline scheduling.
+
+Green acceptance:
+
+- driver sleeps until next meaningful deadline.
+- timer races do not produce duplicated work loops.
+
+### Phase N4: Connection and stream event pump
+
+Scope:
+
+- map `quinn-proto` connection events to public `QuicConnection` operations.
+- implement uni/bi stream open/accept/read/write/finish/reset plumbing.
+- preserve current `QuicConnection` API behavior and error shape.
+
+Red tests first:
+
+- bi/uni stream open+echo paths pass under concurrent connections.
+- finish/reset/stop semantics match expected transport behavior.
+
+Green acceptance:
+
+- no API regression relative to current `spargio-quic` tests.
+- deterministic cancellation/drop semantics.
+
+### Phase N5: Datagram and transport tuning depth
+
+Scope:
+
+- complete datagram send/recv behavior with size-limit enforcement.
+- expose practical tuning pass-throughs (transport windows, keepalive, MTU).
+
+Red tests first:
+
+- oversized datagrams fail predictably.
+- tuning knobs are plumbed and affect runtime-observable behavior.
+
+Green acceptance:
+
+- datagram paths are parity-complete for common workloads.
+
+### Phase N6: Local `!Send` and cross-thread handoff mapping
+
+Scope:
+
+- keep `LocalQuicConnection` and `QuicSendConnection` on native backend.
+- enforce ownership/thread invariants with explicit handoff boundaries.
+
+Red tests first:
+
+- local-to-send handoff preserves stable identity and operation correctness.
+- invalid post-shutdown/local misuse yields deterministic errors.
+
+Green acceptance:
+
+- current ergonomics tests remain green without bridge fallback.
+
+### Phase N7: Observability and operations gates
+
+Scope:
+
+- emit native-path counters and structured lifecycle/error events.
+- add p50/p95/p99 and retransmit/PTO visibility hooks for CI and soak lanes.
+
+Red tests first:
+
+- counters advance for connects/accepts/streams/datagrams/timeouts.
+- error events include terminal reason classes.
+
+Green acceptance:
+
+- companion CI lane includes native-QUIC smoke targets.
+- soak lane validates no unbounded growth.
+
+### Phase N8: Interop/fault/perf qualification and rollout
+
+Scope:
+
+- interop against at least quinn peer + one non-quinn peer where practical.
+- fault-injection matrix: loss/reorder/duplication/timeout.
+- benchmark A/B against current bridge path.
+
+Red tests first:
+
+- forced-loss and reorder scenarios fail without reliability fixes.
+- A/B harness asserts no material regressions versus baseline thresholds.
+
+Green acceptance:
+
+- native backend meets or exceeds checklist thresholds for default use.
+- bridge backend retained as compatibility fallback until native lane is
+  sufficiently hardened in CI/soak.
+
+### Immediate execution order
+
+1. N1 driver skeleton and ownership model.
+2. N2 UDP integration.
+3. N3 timers/wakes.
+4. N4 connection/stream pump.
+5. N6 ergonomics mapping.
+6. N5 datagram/tuning depth.
+7. N7 observability/ops.
+8. N8 interop/fault/perf rollout gates.
+
+## Update: Phase N1 implemented (native driver skeleton + ownership model) with Red/Green TDD (2026-03-01)
+
+Implemented the first native `quinn-proto` milestone as a dedicated driver
+skeleton API while preserving existing `QuicEndpoint` behavior.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_runs_on_owner_shard`
+- `native_proto_driver_stable_ids_are_monotonic`
+- `native_proto_driver_rejects_commands_after_shutdown`
+
+Expected red failures:
+
+- missing `NativeProtoDriver` and `NativeProtoDriverOptions`
+- no owner-shard task mailbox or stable-id allocation surface
+
+### Green phase
+
+Added native-driver skeleton in `crates/spargio-quic/src/lib.rs`:
+
+- new options:
+  - `NativeProtoDriverOptions` (`owner_shard`)
+- new probe snapshot:
+  - `NativeProtoDriverProbe`
+- new driver handle:
+  - `NativeProtoDriver::start(&RuntimeHandle, options)`
+  - `probe()`
+  - `allocate_connection_id()`
+  - `allocate_stream_id()`
+  - `shutdown()`
+  - `is_closed()`
+  - `endpoint_id()`
+  - `owner_shard()`
+
+Ownership and mailbox semantics:
+
+- driver loop is spawned via `RuntimeHandle::spawn_local_on(owner_shard, ...)`.
+- loop owns a `quinn_proto::Endpoint` instance and processes command mailbox
+  messages serially.
+- stable endpoint IDs are generated globally (`NEXT_NATIVE_ENDPOINT_ID`).
+- connection/stream IDs are generated monotonically within the owner task.
+- post-shutdown commands are rejected with `BrokenPipe`.
+
+Cargo updates:
+
+- `crates/spargio-quic/Cargo.toml` adds direct dependency:
+  - `quinn-proto = "0.11"`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`

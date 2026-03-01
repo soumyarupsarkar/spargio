@@ -8,8 +8,11 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
 quinn = "0.11"
+quinn-proto = "0.11"
 spargio = { path = "../.." }
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 futures = "0.3"
+rcgen = "0.13"
+rustls = "0.23"

@@ -1,6 +1,12 @@
 use futures::executor::block_on;
-use spargio_quic::{QuicBridge, QuicOptions};
+use futures::channel::oneshot;
+use spargio_quic::{
+    NativeProtoDriver, NativeProtoDriverOptions, QuicBridge, QuicEndpoint, QuicEndpointOptions,
+    QuicMetricsSnapshot, QuicOptions,
+};
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
@@ -42,4 +48,255 @@ fn quic_bridge_timeout_is_enforced() {
             .expect_err("timeout")
     });
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn quic_endpoint_connects_and_exchanges_uni_stream_data() {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
+    let mut client = QuicEndpoint::client(localhost_addr(0)).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server_task = async {
+            let conn = server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept bi");
+            let msg = recv.read_to_end(1024).await.expect("read");
+            assert_eq!(msg, b"ping");
+            send.write_all(b"pong").await.expect("write");
+            send.finish().expect("finish");
+            let _ = done_rx.await;
+        };
+
+        let client_task = async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect");
+            let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+            send.write_all(b"ping").await.expect("write");
+            send.finish().expect("finish");
+            let msg = recv.read_to_end(1024).await.expect("read");
+            assert_eq!(msg, b"pong");
+            let _ = done_tx.send(());
+        };
+
+        futures::join!(server_task, client_task);
+    });
+}
+
+#[test]
+fn quic_endpoint_datagram_roundtrip_updates_metrics() {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
+    let mut client = QuicEndpoint::client(localhost_addr(0)).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server_task = async {
+            let conn = server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection");
+            let incoming = conn.read_datagram().await.expect("read datagram");
+            assert_eq!(incoming, b"hello-dgram");
+            conn.send_datagram(b"ack-dgram".to_vec())
+                .expect("send datagram");
+            let _ = done_rx.await;
+        };
+
+        let client_task = async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect");
+            conn.send_datagram(b"hello-dgram".to_vec())
+                .expect("send datagram");
+            let incoming = conn.read_datagram().await.expect("read datagram");
+            assert_eq!(incoming, b"ack-dgram");
+            let _ = done_tx.send(());
+        };
+
+        futures::join!(server_task, client_task);
+    });
+
+    let server_snapshot = server.metrics_snapshot();
+    let client_snapshot = client.metrics_snapshot();
+    assert!(server_snapshot.accepts_succeeded >= 1);
+    assert!(server_snapshot.datagrams_received >= 1);
+    assert!(server_snapshot.datagrams_sent >= 1);
+    assert!(client_snapshot.connects_succeeded >= 1);
+    assert!(client_snapshot.datagrams_sent >= 1);
+    assert!(client_snapshot.datagrams_received >= 1);
+}
+
+#[test]
+fn quic_endpoint_accept_backpressure_is_enforced() {
+    let (server_config, _client_config) = test_server_and_client_configs();
+    let options = QuicEndpointOptions::default()
+        .with_accept_timeout(Duration::from_millis(50))
+        .with_max_inflight_ops(1);
+    let server =
+        QuicEndpoint::server_with_options(server_config, localhost_addr(0), options).expect("server");
+
+    block_on(async {
+        let (a, b) = futures::join!(server.accept(), server.accept());
+        let mut saw_timeout = false;
+        let mut saw_would_block = false;
+        for err in [a.err().expect("first err"), b.err().expect("second err")] {
+            if err.kind() == io::ErrorKind::TimedOut {
+                saw_timeout = true;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                saw_would_block = true;
+            }
+        }
+        assert!(saw_timeout, "expected one accept timeout");
+        assert!(saw_would_block, "expected one accept backpressure error");
+    });
+}
+
+#[test]
+fn quic_connection_local_to_send_handoff_preserves_identity() {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
+    let mut client = QuicEndpoint::client(localhost_addr(0)).expect("client endpoint");
+    client.set_default_client_config(client_config);
+    let server_addr = server.local_addr().expect("server addr");
+
+    block_on(async {
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server_task = async {
+            let conn = server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept bi");
+            let msg = recv.read_to_end(1024).await.expect("read");
+            assert_eq!(msg, b"handoff");
+            send.write_all(b"ack").await.expect("write");
+            send.finish().expect("finish");
+            let _ = done_rx.await;
+        };
+
+        let client_task = async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect");
+            let local = conn.to_local();
+            let send_handle = local.to_send_handle();
+            assert_eq!(conn.stable_id(), local.stable_id());
+            assert_eq!(conn.stable_id(), send_handle.stable_id());
+
+            let (mut send, mut recv) = local.open_bi().await.expect("open bi");
+            send.write_all(b"handoff").await.expect("write");
+            send.finish().expect("finish");
+            let ack = recv.read_to_end(16).await.expect("read");
+            assert_eq!(ack, b"ack");
+            let _ = done_tx.send(());
+            drop(send_handle);
+        };
+
+        futures::join!(server_task, client_task);
+    });
+}
+
+#[test]
+fn quic_endpoint_metrics_snapshot_has_expected_counters() {
+    let snapshot = QuicMetricsSnapshot::default();
+    assert_eq!(snapshot.connects_started, 0);
+    assert_eq!(snapshot.connects_succeeded, 0);
+    assert_eq!(snapshot.datagrams_sent, 0);
+}
+
+#[test]
+fn native_proto_driver_runs_on_owner_shard() {
+    let rt = spargio::Runtime::builder()
+        .shards(2)
+        .build()
+        .expect("runtime");
+    let options = NativeProtoDriverOptions::default().with_owner_shard(1);
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), options)
+            .await
+            .expect("start native driver");
+        let probe = driver.probe().await.expect("probe");
+        assert_eq!(usize::from(probe.owner_shard), 1);
+        assert_eq!(probe.owner_shard, probe.executing_shard);
+        assert_eq!(probe.endpoint_id, driver.endpoint_id());
+    });
+}
+
+#[test]
+fn native_proto_driver_stable_ids_are_monotonic() {
+    let rt = spargio::Runtime::builder()
+        .shards(2)
+        .build()
+        .expect("runtime");
+    let options = NativeProtoDriverOptions::default().with_owner_shard(0);
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), options)
+            .await
+            .expect("start native driver");
+        let a = driver.allocate_connection_id().await.expect("conn id");
+        let b = driver.allocate_connection_id().await.expect("conn id");
+        let s0 = driver.allocate_stream_id().await.expect("stream id");
+        let s1 = driver.allocate_stream_id().await.expect("stream id");
+        assert!(b > a);
+        assert!(s1 > s0);
+    });
+}
+
+#[test]
+fn native_proto_driver_rejects_commands_after_shutdown() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        driver.shutdown().await.expect("shutdown");
+        let err = driver.probe().await.expect_err("probe should fail after shutdown");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    });
+}
+
+fn localhost_addr(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn test_server_and_client_configs() -> (spargio_quic::quinn::ServerConfig, spargio_quic::quinn::ClientConfig) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert");
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
+    let priv_key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+
+    let server_config = spargio_quic::quinn::ServerConfig::with_single_cert(
+        vec![cert_der.clone()],
+        priv_key,
+    )
+    .expect("server config");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).expect("add root cert");
+    let client_config =
+        spargio_quic::quinn::ClientConfig::with_root_certificates(Arc::new(roots))
+            .expect("client config");
+
+    (server_config, client_config)
 }
