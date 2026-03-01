@@ -10,8 +10,9 @@
 use spargio::{RuntimeError, RuntimeHandle};
 use std::future::{Future, IntoFuture};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -112,11 +113,15 @@ where
 #[derive(Debug, Clone, Copy)]
 pub struct NativeProtoDriverOptions {
     owner_shard: spargio::ShardId,
+    max_pending_transmits: usize,
 }
 
 impl Default for NativeProtoDriverOptions {
     fn default() -> Self {
-        Self { owner_shard: 0 }
+        Self {
+            owner_shard: 0,
+            max_pending_transmits: DEFAULT_MAX_INFLIGHT_OPS,
+        }
     }
 }
 
@@ -129,6 +134,15 @@ impl NativeProtoDriverOptions {
     pub fn owner_shard(self) -> spargio::ShardId {
         self.owner_shard
     }
+
+    pub fn with_max_pending_transmits(mut self, max_pending_transmits: usize) -> Self {
+        self.max_pending_transmits = max_pending_transmits;
+        self
+    }
+
+    pub fn max_pending_transmits(self) -> usize {
+        self.max_pending_transmits
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -137,6 +151,21 @@ pub struct NativeProtoDriverProbe {
     pub owner_shard: spargio::ShardId,
     pub executing_shard: spargio::ShardId,
     pub commands_processed: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NativeProtoTransmit {
+    pub destination: SocketAddr,
+    pub ecn: Option<quinn::EcnCodepoint>,
+    pub size: usize,
+    pub segment_size: Option<usize>,
+    pub src_ip: Option<IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NativeProtoIngressReport {
+    pub generated_transmits: usize,
+    pub queued_transmits: usize,
 }
 
 #[derive(Clone)]
@@ -158,6 +187,12 @@ impl NativeProtoDriver {
                 format!("invalid native proto owner shard {}", options.owner_shard()),
             ));
         }
+        if options.max_pending_transmits() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native proto max_pending_transmits must be > 0",
+            ));
+        }
 
         let endpoint_id = NEXT_NATIVE_ENDPOINT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -172,6 +207,7 @@ impl NativeProtoDriver {
                     owner_shard,
                     ctx.shard_id(),
                     rx,
+                    options.max_pending_transmits(),
                     closed_for_task,
                 )
                 .await;
@@ -222,6 +258,44 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    pub async fn submit_datagram(
+        &self,
+        remote: SocketAddr,
+        payload: Vec<u8>,
+    ) -> io::Result<NativeProtoIngressReport> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::SubmitDatagram {
+            remote,
+            payload,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn drain_transmits(&self, max: usize) -> io::Result<Vec<NativeProtoTransmit>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::DrainTransmits {
+            max,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn enqueue_transmit_for_test(&self, transmit: NativeProtoTransmit) -> io::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::EnqueueTransmitForTest {
+            transmit,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -259,6 +333,19 @@ enum NativeProtoCommand {
     AllocateStreamId {
         reply: tokio::sync::oneshot::Sender<u64>,
     },
+    SubmitDatagram {
+        remote: SocketAddr,
+        payload: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoIngressReport>>,
+    },
+    DrainTransmits {
+        max: usize,
+        reply: tokio::sync::oneshot::Sender<Vec<NativeProtoTransmit>>,
+    },
+    EnqueueTransmitForTest {
+        transmit: NativeProtoTransmit,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -270,14 +357,17 @@ async fn native_proto_driver_loop(
     owner_shard: spargio::ShardId,
     executing_shard: spargio::ShardId,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<NativeProtoCommand>,
+    max_pending_transmits: usize,
     closed: Arc<AtomicBool>,
 ) {
-    let _endpoint = quinn_proto::Endpoint::new(
+    let mut endpoint = quinn_proto::Endpoint::new(
         Arc::new(quinn_proto::EndpointConfig::default()),
         None,
         true,
         None,
     );
+    let mut scratch = Vec::new();
+    let mut pending_transmits: VecDeque<NativeProtoTransmit> = VecDeque::new();
     let mut commands_processed = 0u64;
     let mut next_connection_id = 1u64;
     let mut next_stream_id = 1u64;
@@ -305,8 +395,81 @@ async fn native_proto_driver_loop(
                 next_stream_id = next_stream_id.saturating_add(1);
                 let _ = reply.send(id);
             }
-            NativeProtoCommand::Shutdown { reply } => {
+            NativeProtoCommand::SubmitDatagram {
+                remote,
+                payload,
+                reply,
+            } => {
                 commands_processed = commands_processed.saturating_add(1);
+                let mut generated_transmits = 0usize;
+                let event = endpoint.handle(
+                    std::time::Instant::now(),
+                    remote,
+                    None,
+                    None,
+                    bytes::BytesMut::from(payload.as_slice()),
+                    &mut scratch,
+                );
+                let result = match event {
+                    Some(quinn_proto::DatagramEvent::Response(tx)) => {
+                        generated_transmits = 1;
+                        match push_native_transmit(
+                            &mut pending_transmits,
+                            tx,
+                            max_pending_transmits,
+                        ) {
+                            Ok(()) => Ok(NativeProtoIngressReport {
+                                generated_transmits,
+                                queued_transmits: pending_transmits.len(),
+                            }),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Some(quinn_proto::DatagramEvent::ConnectionEvent(_, _)) => {
+                        Ok(NativeProtoIngressReport {
+                            generated_transmits,
+                            queued_transmits: pending_transmits.len(),
+                        })
+                    }
+                    Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
+                        let tx = endpoint.refuse(incoming, &mut scratch);
+                        generated_transmits = 1;
+                        match push_native_transmit(&mut pending_transmits, tx, max_pending_transmits)
+                        {
+                            Ok(()) => Ok(NativeProtoIngressReport {
+                                generated_transmits,
+                                queued_transmits: pending_transmits.len(),
+                            }),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    None => Ok(NativeProtoIngressReport {
+                        generated_transmits,
+                        queued_transmits: pending_transmits.len(),
+                    }),
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::DrainTransmits { max, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let take = max.min(pending_transmits.len());
+                let drained = pending_transmits.drain(..take).collect::<Vec<_>>();
+                let _ = reply.send(drained);
+            }
+            NativeProtoCommand::EnqueueTransmitForTest { transmit, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if pending_transmits.len() >= max_pending_transmits {
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native proto egress queue full",
+                    ))
+                } else {
+                    pending_transmits.push_back(transmit);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());
                 break;
             }
@@ -317,6 +480,27 @@ async fn native_proto_driver_loop(
     }
 
     closed.store(true, Ordering::Release);
+}
+
+fn push_native_transmit(
+    pending_transmits: &mut VecDeque<NativeProtoTransmit>,
+    tx: quinn_proto::Transmit,
+    max_pending_transmits: usize,
+) -> io::Result<()> {
+    if pending_transmits.len() >= max_pending_transmits {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native proto egress queue full",
+        ));
+    }
+    pending_transmits.push_back(NativeProtoTransmit {
+        destination: tx.destination,
+        ecn: tx.ecn,
+        size: tx.size,
+        segment_size: tx.segment_size,
+        src_ip: tx.src_ip,
+    });
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

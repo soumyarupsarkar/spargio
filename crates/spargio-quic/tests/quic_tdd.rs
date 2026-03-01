@@ -1,8 +1,8 @@
 use futures::executor::block_on;
 use futures::channel::oneshot;
 use spargio_quic::{
-    NativeProtoDriver, NativeProtoDriverOptions, QuicBridge, QuicEndpoint, QuicEndpointOptions,
-    QuicMetricsSnapshot, QuicOptions,
+    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoTransmit, QuicBridge, QuicEndpoint,
+    QuicEndpointOptions, QuicMetricsSnapshot, QuicOptions,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -274,6 +274,96 @@ fn native_proto_driver_rejects_commands_after_shutdown() {
         driver.shutdown().await.expect("shutdown");
         let err = driver.probe().await.expect_err("probe should fail after shutdown");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    });
+}
+
+#[test]
+fn native_proto_driver_ingests_datagrams_and_supports_bounded_drain() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let ingested = driver
+            .submit_datagram(localhost_addr(4444), vec![0u8; 64])
+            .await
+            .expect("submit datagram");
+        assert!(ingested.generated_transmits <= 1);
+
+        let drained = driver.drain_transmits(4).await.expect("drain");
+        assert!(drained.len() <= 4);
+    });
+}
+
+#[test]
+fn native_proto_driver_egress_queue_applies_backpressure() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let options = NativeProtoDriverOptions::default().with_max_pending_transmits(1);
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), options)
+            .await
+            .expect("start native driver");
+        let tx = NativeProtoTransmit {
+            destination: localhost_addr(5555),
+            ecn: None,
+            size: 42,
+            segment_size: None,
+            src_ip: None,
+        };
+        driver
+            .enqueue_transmit_for_test(tx.clone())
+            .await
+            .expect("first enqueue");
+        let err = driver
+            .enqueue_transmit_for_test(tx)
+            .await
+            .expect_err("second enqueue should backpressure");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    });
+}
+
+#[test]
+fn native_proto_driver_drain_is_fifo_and_batch_limited() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let options = NativeProtoDriverOptions::default().with_max_pending_transmits(8);
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), options)
+            .await
+            .expect("start native driver");
+        for size in [10usize, 20, 30] {
+            driver
+                .enqueue_transmit_for_test(NativeProtoTransmit {
+                    destination: localhost_addr(7000 + u16::try_from(size).expect("size fits")),
+                    ecn: None,
+                    size,
+                    segment_size: None,
+                    src_ip: None,
+                })
+                .await
+                .expect("enqueue");
+        }
+
+        let first = driver.drain_transmits(2).await.expect("drain first");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].size, 10);
+        assert_eq!(first[1].size, 20);
+
+        let second = driver.drain_transmits(2).await.expect("drain second");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].size, 30);
     });
 }
 

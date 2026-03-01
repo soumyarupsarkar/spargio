@@ -5920,6 +5920,60 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N2 implemented (native UDP ingress/egress skeleton) with Red/Green TDD (2026-03-01)
+
+Implemented bounded UDP ingress/egress command plumbing in the native driver
+loop so the owner task can ingest datagrams and emit queued transmits.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_ingests_datagrams_and_supports_bounded_drain`
+- `native_proto_driver_egress_queue_applies_backpressure`
+- `native_proto_driver_drain_is_fifo_and_batch_limited`
+
+Expected red failures:
+
+- missing `submit_datagram`, `drain_transmits`, and queue backpressure methods
+- missing `NativeProtoTransmit` and N2-specific options
+
+### Green phase
+
+Extended native driver API in `crates/spargio-quic/src/lib.rs`:
+
+- new options:
+  - `NativeProtoDriverOptions::with_max_pending_transmits(...)`
+- new types:
+  - `NativeProtoTransmit`
+  - `NativeProtoIngressReport`
+- new driver methods:
+  - `submit_datagram(remote, payload).await`
+  - `drain_transmits(max).await`
+  - `enqueue_transmit_for_test(...).await` (deterministic queue-path test hook)
+
+Owner-loop integration details:
+
+- owner loop now maintains:
+  - `quinn_proto::Endpoint`
+  - bounded `VecDeque<NativeProtoTransmit>` egress queue
+- `submit_datagram` path feeds payload into `Endpoint::handle(...)`.
+- response/new-connection outputs are converted into queued transmits.
+- queue saturation returns deterministic `WouldBlock`.
+- drain path is FIFO and batch-limited.
+
+Cargo updates:
+
+- `crates/spargio-quic/Cargo.toml` adds:
+  - `bytes = "1"` (for `BytesMut` ingress feed)
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ### Notes on long-term direction
 
 - This slice removes the highest-friction bridge behavior (per-call runtime

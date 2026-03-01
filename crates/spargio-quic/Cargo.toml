@@ -7,6 +7,7 @@ description = "QUIC companion crate for spargio (quinn bridge)"
 repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
+bytes = "1"
 quinn = "0.11"
 quinn-proto = "0.11"
 spargio = { path = "../.." }

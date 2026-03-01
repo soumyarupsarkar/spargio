@@ -1453,6 +1453,7 @@ dependencies = [
 name = "spargio-quic"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "futures",
  "quinn",
  "quinn-proto",
