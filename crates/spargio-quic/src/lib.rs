@@ -12,7 +12,7 @@ use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -176,6 +176,12 @@ pub struct NativeProtoTimerState {
     pub last_fired_generation: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NativeProtoStreamState {
+    pub finished: bool,
+    pub reset: bool,
+}
+
 #[derive(Clone)]
 pub struct NativeProtoDriver {
     endpoint_id: u64,
@@ -334,6 +340,98 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    pub async fn register_connection_for_test(&self) -> io::Result<u64> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::RegisterConnectionForTest { reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::OpenUniOnConnection {
+            connection_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::AcceptUniOnConnection {
+            connection_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::OpenBiOnConnection {
+            connection_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::AcceptBiOnConnection {
+            connection_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::FinishStream {
+            connection_id,
+            stream_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::ResetStream {
+            connection_id,
+            stream_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn stream_state(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+    ) -> io::Result<NativeProtoStreamState> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::StreamState {
+            connection_id,
+            stream_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -395,10 +493,51 @@ enum NativeProtoCommand {
     TimerState {
         reply: tokio::sync::oneshot::Sender<NativeProtoTimerState>,
     },
+    RegisterConnectionForTest {
+        reply: tokio::sync::oneshot::Sender<u64>,
+    },
+    OpenUniOnConnection {
+        connection_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<u64>>,
+    },
+    AcceptUniOnConnection {
+        connection_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<u64>>,
+    },
+    OpenBiOnConnection {
+        connection_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<(u64, u64)>>,
+    },
+    AcceptBiOnConnection {
+        connection_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<(u64, u64)>>,
+    },
+    FinishStream {
+        connection_id: u64,
+        stream_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    ResetStream {
+        connection_id: u64,
+        stream_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    StreamState {
+        connection_id: u64,
+        stream_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoStreamState>>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
     Closed,
+}
+
+#[derive(Default)]
+struct NativeProtoConnectionPump {
+    pending_uni_accept: VecDeque<u64>,
+    pending_bi_accept: VecDeque<(u64, u64)>,
+    streams: HashMap<u64, NativeProtoStreamState>,
 }
 
 async fn native_proto_driver_loop(
@@ -425,6 +564,7 @@ async fn native_proto_driver_loop(
     let mut next_timer_generation = 1u64;
     let mut timeout_fires = 0u64;
     let mut last_fired_generation = None;
+    let mut connections: HashMap<u64, NativeProtoConnectionPump> = HashMap::new();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -556,6 +696,159 @@ async fn native_proto_driver_loop(
                     timeout_fires,
                     last_fired_generation,
                 });
+            }
+            NativeProtoCommand::RegisterConnectionForTest { reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let id = next_connection_id;
+                next_connection_id = next_connection_id.saturating_add(1);
+                connections.entry(id).or_default();
+                let _ = reply.send(id);
+            }
+            NativeProtoCommand::OpenUniOnConnection {
+                connection_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    let stream_id = next_stream_id;
+                    next_stream_id = next_stream_id.saturating_add(1);
+                    conn.pending_uni_accept.push_back(stream_id);
+                    conn.streams.entry(stream_id).or_default();
+                    Ok(stream_id)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::AcceptUniOnConnection {
+                connection_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    conn.pending_uni_accept.pop_front().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "no pending uni stream for accept",
+                        )
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::OpenBiOnConnection {
+                connection_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    let stream_id = next_stream_id;
+                    next_stream_id = next_stream_id.saturating_add(1);
+                    let pair = (stream_id, stream_id);
+                    conn.pending_bi_accept.push_back(pair);
+                    conn.streams.entry(stream_id).or_default();
+                    Ok(pair)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::AcceptBiOnConnection {
+                connection_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    conn.pending_bi_accept.pop_front().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::WouldBlock, "no pending bi stream for accept")
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::FinishStream {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    if let Some(state) = conn.streams.get_mut(&stream_id) {
+                        state.finished = true;
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown native proto stream {stream_id}"),
+                        ))
+                    }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::ResetStream {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    if let Some(state) = conn.streams.get_mut(&stream_id) {
+                        state.finished = true;
+                        state.reset = true;
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown native proto stream {stream_id}"),
+                        ))
+                    }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::StreamState {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get(&connection_id) {
+                    conn.streams.get(&stream_id).copied().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown native proto stream {stream_id}"),
+                        )
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
             }
             NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());

@@ -436,6 +436,77 @@ fn native_proto_driver_newer_deadline_supersedes_older() {
     });
 }
 
+#[test]
+fn native_proto_driver_open_uni_roundtrips_to_accept_uni() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let conn = driver
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
+        let opened = driver.open_uni_on_connection(conn).await.expect("open uni");
+        let accepted = driver.accept_uni_on_connection(conn).await.expect("accept uni");
+        assert_eq!(accepted, opened);
+    });
+}
+
+#[test]
+fn native_proto_driver_open_bi_roundtrips_to_accept_bi() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let conn = driver
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
+        let opened = driver.open_bi_on_connection(conn).await.expect("open bi");
+        let accepted = driver.accept_bi_on_connection(conn).await.expect("accept bi");
+        assert_eq!(accepted, opened);
+    });
+}
+
+#[test]
+fn native_proto_driver_finish_and_reset_stream_are_observable() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let conn = driver
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
+        let stream = driver.open_uni_on_connection(conn).await.expect("open uni");
+
+        driver
+            .finish_stream(conn, stream)
+            .await
+            .expect("finish stream");
+        let finished = driver.stream_state(conn, stream).await.expect("state");
+        assert!(finished.finished);
+        assert!(!finished.reset);
+
+        driver.reset_stream(conn, stream).await.expect("reset stream");
+        let reset = driver.stream_state(conn, stream).await.expect("state");
+        assert!(reset.finished);
+        assert!(reset.reset);
+    });
+}
+
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }

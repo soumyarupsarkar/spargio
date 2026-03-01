@@ -5920,6 +5920,57 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N4 implemented (connection/stream pump skeleton) with Red/Green TDD (2026-03-01)
+
+Implemented a deterministic native connection/stream event-pump skeleton in the
+owner task to model connection registration and stream lifecycle transitions.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_open_uni_roundtrips_to_accept_uni`
+- `native_proto_driver_open_bi_roundtrips_to_accept_bi`
+- `native_proto_driver_finish_and_reset_stream_are_observable`
+
+Expected red failures:
+
+- missing connection registration and stream open/accept APIs
+- missing stream finish/reset state tracking
+
+### Green phase
+
+Added native connection/stream pump surface:
+
+- new stream-state type:
+  - `NativeProtoStreamState { finished, reset }`
+- new driver methods:
+  - `register_connection_for_test().await`
+  - `open_uni_on_connection(...).await`
+  - `accept_uni_on_connection(...).await`
+  - `open_bi_on_connection(...).await`
+  - `accept_bi_on_connection(...).await`
+  - `finish_stream(...).await`
+  - `reset_stream(...).await`
+  - `stream_state(...).await`
+
+Owner-loop internals:
+
+- per-connection registry (`HashMap`) with:
+  - pending uni accept queue
+  - pending bi accept queue
+  - per-stream terminal state
+- deterministic error behavior:
+  - unknown connection/stream => `NotFound`
+  - accept with no pending stream => `WouldBlock`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N3 implemented (timer/wake progression skeleton) with Red/Green TDD (2026-03-01)
 
 Implemented deterministic timer progression primitives in the native driver
