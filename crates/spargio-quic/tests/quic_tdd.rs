@@ -507,6 +507,57 @@ fn native_proto_driver_finish_and_reset_stream_are_observable() {
     });
 }
 
+#[test]
+fn native_proto_driver_local_send_handoff_preserves_identity() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let local = driver.to_local();
+        let send = local.to_send_handle();
+        assert_eq!(driver.endpoint_id(), local.endpoint_id());
+        assert_eq!(driver.endpoint_id(), send.endpoint_id());
+
+        let conn = local
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
+        let opened = local
+            .open_uni_on_connection(conn)
+            .await
+            .expect("open uni");
+        let accepted = send
+            .accept_uni_on_connection(conn)
+            .await
+            .expect("accept uni");
+        assert_eq!(opened, accepted);
+    });
+}
+
+#[test]
+fn native_proto_driver_send_handle_respects_shutdown() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        let send = driver.to_send_handle();
+        send.shutdown().await.expect("shutdown");
+        let err = send
+            .probe()
+            .await
+            .expect_err("probe should fail after shutdown");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    });
+}
+
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }

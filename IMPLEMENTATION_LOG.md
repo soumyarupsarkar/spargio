@@ -5920,6 +5920,46 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N6 implemented (native local/send ergonomics mapping) with Red/Green TDD (2026-03-01)
+
+Implemented `!Send` local and explicit send-handoff wrappers for the native
+driver command surface.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_local_send_handoff_preserves_identity`
+- `native_proto_driver_send_handle_respects_shutdown`
+
+Expected red failures:
+
+- missing `to_local()` / `to_send_handle()` on `NativeProtoDriver`
+- missing local/send wrapper types
+
+### Green phase
+
+Added wrapper types:
+
+- `NativeProtoDriverLocal` (`Rc`-backed local handle)
+- `NativeProtoDriverSend` (`Send` handoff handle)
+
+Added conversions:
+
+- `NativeProtoDriver::to_local()`
+- `NativeProtoDriver::to_send_handle()`
+- `NativeProtoDriverLocal::to_send_handle()`
+
+Delegated native-driver operations through wrappers (probe/shutdown/connection
+and stream APIs) while preserving endpoint identity and closed-state behavior.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N4 implemented (connection/stream pump skeleton) with Red/Green TDD (2026-03-01)
 
 Implemented a deterministic native connection/stream event-pump skeleton in the

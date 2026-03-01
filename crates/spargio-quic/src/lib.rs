@@ -248,6 +248,18 @@ impl NativeProtoDriver {
         self.closed.load(Ordering::Acquire)
     }
 
+    pub fn to_local(&self) -> NativeProtoDriverLocal {
+        NativeProtoDriverLocal {
+            inner: Rc::new(self.clone()),
+        }
+    }
+
+    pub fn to_send_handle(&self) -> NativeProtoDriverSend {
+        NativeProtoDriverSend {
+            inner: self.clone(),
+        }
+    }
+
     pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::Probe { reply: reply_tx })?;
@@ -456,6 +468,140 @@ impl NativeProtoDriver {
         self.tx
             .send(cmd)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeProtoDriverSend {
+    inner: NativeProtoDriver,
+}
+
+impl NativeProtoDriverSend {
+    pub fn endpoint_id(&self) -> u64 {
+        self.inner.endpoint_id()
+    }
+
+    pub fn owner_shard(&self) -> spargio::ShardId {
+        self.inner.owner_shard()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
+        self.inner.probe().await
+    }
+
+    pub async fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+
+    pub async fn register_connection_for_test(&self) -> io::Result<u64> {
+        self.inner.register_connection_for_test().await
+    }
+
+    pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        self.inner.open_uni_on_connection(connection_id).await
+    }
+
+    pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        self.inner.accept_uni_on_connection(connection_id).await
+    }
+
+    pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        self.inner.open_bi_on_connection(connection_id).await
+    }
+
+    pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        self.inner.accept_bi_on_connection(connection_id).await
+    }
+
+    pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        self.inner.finish_stream(connection_id, stream_id).await
+    }
+
+    pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        self.inner.reset_stream(connection_id, stream_id).await
+    }
+
+    pub async fn stream_state(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+    ) -> io::Result<NativeProtoStreamState> {
+        self.inner.stream_state(connection_id, stream_id).await
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeProtoDriverLocal {
+    inner: Rc<NativeProtoDriver>,
+}
+
+impl NativeProtoDriverLocal {
+    pub fn endpoint_id(&self) -> u64 {
+        self.inner.endpoint_id()
+    }
+
+    pub fn owner_shard(&self) -> spargio::ShardId {
+        self.inner.owner_shard()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub fn to_send_handle(&self) -> NativeProtoDriverSend {
+        self.inner.to_send_handle()
+    }
+
+    pub fn driver(&self) -> NativeProtoDriver {
+        (*self.inner).clone()
+    }
+
+    pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
+        self.inner.probe().await
+    }
+
+    pub async fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+
+    pub async fn register_connection_for_test(&self) -> io::Result<u64> {
+        self.inner.register_connection_for_test().await
+    }
+
+    pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        self.inner.open_uni_on_connection(connection_id).await
+    }
+
+    pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
+        self.inner.accept_uni_on_connection(connection_id).await
+    }
+
+    pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        self.inner.open_bi_on_connection(connection_id).await
+    }
+
+    pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
+        self.inner.accept_bi_on_connection(connection_id).await
+    }
+
+    pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        self.inner.finish_stream(connection_id, stream_id).await
+    }
+
+    pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        self.inner.reset_stream(connection_id, stream_id).await
+    }
+
+    pub async fn stream_state(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+    ) -> io::Result<NativeProtoStreamState> {
+        self.inner.stream_state(connection_id, stream_id).await
     }
 }
 
