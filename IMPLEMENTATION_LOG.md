@@ -5920,6 +5920,63 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N8 implemented (fault injection + rollout/perf gates) with Red/Green TDD (2026-03-01)
+
+Implemented N8 qualification primitives: deterministic fault injection controls,
+fault stats, and explicit rollout/performance gate APIs.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_fault_injection_drops_ingress_and_tracks_stats`
+- `native_proto_driver_reorders_egress_when_fault_enabled`
+- `native_proto_perf_gate_marks_material_regression_as_fail`
+- `native_proto_rollout_stage_is_experimental_for_now`
+
+Expected red failures:
+
+- missing fault spec/stats APIs and behaviors
+- missing rollout/performance gate types
+
+### Green phase
+
+Added fault-injection types and APIs:
+
+- `NativeProtoFaultSpec`
+- `NativeProtoFaultStats`
+- `NativeProtoDriver::{set_fault_spec, fault_stats}`
+
+Owner-loop fault behaviors:
+
+- optional inbound drop mode (`drop_inbound`)
+- optional egress drop mode (`drop_egress`)
+- optional egress reorder mode (`reorder_egress` on drain)
+- tracked fault counters:
+  - inbound drops
+  - egress drops
+  - egress reorder operations
+
+Added rollout/performance gate types:
+
+- `NativeProtoRolloutStage` with current stage:
+  - `NativeProtoDriver::rollout_stage() == Experimental`
+- `NativeProtoPerfGate`
+- `NativeProtoPerfVerdict`
+- regression evaluation helper:
+  - `NativeProtoPerfGate::evaluate(...)`
+
+Wrapper parity:
+
+- local/send native wrappers delegate fault spec/stats APIs.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N7 implemented (native observability surface) with Red/Green TDD (2026-03-01)
 
 Implemented native-driver stats snapshots and structured event logging with

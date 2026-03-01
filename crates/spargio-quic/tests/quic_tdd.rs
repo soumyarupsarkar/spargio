@@ -1,9 +1,9 @@
 use futures::executor::block_on;
 use futures::channel::oneshot;
 use spargio_quic::{
-    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoEvent, NativeProtoTransportTuning,
-    NativeProtoTransmit, QuicBridge, QuicEndpoint, QuicEndpointOptions, QuicMetricsSnapshot,
-    QuicOptions,
+    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoEvent, NativeProtoFaultSpec,
+    NativeProtoPerfGate, NativeProtoRolloutStage, NativeProtoTransportTuning, NativeProtoTransmit,
+    QuicBridge, QuicEndpoint, QuicEndpointOptions, QuicMetricsSnapshot, QuicOptions,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -693,6 +693,84 @@ fn native_proto_driver_event_log_captures_timeout_and_backpressure() {
             )
         );
     });
+}
+
+#[test]
+fn native_proto_driver_fault_injection_drops_ingress_and_tracks_stats() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        driver
+            .set_fault_spec(NativeProtoFaultSpec::default().with_drop_inbound(true))
+            .await
+            .expect("set fault spec");
+
+        let report = driver
+            .submit_datagram(localhost_addr(9090), vec![0u8; 12])
+            .await
+            .expect("submit");
+        assert_eq!(report.generated_transmits, 0);
+
+        let stats = driver.stats().await.expect("stats");
+        assert!(stats.operations_total >= 2);
+        let fault_stats = driver.fault_stats().await.expect("fault stats");
+        assert!(fault_stats.inbound_dropped >= 1);
+    });
+}
+
+#[test]
+fn native_proto_driver_reorders_egress_when_fault_enabled() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+        driver
+            .set_fault_spec(NativeProtoFaultSpec::default().with_reorder_egress(true))
+            .await
+            .expect("set fault spec");
+        for size in [11usize, 22] {
+            driver
+                .enqueue_transmit_for_test(NativeProtoTransmit {
+                    destination: localhost_addr(6000 + u16::try_from(size).expect("size fits")),
+                    ecn: None,
+                    size,
+                    segment_size: None,
+                    src_ip: None,
+                })
+                .await
+                .expect("enqueue");
+        }
+        let drained = driver.drain_transmits(2).await.expect("drain");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].size, 22);
+        assert_eq!(drained[1].size, 11);
+        let fault_stats = driver.fault_stats().await.expect("fault stats");
+        assert!(fault_stats.egress_reorders >= 1);
+    });
+}
+
+#[test]
+fn native_proto_perf_gate_marks_material_regression_as_fail() {
+    let gate = NativeProtoPerfGate::default()
+        .with_max_p95_regression_pct(10.0)
+        .with_max_p99_regression_pct(12.5);
+    let verdict = gate.evaluate(100.0, 105.0, 100.0, 118.0);
+    assert!(!verdict.pass);
+    assert!(verdict.p99_regression_pct > gate.max_p99_regression_pct);
+}
+
+#[test]
+fn native_proto_rollout_stage_is_experimental_for_now() {
+    assert_eq!(NativeProtoDriver::rollout_stage(), NativeProtoRolloutStage::Experimental);
 }
 
 fn localhost_addr(port: u16) -> SocketAddr {

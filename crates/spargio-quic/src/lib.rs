@@ -251,6 +251,104 @@ pub enum NativeProtoEvent {
     Backpressure { scope: &'static str },
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NativeProtoFaultSpec {
+    pub drop_inbound: bool,
+    pub drop_egress: bool,
+    pub reorder_egress: bool,
+}
+
+impl NativeProtoFaultSpec {
+    pub fn with_drop_inbound(mut self, drop_inbound: bool) -> Self {
+        self.drop_inbound = drop_inbound;
+        self
+    }
+
+    pub fn with_drop_egress(mut self, drop_egress: bool) -> Self {
+        self.drop_egress = drop_egress;
+        self
+    }
+
+    pub fn with_reorder_egress(mut self, reorder_egress: bool) -> Self {
+        self.reorder_egress = reorder_egress;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NativeProtoFaultStats {
+    pub inbound_dropped: u64,
+    pub egress_dropped: u64,
+    pub egress_reorders: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NativeProtoRolloutStage {
+    Experimental,
+    Candidate,
+    Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeProtoPerfGate {
+    pub max_p95_regression_pct: f64,
+    pub max_p99_regression_pct: f64,
+}
+
+impl Default for NativeProtoPerfGate {
+    fn default() -> Self {
+        Self {
+            max_p95_regression_pct: 15.0,
+            max_p99_regression_pct: 20.0,
+        }
+    }
+}
+
+impl NativeProtoPerfGate {
+    pub fn with_max_p95_regression_pct(mut self, value: f64) -> Self {
+        self.max_p95_regression_pct = value;
+        self
+    }
+
+    pub fn with_max_p99_regression_pct(mut self, value: f64) -> Self {
+        self.max_p99_regression_pct = value;
+        self
+    }
+
+    pub fn evaluate(
+        self,
+        baseline_p95: f64,
+        sample_p95: f64,
+        baseline_p99: f64,
+        sample_p99: f64,
+    ) -> NativeProtoPerfVerdict {
+        let p95_regression_pct = if baseline_p95 <= 0.0 {
+            0.0
+        } else {
+            ((sample_p95 - baseline_p95) / baseline_p95) * 100.0
+        };
+        let p99_regression_pct = if baseline_p99 <= 0.0 {
+            0.0
+        } else {
+            ((sample_p99 - baseline_p99) / baseline_p99) * 100.0
+        };
+        let pass = p95_regression_pct <= self.max_p95_regression_pct
+            && p99_regression_pct <= self.max_p99_regression_pct;
+        NativeProtoPerfVerdict {
+            pass,
+            p95_regression_pct,
+            p99_regression_pct,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeProtoPerfVerdict {
+    pub pass: bool,
+    pub p95_regression_pct: f64,
+    pub p99_regression_pct: f64,
+}
+
 #[derive(Clone)]
 pub struct NativeProtoDriver {
     endpoint_id: u64,
@@ -260,6 +358,10 @@ pub struct NativeProtoDriver {
 }
 
 impl NativeProtoDriver {
+    pub fn rollout_stage() -> NativeProtoRolloutStage {
+        NativeProtoRolloutStage::Experimental
+    }
+
     pub async fn start(
         handle: &RuntimeHandle,
         options: NativeProtoDriverOptions,
@@ -457,6 +559,22 @@ impl NativeProtoDriver {
             max,
             reply: reply_tx,
         })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::SetFaultSpec { spec, reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::FaultStats { reply: reply_tx })?;
         reply_rx
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
@@ -661,6 +779,14 @@ impl NativeProtoDriverSend {
     pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
         self.inner.drain_events(max).await
     }
+
+    pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
+        self.inner.set_fault_spec(spec).await
+    }
+
+    pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
+        self.inner.fault_stats().await
+    }
 }
 
 #[derive(Clone)]
@@ -751,6 +877,14 @@ impl NativeProtoDriverLocal {
     pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
         self.inner.drain_events(max).await
     }
+
+    pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
+        self.inner.set_fault_spec(spec).await
+    }
+
+    pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
+        self.inner.fault_stats().await
+    }
 }
 
 enum NativeProtoCommand {
@@ -835,6 +969,13 @@ enum NativeProtoCommand {
         max: usize,
         reply: tokio::sync::oneshot::Sender<Vec<NativeProtoEvent>>,
     },
+    SetFaultSpec {
+        spec: NativeProtoFaultSpec,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    FaultStats {
+        reply: tokio::sync::oneshot::Sender<NativeProtoFaultStats>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -876,6 +1017,8 @@ async fn native_proto_driver_loop(
     let mut tuning = NativeProtoTransportTuning::default();
     let mut stats = NativeProtoStats::default();
     let mut events: VecDeque<NativeProtoEvent> = VecDeque::new();
+    let mut fault_spec = NativeProtoFaultSpec::default();
+    let mut fault_stats = NativeProtoFaultStats::default();
 
     while let Some(cmd) = rx.recv().await {
         stats.operations_total = stats.operations_total.saturating_add(1);
@@ -927,6 +1070,14 @@ async fn native_proto_driver_loop(
                     )));
                     continue;
                 }
+                if fault_spec.drop_inbound {
+                    fault_stats.inbound_dropped = fault_stats.inbound_dropped.saturating_add(1);
+                    let _ = reply.send(Ok(NativeProtoIngressReport {
+                        generated_transmits: 0,
+                        queued_transmits: pending_transmits.len(),
+                    }));
+                    continue;
+                }
                 stats.datagrams_ingested = stats.datagrams_ingested.saturating_add(1);
                 let event = endpoint.handle(
                     std::time::Instant::now(),
@@ -939,27 +1090,35 @@ async fn native_proto_driver_loop(
                 let result = match event {
                     Some(quinn_proto::DatagramEvent::Response(tx)) => {
                         generated_transmits = 1;
-                        match push_native_transmit(
-                            &mut pending_transmits,
-                            tx,
-                            max_pending_transmits,
-                        ) {
-                            Ok(()) => Ok(NativeProtoIngressReport {
+                        if fault_spec.drop_egress {
+                            fault_stats.egress_dropped = fault_stats.egress_dropped.saturating_add(1);
+                            Ok(NativeProtoIngressReport {
                                 generated_transmits,
                                 queued_transmits: pending_transmits.len(),
-                            }),
-                            Err(err) => {
-                                if err.kind() == io::ErrorKind::WouldBlock {
-                                    stats.backpressure_hits =
-                                        stats.backpressure_hits.saturating_add(1);
-                                    push_native_event(
-                                        &mut events,
-                                        NativeProtoEvent::Backpressure {
-                                            scope: "egress_queue",
-                                        },
-                                    );
+                            })
+                        } else {
+                            match push_native_transmit(
+                                &mut pending_transmits,
+                                tx,
+                                max_pending_transmits,
+                            ) {
+                                Ok(()) => Ok(NativeProtoIngressReport {
+                                    generated_transmits,
+                                    queued_transmits: pending_transmits.len(),
+                                }),
+                                Err(err) => {
+                                    if err.kind() == io::ErrorKind::WouldBlock {
+                                        stats.backpressure_hits =
+                                            stats.backpressure_hits.saturating_add(1);
+                                        push_native_event(
+                                            &mut events,
+                                            NativeProtoEvent::Backpressure {
+                                                scope: "egress_queue",
+                                            },
+                                        );
+                                    }
+                                    Err(err)
                                 }
-                                Err(err)
                             }
                         }
                     }
@@ -973,24 +1132,35 @@ async fn native_proto_driver_loop(
                     Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
                         let tx = endpoint.refuse(incoming, &mut scratch);
                         generated_transmits = 1;
-                        match push_native_transmit(&mut pending_transmits, tx, max_pending_transmits)
-                        {
-                            Ok(()) => Ok(NativeProtoIngressReport {
+                        if fault_spec.drop_egress {
+                            fault_stats.egress_dropped = fault_stats.egress_dropped.saturating_add(1);
+                            Ok(NativeProtoIngressReport {
                                 generated_transmits,
                                 queued_transmits: pending_transmits.len(),
-                            }),
-                            Err(err) => {
-                                if err.kind() == io::ErrorKind::WouldBlock {
-                                    stats.backpressure_hits =
-                                        stats.backpressure_hits.saturating_add(1);
-                                    push_native_event(
-                                        &mut events,
-                                        NativeProtoEvent::Backpressure {
-                                            scope: "egress_queue",
-                                        },
-                                    );
+                            })
+                        } else {
+                            match push_native_transmit(
+                                &mut pending_transmits,
+                                tx,
+                                max_pending_transmits,
+                            ) {
+                                Ok(()) => Ok(NativeProtoIngressReport {
+                                    generated_transmits,
+                                    queued_transmits: pending_transmits.len(),
+                                }),
+                                Err(err) => {
+                                    if err.kind() == io::ErrorKind::WouldBlock {
+                                        stats.backpressure_hits =
+                                            stats.backpressure_hits.saturating_add(1);
+                                        push_native_event(
+                                            &mut events,
+                                            NativeProtoEvent::Backpressure {
+                                                scope: "egress_queue",
+                                            },
+                                        );
+                                    }
+                                    Err(err)
                                 }
-                                Err(err)
                             }
                         }
                     }
@@ -1004,12 +1174,19 @@ async fn native_proto_driver_loop(
             NativeProtoCommand::DrainTransmits { max, reply } => {
                 commands_processed = commands_processed.saturating_add(1);
                 let take = max.min(pending_transmits.len());
-                let drained = pending_transmits.drain(..take).collect::<Vec<_>>();
+                let mut drained = pending_transmits.drain(..take).collect::<Vec<_>>();
+                if fault_spec.reorder_egress && drained.len() > 1 {
+                    drained.reverse();
+                    fault_stats.egress_reorders = fault_stats.egress_reorders.saturating_add(1);
+                }
                 let _ = reply.send(drained);
             }
             NativeProtoCommand::EnqueueTransmitForTest { transmit, reply } => {
                 commands_processed = commands_processed.saturating_add(1);
-                let result = if pending_transmits.len() >= max_pending_transmits {
+                let result = if fault_spec.drop_egress {
+                    fault_stats.egress_dropped = fault_stats.egress_dropped.saturating_add(1);
+                    Ok(())
+                } else if pending_transmits.len() >= max_pending_transmits {
                     stats.backpressure_hits = stats.backpressure_hits.saturating_add(1);
                     push_native_event(
                         &mut events,
@@ -1255,6 +1432,15 @@ async fn native_proto_driver_loop(
                 let take = max.min(events.len());
                 let drained = events.drain(..take).collect::<Vec<_>>();
                 let _ = reply.send(drained);
+            }
+            NativeProtoCommand::SetFaultSpec { spec, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                fault_spec = spec;
+                let _ = reply.send(Ok(()));
+            }
+            NativeProtoCommand::FaultStats { reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let _ = reply.send(fault_stats);
             }
             NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());
