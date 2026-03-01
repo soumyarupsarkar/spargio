@@ -22,6 +22,7 @@ pub use quinn_proto;
 
 const DEFAULT_MAX_INFLIGHT_OPS: usize = 1024;
 const BRIDGE_WORKER_THREADS: usize = 2;
+const NATIVE_EVENT_CAPACITY: usize = 1024;
 static NEXT_NATIVE_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -230,6 +231,26 @@ impl NativeProtoTransportTuning {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NativeProtoStats {
+    pub operations_total: u64,
+    pub connections_registered: u64,
+    pub streams_opened_uni: u64,
+    pub streams_opened_bi: u64,
+    pub datagrams_ingested: u64,
+    pub datagrams_oversized: u64,
+    pub backpressure_hits: u64,
+    pub timeouts_fired: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum NativeProtoEvent {
+    ConnectionRegistered { connection_id: u64 },
+    TimeoutFired { generation: u64 },
+    OversizedDatagram { size: usize, max_size: usize },
+    Backpressure { scope: &'static str },
+}
+
 #[derive(Clone)]
 pub struct NativeProtoDriver {
     endpoint_id: u64,
@@ -417,6 +438,25 @@ impl NativeProtoDriver {
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::TransportTuning { reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn stats(&self) -> io::Result<NativeProtoStats> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::Stats { reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::DrainEvents {
+            max,
+            reply: reply_tx,
+        })?;
         reply_rx
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
@@ -613,6 +653,14 @@ impl NativeProtoDriverSend {
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         self.inner.transport_tuning().await
     }
+
+    pub async fn stats(&self) -> io::Result<NativeProtoStats> {
+        self.inner.stats().await
+    }
+
+    pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
+        self.inner.drain_events(max).await
+    }
 }
 
 #[derive(Clone)]
@@ -695,6 +743,14 @@ impl NativeProtoDriverLocal {
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         self.inner.transport_tuning().await
     }
+
+    pub async fn stats(&self) -> io::Result<NativeProtoStats> {
+        self.inner.stats().await
+    }
+
+    pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
+        self.inner.drain_events(max).await
+    }
 }
 
 enum NativeProtoCommand {
@@ -772,6 +828,13 @@ enum NativeProtoCommand {
     TransportTuning {
         reply: tokio::sync::oneshot::Sender<NativeProtoTransportTuning>,
     },
+    Stats {
+        reply: tokio::sync::oneshot::Sender<NativeProtoStats>,
+    },
+    DrainEvents {
+        max: usize,
+        reply: tokio::sync::oneshot::Sender<Vec<NativeProtoEvent>>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -811,8 +874,11 @@ async fn native_proto_driver_loop(
     let mut last_fired_generation = None;
     let mut connections: HashMap<u64, NativeProtoConnectionPump> = HashMap::new();
     let mut tuning = NativeProtoTransportTuning::default();
+    let mut stats = NativeProtoStats::default();
+    let mut events: VecDeque<NativeProtoEvent> = VecDeque::new();
 
     while let Some(cmd) = rx.recv().await {
+        stats.operations_total = stats.operations_total.saturating_add(1);
         match cmd {
             NativeProtoCommand::Probe { reply } => {
                 commands_processed = commands_processed.saturating_add(1);
@@ -843,6 +909,14 @@ async fn native_proto_driver_loop(
                 commands_processed = commands_processed.saturating_add(1);
                 let mut generated_transmits = 0usize;
                 if payload.len() > tuning.max_datagram_size {
+                    stats.datagrams_oversized = stats.datagrams_oversized.saturating_add(1);
+                    push_native_event(
+                        &mut events,
+                        NativeProtoEvent::OversizedDatagram {
+                            size: payload.len(),
+                            max_size: tuning.max_datagram_size,
+                        },
+                    );
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
@@ -853,6 +927,7 @@ async fn native_proto_driver_loop(
                     )));
                     continue;
                 }
+                stats.datagrams_ingested = stats.datagrams_ingested.saturating_add(1);
                 let event = endpoint.handle(
                     std::time::Instant::now(),
                     remote,
@@ -873,10 +948,23 @@ async fn native_proto_driver_loop(
                                 generated_transmits,
                                 queued_transmits: pending_transmits.len(),
                             }),
-                            Err(err) => Err(err),
+                            Err(err) => {
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    stats.backpressure_hits =
+                                        stats.backpressure_hits.saturating_add(1);
+                                    push_native_event(
+                                        &mut events,
+                                        NativeProtoEvent::Backpressure {
+                                            scope: "egress_queue",
+                                        },
+                                    );
+                                }
+                                Err(err)
+                            }
                         }
                     }
                     Some(quinn_proto::DatagramEvent::ConnectionEvent(_, _)) => {
+                        stats.datagrams_ingested = stats.datagrams_ingested.saturating_add(1);
                         Ok(NativeProtoIngressReport {
                             generated_transmits,
                             queued_transmits: pending_transmits.len(),
@@ -891,7 +979,19 @@ async fn native_proto_driver_loop(
                                 generated_transmits,
                                 queued_transmits: pending_transmits.len(),
                             }),
-                            Err(err) => Err(err),
+                            Err(err) => {
+                                if err.kind() == io::ErrorKind::WouldBlock {
+                                    stats.backpressure_hits =
+                                        stats.backpressure_hits.saturating_add(1);
+                                    push_native_event(
+                                        &mut events,
+                                        NativeProtoEvent::Backpressure {
+                                            scope: "egress_queue",
+                                        },
+                                    );
+                                }
+                                Err(err)
+                            }
                         }
                     }
                     None => Ok(NativeProtoIngressReport {
@@ -910,6 +1010,13 @@ async fn native_proto_driver_loop(
             NativeProtoCommand::EnqueueTransmitForTest { transmit, reply } => {
                 commands_processed = commands_processed.saturating_add(1);
                 let result = if pending_transmits.len() >= max_pending_transmits {
+                    stats.backpressure_hits = stats.backpressure_hits.saturating_add(1);
+                    push_native_event(
+                        &mut events,
+                        NativeProtoEvent::Backpressure {
+                            scope: "egress_queue",
+                        },
+                    );
                     Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "native proto egress queue full",
@@ -936,6 +1043,11 @@ async fn native_proto_driver_loop(
                         timeout_fires = timeout_fires.saturating_add(1);
                         last_fired_generation = Some(generation);
                         next_deadline = None;
+                        stats.timeouts_fired = stats.timeouts_fired.saturating_add(1);
+                        push_native_event(
+                            &mut events,
+                            NativeProtoEvent::TimeoutFired { generation },
+                        );
                     }
                 }
                 let _ = reply.send(NativeProtoTimerState {
@@ -959,6 +1071,11 @@ async fn native_proto_driver_loop(
                 let id = next_connection_id;
                 next_connection_id = next_connection_id.saturating_add(1);
                 connections.entry(id).or_default();
+                 stats.connections_registered = stats.connections_registered.saturating_add(1);
+                push_native_event(
+                    &mut events,
+                    NativeProtoEvent::ConnectionRegistered { connection_id: id },
+                );
                 let _ = reply.send(id);
             }
             NativeProtoCommand::OpenUniOnConnection {
@@ -971,6 +1088,7 @@ async fn native_proto_driver_loop(
                     next_stream_id = next_stream_id.saturating_add(1);
                     conn.pending_uni_accept.push_back(stream_id);
                     conn.streams.entry(stream_id).or_default();
+                    stats.streams_opened_uni = stats.streams_opened_uni.saturating_add(1);
                     Ok(stream_id)
                 } else {
                     Err(io::Error::new(
@@ -1011,6 +1129,7 @@ async fn native_proto_driver_loop(
                     let pair = (stream_id, stream_id);
                     conn.pending_bi_accept.push_back(pair);
                     conn.streams.entry(stream_id).or_default();
+                    stats.streams_opened_bi = stats.streams_opened_bi.saturating_add(1);
                     Ok(pair)
                 } else {
                     Err(io::Error::new(
@@ -1127,6 +1246,16 @@ async fn native_proto_driver_loop(
                 commands_processed = commands_processed.saturating_add(1);
                 let _ = reply.send(tuning);
             }
+            NativeProtoCommand::Stats { reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let _ = reply.send(stats);
+            }
+            NativeProtoCommand::DrainEvents { max, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let take = max.min(events.len());
+                let drained = events.drain(..take).collect::<Vec<_>>();
+                let _ = reply.send(drained);
+            }
             NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());
                 break;
@@ -1159,6 +1288,13 @@ fn push_native_transmit(
         src_ip: tx.src_ip,
     });
     Ok(())
+}
+
+fn push_native_event(events: &mut VecDeque<NativeProtoEvent>, event: NativeProtoEvent) {
+    if events.len() >= NATIVE_EVENT_CAPACITY {
+        events.pop_front();
+    }
+    events.push_back(event);
 }
 
 #[derive(Debug, Clone, Copy)]

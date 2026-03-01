@@ -5920,6 +5920,61 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N7 implemented (native observability surface) with Red/Green TDD (2026-03-01)
+
+Implemented native-driver stats snapshots and structured event logging with
+bounded event retention.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_stats_track_key_operations`
+- `native_proto_driver_event_log_captures_timeout_and_backpressure`
+
+Expected red failures:
+
+- missing `stats()` and `drain_events()` APIs
+- missing `NativeProtoEvent` and operation counters
+
+### Green phase
+
+Added observability types:
+
+- `NativeProtoStats`
+- `NativeProtoEvent`
+
+Added native driver APIs:
+
+- `stats().await`
+- `drain_events(max).await`
+
+Owner-loop observability behavior:
+
+- tracks operation totals and key domain counters:
+  - connection registrations
+  - stream opens (uni/bi)
+  - datagram ingest/oversize rejections
+  - backpressure hits
+  - timer fires
+- emits structured events for:
+  - connection registration
+  - timeout firing
+  - oversized datagram rejection
+  - backpressure events
+- retains events in bounded FIFO buffer (`NATIVE_EVENT_CAPACITY`).
+
+Wrapper parity:
+
+- local/send native wrappers delegate `stats()` and `drain_events(...)`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N5 implemented (datagram limits + transport tuning surface) with Red/Green TDD (2026-03-01)
 
 Implemented datagram-size enforcement and transport tuning roundtrip APIs on

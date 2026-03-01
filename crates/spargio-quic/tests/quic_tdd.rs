@@ -1,8 +1,9 @@
 use futures::executor::block_on;
 use futures::channel::oneshot;
 use spargio_quic::{
-    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoTransportTuning, NativeProtoTransmit,
-    QuicBridge, QuicEndpoint, QuicEndpointOptions, QuicMetricsSnapshot, QuicOptions,
+    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoEvent, NativeProtoTransportTuning,
+    NativeProtoTransmit, QuicBridge, QuicEndpoint, QuicEndpointOptions, QuicMetricsSnapshot,
+    QuicOptions,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -604,6 +605,93 @@ fn native_proto_driver_rejects_oversized_datagram_per_tuning() {
             .await
             .expect_err("oversized datagram should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    });
+}
+
+#[test]
+fn native_proto_driver_stats_track_key_operations() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let conn = driver
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
+        let _ = driver.open_uni_on_connection(conn).await.expect("open uni");
+        let _ = driver.open_bi_on_connection(conn).await.expect("open bi");
+        let _ = driver
+            .submit_datagram(localhost_addr(12345), vec![0u8; 16])
+            .await
+            .expect("submit datagram");
+        let _ = driver
+            .schedule_timeout(Duration::from_millis(10))
+            .await
+            .expect("schedule");
+        let _ = driver
+            .advance_clock_for_test(Duration::from_millis(20))
+            .await
+            .expect("advance");
+
+        let stats = driver.stats().await.expect("stats");
+        assert!(stats.operations_total >= 6);
+        assert_eq!(stats.connections_registered, 1);
+        assert_eq!(stats.streams_opened_uni, 1);
+        assert_eq!(stats.streams_opened_bi, 1);
+        assert_eq!(stats.timeouts_fired, 1);
+    });
+}
+
+#[test]
+fn native_proto_driver_event_log_captures_timeout_and_backpressure() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let options = NativeProtoDriverOptions::default().with_max_pending_transmits(1);
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), options)
+            .await
+            .expect("start native driver");
+
+        let _ = driver
+            .schedule_timeout(Duration::from_millis(5))
+            .await
+            .expect("schedule");
+        let _ = driver
+            .advance_clock_for_test(Duration::from_millis(10))
+            .await
+            .expect("advance");
+
+        let tx = NativeProtoTransmit {
+            destination: localhost_addr(8888),
+            ecn: None,
+            size: 1,
+            segment_size: None,
+            src_ip: None,
+        };
+        driver
+            .enqueue_transmit_for_test(tx.clone())
+            .await
+            .expect("first enqueue");
+        let _ = driver.enqueue_transmit_for_test(tx).await.expect_err("backpressure");
+
+        let events = driver.drain_events(16).await.expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, NativeProtoEvent::TimeoutFired { .. }))
+        );
+        assert!(
+            events.iter().any(
+                |event| matches!(event, NativeProtoEvent::Backpressure { .. })
+            )
+        );
     });
 }
 
