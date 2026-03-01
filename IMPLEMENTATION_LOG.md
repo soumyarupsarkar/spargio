@@ -5920,6 +5920,584 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: R1 native cutover continuation (connection-op dispatch) with Red/Green TDD (2026-03-01)
+
+Implemented the next R1 slice by routing native-backend connection async
+operations through a persistent connection dispatcher task, and by making
+connection-level backend dispatch visible in metrics.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `quic_connection_native_backend_dispatches_connection_ops`
+- `quic_connection_bridge_backend_dispatches_connection_ops`
+
+Expected red failures:
+
+- connection operations (`open_*`, `accept_*`, etc.) were not incrementing
+  backend dispatch counters, so before/after metric deltas stayed flat.
+
+### Green phase
+
+Implemented in `crates/spargio-quic/src/lib.rs`:
+
+- Added `NativeConnectionDispatch` actor:
+  - persistent Tokio task per accepted/connected native connection
+  - command loop for async connection operations:
+    - `closed`
+    - `open_uni` / `open_bi`
+    - `accept_uni` / `accept_bi`
+    - `read_datagram`
+  - bounded command/reply semantics via unbounded mpsc + oneshot replies
+  - deterministic `BrokenPipe` error when dispatcher is closed.
+- Updated `QuicEndpoint::wrap_connection(...)`:
+  - now initializes native connection dispatch for `QuicBackend::Native`
+  - now returns `io::Result<QuicConnection>` to surface dispatcher init errors.
+- Updated connect/accept call sites to handle fallible wrapping and keep metrics
+  (`connects_failed` / `accepts_failed`) consistent on wrap failures.
+- Updated `QuicConnection` operation dispatch:
+  - native backend async ops route through `NativeConnectionDispatch`
+  - bridge backend keeps direct path
+  - both backends now increment backend dispatch counters for connection ops
+  - timeout accounting (`operation_timeouts`) preserved.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd quic_connection_` (red then green)
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test soak_tdd`
+
+## Update: R1 cutover guardrails expanded (native path bridge-spawn exclusion) with Red/Green TDD (2026-03-01)
+
+Added explicit cutover tests that assert native backend data-path operations do
+not go through bridge task spawning, while bridge backend still does.
+
+### Red phase
+
+Added failing tests in new file `crates/spargio-quic/tests/native_cutover_tdd.rs`:
+
+- `native_backend_data_path_avoids_bridge_task_spawn`
+- `bridge_backend_data_path_uses_bridge_task_spawn`
+
+Initial failures:
+
+- native test failed due premature close ordering causing stream read abort.
+- lock poisoning cascaded into the second test.
+
+### Green phase
+
+Adjusted test choreography and synchronization:
+
+- serialized counter-sensitive tests with process-local lock
+  (`BRIDGE_COUNT_TEST_LOCK`).
+- moved connection close calls to post-exchange phase before `wait_idle`.
+- recovered lock from poison safely for deterministic reruns.
+
+Cutover assertions now enforced:
+
+- native backend (`QuicBackend::Native`) exchange + `wait_idle` path leaves
+  `bridge_runtime_spawn_count() == 0`.
+- bridge backend (`QuicBackend::Bridge`) exchange + `wait_idle` path yields
+  `bridge_runtime_spawn_count() >= 1`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test soak_tdd`
+
+## Update: R1 cutover continuation (native endpoint lifecycle without bridge runtime context entry) with Red/Green TDD (2026-03-01)
+
+Implemented the next R1 slice by removing native endpoint constructor/drop
+dependence on `with_bridge_runtime_context(...)`, while keeping bridge backend
+compatibility behavior unchanged.
+
+### Red phase
+
+Extended `crates/spargio-quic/tests/native_cutover_tdd.rs` with failing tests:
+
+- `native_backend_endpoint_lifecycle_avoids_bridge_runtime_context_entry`
+- `bridge_backend_endpoint_lifecycle_uses_bridge_runtime_context_entry`
+
+Expected red failure before implementation:
+
+- native endpoint lifecycle (`server/client` + drop) still went through
+  `with_bridge_runtime_context(...)`.
+
+### Green phase
+
+Implemented in `crates/spargio-quic/src/lib.rs`:
+
+- Added bridge-runtime context-entry counters:
+  - `bridge_runtime_context_enter_count()`
+  - `reset_bridge_runtime_context_enter_count()`
+  - internal counter increment in `with_bridge_runtime_context(...)`.
+- Added native endpoint runtime adapter:
+  - `BridgeTokioRuntime` implementing `quinn::Runtime` with explicit
+    `tokio::runtime::Handle` (spawn/timer/socket wrapping without relying on
+    thread-local runtime context entry).
+  - `BridgeUdpSocket` and `BridgeUdpPoller` implementing
+    `quinn::AsyncUdpSocket` / `quinn::UdpPoller`.
+- Added native constructor helpers:
+  - `native_server_endpoint(...)`
+  - `native_client_endpoint(...)`
+- Updated endpoint constructors:
+  - `QuicBackend::Native` now uses native constructor helpers.
+  - `QuicBackend::Bridge` retains `with_bridge_runtime_context(...)` path.
+- Updated `Drop for QuicEndpoint`:
+  - bridge backend keeps runtime-context drop guard.
+  - native backend drops endpoint directly (no bridge context entry).
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test soak_tdd`
+
+## Update: R8 deferred-fs progression (`create_dir_all` native-first) with Red/Green TDD (2026-03-01)
+
+Implemented a concrete deferred-fs migration slice by removing direct
+`spawn_blocking(std::fs::create_dir_all)` usage from the common path.
+
+### Red phase
+
+Extended `tests/deferred_items_tdd.rs` with a new assertion in:
+
+- `deferred_fs_helpers_execute_and_metadata_lite_is_available`
+
+New contract:
+
+- simple nested `create_dir_all` paths should not use direct blocking fallback
+  in `spargio::fs::create_dir_all`.
+
+### Green phase
+
+Implemented in `src/lib.rs` (`spargio::fs` module):
+
+- `create_dir_all(...)` now uses native-first iterative creation via
+  `create_dir(...)` for straightforward path forms.
+- preserved compatibility fallback to `std::fs::create_dir_all` for complex
+  relative path forms (`.` / `..` / platform prefix components).
+- added test instrumentation helpers:
+  - `create_dir_all_blocking_fallback_count_for_test()`
+  - `reset_create_dir_all_blocking_fallback_count_for_test()`
+
+Docs/status sync:
+
+- updated README deferred-fs wording to reflect:
+  - `create_dir_all` now native-first for straightforward paths
+  - still-deferred helpers remain `canonicalize`, `metadata`,
+    `symlink_metadata`, `set_permissions`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test --features uring-native --test deferred_items_tdd`
+- `cargo test --test deferred_items_tdd`
+
+## Update: R2 native-proto progression (`connect_for_test` + protocol transmit pump) with Red/Green TDD (2026-03-01)
+
+Implemented an additional R2 slice to move native driver behavior beyond
+placeholder queue semantics by wiring real `quinn-proto` connection bootstrap
+and transmit progression in the owner loop.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_connect_for_test_generates_initial_transmit`
+
+Red expectation:
+
+- driver lacked a real client connection bootstrap path that produced protocol
+  transmits from `quinn-proto::Connection::poll_transmit(...)`.
+
+### Green phase
+
+Implemented in `crates/spargio-quic/src/lib.rs`:
+
+- Added new command/API:
+  - `NativeProtoDriver::{connect_for_test(...)}`
+  - parity on local/send wrappers.
+- Added owner-loop command:
+  - `NativeProtoCommand::ConnectForTest`
+- Added protocol connection state in owner loop:
+  - `HashMap<ConnectionHandle, quinn_proto::Connection>`
+  - per-handle queued connection-event mailbox
+  - synthetic-id -> proto-handle mapping for close-path cleanup.
+- Added protocol progression helper:
+  - `drive_native_proto_connections(...)`
+  - processes queued `ConnectionEvent`s
+  - forwards endpoint events via `Endpoint::handle_event(...)`
+  - drains `Connection::poll_transmit(...)` into native transmit queue with
+    existing backpressure/fault accounting.
+- Integrated progression helper into:
+  - `SubmitDatagram` (connection-event driven progression)
+  - `AdvanceClockForTest` (timeout-driven progression)
+  - `ConnectForTest` bootstrap path.
+- Added deterministic synthetic-time conversion helper:
+  - `native_proto_now(epoch, now_duration)`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_connect_for_test_generates_initial_transmit`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test --features uring-native --test deferred_items_tdd`
+
+## Update: R1-R9 implementation sweep completed with Red/Green TDD (2026-03-01)
+
+Completed the roadmap milestones `R1` through `R9` with concrete tests,
+implementation slices, and CI/docs wiring.
+
+### R1: QUIC backend cutover controls (`Native` default, `Bridge` explicit fallback)
+
+Red phase:
+
+- Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+  - `quic_endpoint_options_default_to_native_backend`
+  - `quic_endpoint_default_backend_dispatches_native_ops`
+  - `quic_endpoint_bridge_backend_dispatches_bridge_ops`
+
+Green phase:
+
+- Added `QuicBackend` (`Native`, `Bridge`) and plumbed it through
+  `QuicEndpointOptions`.
+- Added dispatch metrics:
+  - `QuicMetricsSnapshot::{native_ops_dispatched, bridge_ops_dispatched}`
+- Routed endpoint operation dispatch by backend mode; `Native` is default.
+- Added controlled endpoint drop path to preserve quinn runtime-context safety.
+
+### R2: Native driver progression beyond bare skeleton semantics
+
+Red phase:
+
+- Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+  - `native_proto_driver_closed_connection_rejects_stream_ops`
+  - `native_proto_driver_connection_datagram_roundtrip_tracks_state`
+
+Green phase:
+
+- Added `NativeProtoConnectionState`.
+- Added connection lifecycle/datagram APIs:
+  - `close_connection_for_test`
+  - `connection_state`
+  - `send_datagram_on_connection_for_test`
+  - `recv_datagram_on_connection_for_test`
+- Extended owner-loop connection pump with close-state guards and per-connection
+  datagram queues/counters.
+- Mirrored these APIs on local/send driver wrappers.
+
+### R3: Native QUIC interop matrix
+
+Red phase:
+
+- Added failing interop suite `crates/spargio-quic/tests/interop_tdd.rs`.
+
+Green phase:
+
+- Added interop tests:
+  - `interop_spargio_client_to_raw_quinn_server_bi_stream`
+  - `interop_raw_quinn_client_to_spargio_server_bi_stream`
+- Added `scripts/quic_interop_matrix.sh`.
+- Added CI wiring in `.github/workflows/ci.yml` (`companion-matrix` job).
+
+### R4: Long-window soak + fault qualification
+
+Red phase:
+
+- Added failing soak/fault qualification suite
+  `crates/spargio-quic/tests/soak_tdd.rs`.
+
+Green phase:
+
+- Added ignored soak tests:
+  - `soak_connection_churn_roundtrip_stays_stable`
+  - `soak_native_fault_injection_keeps_egress_queue_bounded`
+- Added `scripts/quic_soak_fault.sh`.
+- Wired nightly CI soak invocation in `.github/workflows/ci.yml`.
+
+### R5: Performance gate integration for rollout
+
+Red phase:
+
+- Added failing QUIC perf-gate harness tests `tests/quic_perf_guardrail_tdd.rs`.
+
+Green phase:
+
+- Added `scripts/quic_perf_gate.sh` (p95/p99 regression + throughput floor).
+- Added fixture profile:
+  - `tests/fixtures/quic_perf/native_vs_bridge.json`
+- Added CI wiring for fixture-based perf gate in `.github/workflows/ci.yml`.
+- Added CI/script guard test `tests/quic_ops_tdd.rs`.
+
+### R6: README/status sync
+
+Red phase:
+
+- Added failing docs guards in `tests/docs_tdd.rs` for QUIC status wording and
+  helper script references.
+
+Green phase:
+
+- Updated `README.md` done/not-done sections:
+  - backend selector/rollout status
+  - explicit pending full tokio-free `quinn-proto` cutover note
+  - QUIC interop/perf/soak helper scripts listed
+- Added docs assertions:
+  - `readme_tracks_quic_rollout_done_and_not_done_status`
+  - `implementation_log_contains_r1_to_r9_breakdown_sections`
+
+### R7: Companion hardening beyond smoke
+
+Red phase:
+
+- Added failing broader maturity tests across companion crates.
+
+Green phase:
+
+- Added companion hardening tests:
+  - `crates/spargio-process/tests/maturity_tdd.rs`
+  - `crates/spargio-signal/tests/maturity_tdd.rs`
+  - `crates/spargio-protocols/tests/foundation_tdd.rs`
+  - `crates/spargio-tls/tests/tls_tdd.rs`
+  - `crates/spargio-ws/tests/ws_tdd.rs`
+- Added `scripts/companion_ci_hardening.sh`.
+- Wired CI (`companion-matrix`) to run hardening lane.
+- Extended `tests/companion_ops_tdd.rs` to assert hardening script + CI wiring.
+
+### R8: DNS and deferred fs items encoded as explicit contracts
+
+Red phase:
+
+- Added failing contract/behavior tests in `tests/deferred_items_tdd.rs`.
+
+Green phase:
+
+- Added README contract assertions for:
+  - DNS `ToSocketAddrs` caveat and `SocketAddr` alternatives
+  - deferred fs helper list + `metadata_lite`
+- Added feature-gated behavior tests (`uring-native` Linux lane) for:
+  - hostname connect and socket-addr connect behavior
+  - deferred fs helper execution (`create_dir_all`, `canonicalize`, `metadata`,
+    `symlink_metadata`, `set_permissions`, `metadata_lite`)
+
+### R9: Scheduler/docs maturity
+
+Red phase:
+
+- Added failing runtime test for scheduler tuning knob visibility.
+
+Green phase:
+
+- Added scheduler knob:
+  - `RuntimeBuilder::steal_victim_stride(...)`
+- Plumbed victim stride through work-stealing loop and stats snapshot:
+  - `RuntimeStats::steal_victim_stride`
+- Added runtime test:
+  - `runtime_builder_steal_victim_stride_is_reported_and_clamped`
+- Added mdBook chapter:
+  - `book/src/scheduler_tuning.md`
+- Updated book summary:
+  - `book/src/SUMMARY.md`
+
+### Validation
+
+Executed and passing during this sweep:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test soak_tdd`
+- `cargo test --test quic_perf_guardrail_tdd`
+- `cargo test --test quic_ops_tdd`
+- `cargo test --test docs_tdd`
+- `cargo test --test runtime_tdd`
+- `cargo test -p spargio-process --test maturity_tdd`
+- `cargo test -p spargio-signal --test maturity_tdd`
+- `cargo test -p spargio-protocols --test foundation_tdd --features uring-native`
+- `cargo test -p spargio-tls --test tls_tdd`
+- `cargo test -p spargio-ws --test ws_tdd`
+- `cargo test --test deferred_items_tdd`
+- `cargo test --features uring-native --test deferred_items_tdd`
+- `cargo test --test companion_ops_tdd`
+
+## Update: Remaining work breakdown after N1-N8 (2026-03-01)
+
+This captures the concrete work still required for current "not done yet"
+items after completing native QUIC skeleton milestones N1-N8.
+
+### R1: QUIC native data-path cutover (bridge replacement)
+
+Scope:
+
+- route `QuicEndpoint::{connect, connect_with, accept, wait_idle}` and
+  `QuicConnection` operations through `NativeProtoDriver` instead of
+  `spawn_on_bridge_runtime`.
+- keep bridge path only as explicit compatibility fallback.
+
+Red tests first:
+
+- assert public `QuicEndpoint` operations do not require Tokio bridge runtime.
+- assert API behavior parity versus current bridge-path semantics.
+
+Green acceptance:
+
+- default QUIC path is native-driver-backed.
+- bridge path is opt-in and clearly documented.
+
+### R2: Real protocol progression over native loop (beyond skeleton semantics)
+
+Scope:
+
+- replace placeholder stream/datagram progression logic with true
+  `quinn-proto` connection/event handling and transmit scheduling.
+- map connection lifecycle and stream transitions to protocol-driven state.
+
+Red tests first:
+
+- protocol-level stream open/accept/finish/reset behavior fails under skeleton.
+- datagram and close semantics fail under protocol-correct expectations.
+
+Green acceptance:
+
+- protocol-driven tests pass with deterministic behavior under concurrency.
+
+### R3: Native QUIC interop matrix
+
+Scope:
+
+- add interop suite: native Spargio QUIC endpoint vs quinn peer.
+- add at least one non-quinn peer lane where practical.
+
+Red tests first:
+
+- handshake/data exchange against peer(s) fails before interop wiring.
+
+Green acceptance:
+
+- CI interop lane passes for all selected peers and profiles.
+
+### R4: Long-window soak + fault qualification
+
+Scope:
+
+- extend current fault hooks into soak lanes (loss/reorder/drop over duration).
+- add connection churn and memory-growth assertions.
+
+Red tests first:
+
+- soak/fault lanes expose regressions in retries or queue growth.
+
+Green acceptance:
+
+- no unbounded queue/memory growth in long-window runs.
+- fault scenarios meet defined success/error-rate thresholds.
+
+### R5: Performance gate integration for rollout
+
+Scope:
+
+- integrate `NativeProtoPerfGate` into repeatable benchmark guardrail workflow.
+- produce native-vs-bridge verdicts for p95/p99 and throughput.
+
+Red tests first:
+
+- guardrail fails when synthetic/fixture regressions exceed thresholds.
+
+Green acceptance:
+
+- documented threshold policy and passing perf-gate lane in CI tooling.
+
+### R6: README/status sync for new QUIC reality
+
+Scope:
+
+- update `README.md` done/not-done to reflect native-driver milestones N1-N8.
+- explicitly separate "native skeleton done" vs "full default cutover pending".
+
+Red tests first:
+
+- docs/status tests fail when README stale relative to implementation log.
+
+Green acceptance:
+
+- README done/not-done sections accurately mirror implementation state.
+
+### R7: Companion hardening beyond smoke lanes (repo-wide)
+
+Scope:
+
+- deepen failure-injection/soak coverage across companion protocol crates.
+- add broader p95/p99 operational gates where meaningful.
+
+Red tests first:
+
+- dedicated hardening tests expose missing coverage and drift.
+
+Green acceptance:
+
+- companion CI includes deeper operational coverage, not smoke only.
+
+### R8: DNS and fs deferred items (repo-wide)
+
+Scope:
+
+- evaluate nonblocking DNS strategies for `ToSocketAddrs` paths or keep explicit
+  `SocketAddr` requirement with stronger docs/contracts.
+- decide and implement remaining deferred fs helper migration cases where
+  value/complexity tradeoff is justified.
+
+Red tests first:
+
+- DNS-path behavior and deferred fs helper behavior encoded in explicit tests.
+
+Green acceptance:
+
+- each deferred item either implemented with tests or explicitly documented as
+  intentionally deferred with rationale.
+
+### R9: Scheduler/docs maturity (repo-wide)
+
+Scope:
+
+- advance work-stealing policy tuning beyond MVP heuristics.
+- expand mdBook operations/placement/API-selection guidance to current depth.
+
+Red tests first:
+
+- scheduler tuning guardrails and docs-link/coverage tests for new chapters.
+
+Green acceptance:
+
+- measurable scheduler improvements in targeted workloads.
+- book coverage aligned with current feature set and operational guidance.
+
+### Suggested execution order from here
+
+1. R1 native cutover.
+2. R2 protocol-correct progression.
+3. R3 interop matrix.
+4. R4 soak/fault qualification.
+5. R5 perf-gate integration.
+6. R6 README/status sync.
+7. R7 companion hardening.
+8. R8 DNS/fs deferred decisions.
+9. R9 scheduler/docs maturity.
+
 ## Update: Phase N8 implemented (fault injection + rollout/perf gates) with Red/Green TDD (2026-03-01)
 
 Implemented N8 qualification primitives: deterministic fault injection controls,
@@ -6491,4 +7069,51 @@ Cargo updates:
 Executed and passing:
 
 - `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
+## Update: R2 continuation (proto-backed command semantics for connected handles) with Red/Green TDD (2026-03-01)
+
+Implemented a follow-up R2 slice that routes `connect_for_test`-backed
+stream/datagram commands through real `quinn-proto::Connection` APIs instead
+of only synthetic queue behavior.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_connect_for_test_open_uni_respects_proto_stream_credit`
+- `native_proto_driver_connect_for_test_open_bi_respects_proto_stream_credit`
+
+Red expectation:
+
+- with synthetic fallback still active for connected handles, `open_uni`/`open_bi`
+  incorrectly succeeded even when protocol stream credit had not been granted.
+
+### Green phase
+
+Updated owner-loop command handlers in `crates/spargio-quic/src/lib.rs`:
+
+- proto-connected path (`connection_id -> ConnectionHandle`) now uses
+  `quinn_proto::Connection` operations for:
+  - `open_uni_on_connection` / `open_bi_on_connection`
+  - `accept_uni_on_connection` / `accept_bi_on_connection`
+  - `send_datagram_on_connection_for_test` / `recv_datagram_on_connection_for_test`
+  - `finish_stream` / `reset_stream`
+- added conversion/error helpers:
+  - `proto_stream_id_from_u64(...)`
+  - `proto_send_datagram_error_to_io(...)`
+  - `proto_finish_error_to_io(...)`
+- after mutating proto-backed stream/datagram state, the loop now drives
+  `drive_native_proto_connections(...)` to flush resulting endpoint/transmit work.
+- synthetic fallback behavior remains for explicitly synthetic test connections
+  created by `register_connection_for_test`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_connect_for_test_open_`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
