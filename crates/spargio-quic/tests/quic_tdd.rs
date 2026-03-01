@@ -1,8 +1,8 @@
 use futures::executor::block_on;
 use futures::channel::oneshot;
 use spargio_quic::{
-    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoTransmit, QuicBridge, QuicEndpoint,
-    QuicEndpointOptions, QuicMetricsSnapshot, QuicOptions,
+    NativeProtoDriver, NativeProtoDriverOptions, NativeProtoTransportTuning, NativeProtoTransmit,
+    QuicBridge, QuicEndpoint, QuicEndpointOptions, QuicMetricsSnapshot, QuicOptions,
 };
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -555,6 +555,55 @@ fn native_proto_driver_send_handle_respects_shutdown() {
             .await
             .expect_err("probe should fail after shutdown");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    });
+}
+
+#[test]
+fn native_proto_driver_transport_tuning_roundtrip() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let tuning = NativeProtoTransportTuning::default()
+            .with_max_datagram_size(48)
+            .with_send_window(128 * 1024)
+            .with_receive_window(64 * 1024)
+            .with_keep_alive_interval(Some(Duration::from_millis(250)))
+            .with_mtu_discovery_enabled(false);
+        driver
+            .set_transport_tuning(tuning)
+            .await
+            .expect("set tuning");
+        let got = driver.transport_tuning().await.expect("get tuning");
+        assert_eq!(got, tuning);
+    });
+}
+
+#[test]
+fn native_proto_driver_rejects_oversized_datagram_per_tuning() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        driver
+            .set_transport_tuning(NativeProtoTransportTuning::default().with_max_datagram_size(16))
+            .await
+            .expect("set tuning");
+        let err = driver
+            .submit_datagram(localhost_addr(5556), vec![1u8; 64])
+            .await
+            .expect_err("oversized datagram should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     });
 }
 

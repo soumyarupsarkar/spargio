@@ -5920,6 +5920,57 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N5 implemented (datagram limits + transport tuning surface) with Red/Green TDD (2026-03-01)
+
+Implemented datagram-size enforcement and transport tuning roundtrip APIs on
+the native driver surface.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_transport_tuning_roundtrip`
+- `native_proto_driver_rejects_oversized_datagram_per_tuning`
+
+Expected red failures:
+
+- missing transport tuning type and setter/getter APIs
+- no max-datagram-size enforcement in datagram ingest path
+
+### Green phase
+
+Added tuning type:
+
+- `NativeProtoTransportTuning`
+  - `max_datagram_size`
+  - `send_window`
+  - `receive_window`
+  - `keep_alive_interval`
+  - `mtu_discovery_enabled`
+  - builder-style `with_*` methods
+
+Added native driver methods:
+
+- `set_transport_tuning(...).await`
+- `transport_tuning().await`
+
+Owner-loop behavior:
+
+- tracks active tuning config.
+- validates `max_datagram_size > 0` on update.
+- `submit_datagram` rejects oversized payloads with `InvalidInput`.
+
+Wrapper parity:
+
+- local/send native wrappers delegate tuning setter/getter as well.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N6 implemented (native local/send ergonomics mapping) with Red/Green TDD (2026-03-01)
 
 Implemented `!Send` local and explicit send-handoff wrappers for the native

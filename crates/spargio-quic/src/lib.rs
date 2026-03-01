@@ -182,6 +182,54 @@ pub struct NativeProtoStreamState {
     pub reset: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NativeProtoTransportTuning {
+    pub max_datagram_size: usize,
+    pub send_window: u64,
+    pub receive_window: u64,
+    pub keep_alive_interval: Option<Duration>,
+    pub mtu_discovery_enabled: bool,
+}
+
+impl Default for NativeProtoTransportTuning {
+    fn default() -> Self {
+        Self {
+            max_datagram_size: 1200,
+            send_window: 1024 * 1024,
+            receive_window: 1024 * 1024,
+            keep_alive_interval: None,
+            mtu_discovery_enabled: true,
+        }
+    }
+}
+
+impl NativeProtoTransportTuning {
+    pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
+        self.max_datagram_size = max_datagram_size;
+        self
+    }
+
+    pub fn with_send_window(mut self, send_window: u64) -> Self {
+        self.send_window = send_window;
+        self
+    }
+
+    pub fn with_receive_window(mut self, receive_window: u64) -> Self {
+        self.receive_window = receive_window;
+        self
+    }
+
+    pub fn with_keep_alive_interval(mut self, keep_alive_interval: Option<Duration>) -> Self {
+        self.keep_alive_interval = keep_alive_interval;
+        self
+    }
+
+    pub fn with_mtu_discovery_enabled(mut self, mtu_discovery_enabled: bool) -> Self {
+        self.mtu_discovery_enabled = mtu_discovery_enabled;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct NativeProtoDriver {
     endpoint_id: u64,
@@ -347,6 +395,28 @@ impl NativeProtoDriver {
     pub async fn timer_state(&self) -> io::Result<NativeProtoTimerState> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::TimerState { reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn set_transport_tuning(
+        &self,
+        tuning: NativeProtoTransportTuning,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::SetTransportTuning {
+            tuning,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::TransportTuning { reply: reply_tx })?;
         reply_rx
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
@@ -532,6 +602,17 @@ impl NativeProtoDriverSend {
     ) -> io::Result<NativeProtoStreamState> {
         self.inner.stream_state(connection_id, stream_id).await
     }
+
+    pub async fn set_transport_tuning(
+        &self,
+        tuning: NativeProtoTransportTuning,
+    ) -> io::Result<()> {
+        self.inner.set_transport_tuning(tuning).await
+    }
+
+    pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
+        self.inner.transport_tuning().await
+    }
 }
 
 #[derive(Clone)]
@@ -603,6 +684,17 @@ impl NativeProtoDriverLocal {
     ) -> io::Result<NativeProtoStreamState> {
         self.inner.stream_state(connection_id, stream_id).await
     }
+
+    pub async fn set_transport_tuning(
+        &self,
+        tuning: NativeProtoTransportTuning,
+    ) -> io::Result<()> {
+        self.inner.set_transport_tuning(tuning).await
+    }
+
+    pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
+        self.inner.transport_tuning().await
+    }
 }
 
 enum NativeProtoCommand {
@@ -673,6 +765,13 @@ enum NativeProtoCommand {
         stream_id: u64,
         reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoStreamState>>,
     },
+    SetTransportTuning {
+        tuning: NativeProtoTransportTuning,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    TransportTuning {
+        reply: tokio::sync::oneshot::Sender<NativeProtoTransportTuning>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -711,6 +810,7 @@ async fn native_proto_driver_loop(
     let mut timeout_fires = 0u64;
     let mut last_fired_generation = None;
     let mut connections: HashMap<u64, NativeProtoConnectionPump> = HashMap::new();
+    let mut tuning = NativeProtoTransportTuning::default();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -742,6 +842,17 @@ async fn native_proto_driver_loop(
             } => {
                 commands_processed = commands_processed.saturating_add(1);
                 let mut generated_transmits = 0usize;
+                if payload.len() > tuning.max_datagram_size {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "datagram size {} exceeds max_datagram_size {}",
+                            payload.len(),
+                            tuning.max_datagram_size
+                        ),
+                    )));
+                    continue;
+                }
                 let event = endpoint.handle(
                     std::time::Instant::now(),
                     remote,
@@ -995,6 +1106,26 @@ async fn native_proto_driver_loop(
                     ))
                 };
                 let _ = reply.send(result);
+            }
+            NativeProtoCommand::SetTransportTuning {
+                tuning: next_tuning,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if next_tuning.max_datagram_size == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "max_datagram_size must be > 0",
+                    ))
+                } else {
+                    tuning = next_tuning;
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::TransportTuning { reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let _ = reply.send(tuning);
             }
             NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());
