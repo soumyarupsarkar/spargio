@@ -168,6 +168,14 @@ pub struct NativeProtoIngressReport {
     pub queued_transmits: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NativeProtoTimerState {
+    pub now: Duration,
+    pub next_deadline: Option<Duration>,
+    pub timeout_fires: u64,
+    pub last_fired_generation: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct NativeProtoDriver {
     endpoint_id: u64,
@@ -296,6 +304,36 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    pub async fn schedule_timeout(&self, after: Duration) -> io::Result<u64> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::ScheduleTimeout {
+            after,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn advance_clock_for_test(&self, by: Duration) -> io::Result<NativeProtoTimerState> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::AdvanceClockForTest {
+            by,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
+    pub async fn timer_state(&self) -> io::Result<NativeProtoTimerState> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::TimerState { reply: reply_tx })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
+    }
+
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -346,6 +384,17 @@ enum NativeProtoCommand {
         transmit: NativeProtoTransmit,
         reply: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    ScheduleTimeout {
+        after: Duration,
+        reply: tokio::sync::oneshot::Sender<u64>,
+    },
+    AdvanceClockForTest {
+        by: Duration,
+        reply: tokio::sync::oneshot::Sender<NativeProtoTimerState>,
+    },
+    TimerState {
+        reply: tokio::sync::oneshot::Sender<NativeProtoTimerState>,
+    },
     Shutdown {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -371,6 +420,11 @@ async fn native_proto_driver_loop(
     let mut commands_processed = 0u64;
     let mut next_connection_id = 1u64;
     let mut next_stream_id = 1u64;
+    let mut now = Duration::ZERO;
+    let mut next_deadline: Option<(Duration, u64)> = None;
+    let mut next_timer_generation = 1u64;
+    let mut timeout_fires = 0u64;
+    let mut last_fired_generation = None;
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -468,6 +522,40 @@ async fn native_proto_driver_loop(
                     Ok(())
                 };
                 let _ = reply.send(result);
+            }
+            NativeProtoCommand::ScheduleTimeout { after, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let generation = next_timer_generation;
+                next_timer_generation = next_timer_generation.saturating_add(1);
+                let deadline = now.saturating_add(after);
+                next_deadline = Some((deadline, generation));
+                let _ = reply.send(generation);
+            }
+            NativeProtoCommand::AdvanceClockForTest { by, reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                now = now.saturating_add(by);
+                if let Some((deadline, generation)) = next_deadline {
+                    if now >= deadline {
+                        timeout_fires = timeout_fires.saturating_add(1);
+                        last_fired_generation = Some(generation);
+                        next_deadline = None;
+                    }
+                }
+                let _ = reply.send(NativeProtoTimerState {
+                    now,
+                    next_deadline: next_deadline.map(|(deadline, _)| deadline),
+                    timeout_fires,
+                    last_fired_generation,
+                });
+            }
+            NativeProtoCommand::TimerState { reply } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let _ = reply.send(NativeProtoTimerState {
+                    now,
+                    next_deadline: next_deadline.map(|(deadline, _)| deadline),
+                    timeout_fires,
+                    last_fired_generation,
+                });
             }
             NativeProtoCommand::Shutdown { reply } => {
                 let _ = reply.send(());

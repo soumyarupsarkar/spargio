@@ -5920,6 +5920,49 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic`
 
+## Update: Phase N3 implemented (timer/wake progression skeleton) with Red/Green TDD (2026-03-01)
+
+Implemented deterministic timer progression primitives in the native driver
+loop to support deadline scheduling and stale-deadline supersession semantics.
+
+### Red phase
+
+Added failing tests in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_timers_fire_when_deadline_passes`
+- `native_proto_driver_newer_deadline_supersedes_older`
+
+Expected red failures:
+
+- missing timeout scheduling/clock-advance APIs
+- missing timeout fire accounting and generation tracking
+
+### Green phase
+
+Extended native driver with timer-state APIs:
+
+- new type:
+  - `NativeProtoTimerState`
+- new methods:
+  - `schedule_timeout(after).await -> generation`
+  - `advance_clock_for_test(by).await -> NativeProtoTimerState`
+  - `timer_state().await -> NativeProtoTimerState`
+
+Owner-loop behavior:
+
+- maintains synthetic monotonic `now`.
+- tracks single active deadline with generation ID.
+- newer deadline supersedes older deadline.
+- timeout fires increment counter and record last fired generation.
+- deadline state is queryable after each progression step.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic`
+
 ## Update: Phase N2 implemented (native UDP ingress/egress skeleton) with Red/Green TDD (2026-03-01)
 
 Implemented bounded UDP ingress/egress command plumbing in the native driver

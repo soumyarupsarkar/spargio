@@ -367,6 +367,75 @@ fn native_proto_driver_drain_is_fifo_and_batch_limited() {
     });
 }
 
+#[test]
+fn native_proto_driver_timers_fire_when_deadline_passes() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let generation = driver
+            .schedule_timeout(Duration::from_millis(50))
+            .await
+            .expect("schedule");
+        assert!(generation > 0);
+
+        let state_before = driver
+            .advance_clock_for_test(Duration::from_millis(20))
+            .await
+            .expect("advance clock");
+        assert_eq!(state_before.timeout_fires, 0);
+        assert!(state_before.next_deadline.is_some());
+
+        let state_after = driver
+            .advance_clock_for_test(Duration::from_millis(40))
+            .await
+            .expect("advance clock");
+        assert_eq!(state_after.timeout_fires, 1);
+        assert!(state_after.next_deadline.is_none());
+    });
+}
+
+#[test]
+fn native_proto_driver_newer_deadline_supersedes_older() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let first = driver
+            .schedule_timeout(Duration::from_millis(100))
+            .await
+            .expect("first deadline");
+        let second = driver
+            .schedule_timeout(Duration::from_millis(10))
+            .await
+            .expect("second deadline");
+        assert!(second > first);
+
+        let state = driver
+            .advance_clock_for_test(Duration::from_millis(20))
+            .await
+            .expect("advance");
+        assert_eq!(state.timeout_fires, 1);
+        assert_eq!(state.last_fired_generation, Some(second));
+
+        let later = driver
+            .advance_clock_for_test(Duration::from_millis(200))
+            .await
+            .expect("advance");
+        assert_eq!(later.timeout_fires, 1);
+    });
+}
+
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
