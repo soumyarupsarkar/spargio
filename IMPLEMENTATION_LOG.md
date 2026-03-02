@@ -7331,3 +7331,41 @@ Executed and passing:
 - `cargo test -p spargio-quic --test native_cutover_tdd`
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
+
+## Update: R2 continuation (closed-connection stats accounting) with Red/Green TDD (2026-03-02)
+
+Implemented another native-proto observability slice so connection-close
+transitions are tracked in stats alongside lifecycle events.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_close_transitions_increment_closed_stats`
+
+Initial red behavior:
+
+- `NativeProtoStats` exposed no close counter, so close transitions were not
+  measurable through stats snapshots.
+
+### Green phase
+
+Updated `crates/spargio-quic/src/lib.rs`:
+
+- extended `NativeProtoStats` with:
+  - `connections_closed: u64`
+- incremented `connections_closed` on first transition to closed in both paths:
+  - explicit command close (`CloseConnectionForTest`)
+  - protocol-driven peer close (`Event::ConnectionLost`)
+- preserved saturation semantics (`saturating_add`) and no double-counting on
+  repeated close attempts.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_close_transitions_increment_closed_stats -- --exact`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic`

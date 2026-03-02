@@ -276,6 +276,7 @@ impl NativeProtoTransportTuning {
 pub struct NativeProtoStats {
     pub operations_total: u64,
     pub connections_registered: u64,
+    pub connections_closed: u64,
     pub streams_opened_uni: u64,
     pub streams_opened_bi: u64,
     pub datagrams_ingested: u64,
@@ -1651,6 +1652,7 @@ async fn native_proto_driver_loop(
                     ))
                 };
                 if emit_connection_closed {
+                    stats.connections_closed = stats.connections_closed.saturating_add(1);
                     push_native_event(
                         &mut events,
                         NativeProtoEvent::ConnectionClosed { connection_id },
@@ -2434,6 +2436,7 @@ fn drive_native_proto_connections(
                             connection.pending_datagrams.clear();
                         }
                         if emit_connection_closed {
+                            stats.connections_closed = stats.connections_closed.saturating_add(1);
                             push_native_event(
                                 events,
                                 NativeProtoEvent::ConnectionClosed { connection_id },
