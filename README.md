@@ -134,16 +134,20 @@ For performance, different workload shapes favor different runtimes.
 - Explicit socket-address APIs that bypass DNS resolution: `connect_socket_addr*` and `bind_socket_addr`.
 - Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
 - Mixed-runtime boundary API: `spargio::boundary`.
-- Companion crate suite: `spargio-process`, `spargio-signal`, `spargio-protocols` (legacy blocking bridge helpers), `spargio-tls` (rustls/futures-rustls adapter), `spargio-ws` (async-tungstenite adapter), and `spargio-quic` (quinn bridge).
+- Companion crate suite: `spargio-process`, `spargio-signal`, `spargio-protocols` (legacy blocking bridge helpers), `spargio-tls` (rustls/futures-rustls adapter), `spargio-ws` (async-tungstenite adapter), and `spargio-quic` with selectable backend mode (`QuicBackend::Native` default dispatch and explicit `QuicBackend::Bridge` compatibility fallback).
+- Native-vs-bridge QUIC cutover guardrails: native data path is validated to avoid bridge task spawning, while bridge mode remains explicit compatibility fallback.
+- QUIC native default backend now runs on `quinn-proto` driver path (`NativeProtoDriver` + native UDP pump/timers) with stream/datagram operations routed through the driver; bridge mode remains explicit compatibility fallback.
 - Companion hardening lane: `scripts/companion_ci_smoke.sh` plus CI `companion-matrix` job.
+- QUIC qualification lanes: interop matrix (`scripts/quic_interop_matrix.sh`), soak/fault lane (`scripts/quic_soak_fault.sh`, nightly), and native-vs-bridge perf gate (`scripts/quic_perf_gate.sh`).
 - In-repo long-form docs scaffold: `book/` (`mdBook`) with protocol/API-selection and migration chapters.
 - Reference mixed-mode service example.
 
 ## What's Not Done Yet
 
-- Full production-grade higher-level ecosystem parity is still in progress; companion crates now provide practical bridges, but deeper protocol-specific maturity remains (broader TLS/WS/QUIC tuning surfaces, richer process stdio orchestration, and stronger long-window soak/failure coverage).
+- Full production-grade higher-level ecosystem parity is still in progress; companion crates now provide practical bridges and qualification lanes, but deeper protocol-specific maturity remains (broader TLS/WS tuning surfaces, richer process stdio orchestration, and deeper long-window failure coverage).
+- QUIC backend hardening is still in progress: native default path is driver-backed now, but long-window soak/fault/perf requalification depth and rollout maturity (`rollout_stage`) still need production validation.
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
-- Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `create_dir_all`, `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`metadata_lite` exists as native-first alternative).
+- Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
 - Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
 - Advanced work-stealing policy tuning beyond current MVP heuristics.
 - Expand `book/` coverage into deeper API-selection, placement, and operations guides.
@@ -166,6 +170,9 @@ Benchmark helpers:
 ./scripts/bench_fanout_guardrail.sh
 ./scripts/bench_kpi_guardrail.sh
 ./scripts/companion_ci_smoke.sh
+./scripts/quic_interop_matrix.sh
+./scripts/quic_perf_gate.sh
+./scripts/quic_soak_fault.sh
 ```
 
 Reference app:

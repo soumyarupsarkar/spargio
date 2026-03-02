@@ -7615,3 +7615,42 @@ Interop + cutover tests now pass with native default path using driver-backed ba
 
 - `interop_tdd` (raw quinn <-> spargio)
 - `native_cutover_tdd`
+
+## Update: Agent C+D+E follow-through (lifecycle parity, qualification re-check, docs sync) (2026-03-02)
+
+Completed the remaining parallel-plan slices after native cutover.
+
+### Lifecycle/metrics parity checks (Agent C)
+
+Validated native cutover behavior against existing parity tests:
+
+- native/bridge dispatch counters and lifecycle assertions in `native_cutover_tdd`
+- connection op dispatch metrics in `quic_tdd`
+- close/closed/wait-idle behavior under native default path
+
+No additional metric-shape changes were required beyond the native-driver routing.
+
+### Qualification re-check (Agent D)
+
+Re-ran QUIC qualification-oriented suites on the cutover implementation:
+
+- `interop_tdd` (raw quinn interop both directions)
+- `native_cutover_tdd`
+- `quic_tdd`
+- `soak_tdd` lane remains intentionally ignored in regular runs (nightly lane)
+
+All executed suites passed.
+
+### Docs/status sync (Agent E)
+
+Updated project status to reflect completed native cutover and revised not-done scope:
+
+- `README.md`
+  - added explicit done statement for driver-backed native QUIC path
+  - replaced old “full native cutover not finished yet” note with remaining rollout/hardening work
+- `tests/docs_tdd.rs`
+  - updated docs assertion to track new README status wording
+
+Validation:
+
+- `cargo test --test docs_tdd` passes with updated status expectations.
