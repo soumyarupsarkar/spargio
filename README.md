@@ -4,7 +4,9 @@
 
 Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across threads (a novel form of work-stealing).
 
-In our benchmarks (detailed below), `spargio` outperforms `compio` (and likely all other share-nothing runtimes) in imbalanced or coordination-heavy workloads by up to 80%, and outperforms `tokio` for cases involving high coordination or disk I/O by up to 280%. `compio` leads for sustained, balanced workloads by up to 40%.
+In our benchmarks (detailed below), `spargio` outperforms `compio` (and likely all share-nothing runtimes) in imbalanced or coordination-heavy workloads by up to 80%, and outperforms `tokio` for cases involving high coordination or disk I/O by up to 280%. `compio` leads for sustained, balanced workloads by up to 40%.
+
+Out-of-the-box, we support async disk I/O, network I/O (including TLS/WebSockets/QUIC), process execution, and signal handling, and provide an extension API for additional `io_uring` operations. We support both `tokio`-style stealable tasks and `compio`-style pinned (thread-affine) tasks.
 
 ## Disclaimer
 
