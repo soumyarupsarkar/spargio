@@ -7211,3 +7211,42 @@ Executed and passing:
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
 - `cargo test --test docs_tdd`
+
+## Update: R2 continuation (post-handshake stream open/accept contract) with Red/Green TDD (2026-03-01)
+
+Added executable contract coverage for a protocol-correct post-handshake stream
+path across two native drivers.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_post_handshake_bi_stream_open_is_accepted_by_server`
+
+Initial red behavior:
+
+- server-side accept immediately after client `open_bi` failed with
+  `WouldBlock` because no peer-visible stream signal had been transmitted yet.
+
+### Green phase
+
+Adjusted the test flow to align with protocol semantics:
+
+- after client `open_bi`, call `finish_stream` to emit stream signaling.
+- exchange transmit payloads between client/server drivers.
+- assert server `accept_bi_on_connection(...)` observes the opened stream.
+
+Also factored reusable driver-exchange helper in test module:
+
+- `exchange_driver_transmits(...)`
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_post_handshake_bi_stream_open_is_accepted_by_server`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic`
+- `cargo test --test docs_tdd`

@@ -938,6 +938,60 @@ fn native_proto_driver_server_config_accepts_client_transmits() {
 }
 
 #[test]
+fn native_proto_driver_post_handshake_bi_stream_open_is_accepted_by_server() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5660);
+        let client_addr = localhost_addr(5661);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+        let server_conn = server
+            .drain_events(64)
+            .await
+            .expect("server events")
+            .into_iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        let opened = client
+            .open_bi_on_connection(client_conn)
+            .await
+            .expect("client open bi after handshake");
+        client
+            .finish_stream(client_conn, opened.0)
+            .await
+            .expect("client finish opened stream");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+        let accepted = server
+            .accept_bi_on_connection(server_conn)
+            .await
+            .expect("server accept bi");
+        assert_eq!(accepted, opened);
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)
@@ -1247,6 +1301,42 @@ fn native_proto_rollout_stage_is_experimental_for_now() {
 
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+async fn exchange_driver_transmits(
+    client: &NativeProtoDriver,
+    client_addr: SocketAddr,
+    server: &NativeProtoDriver,
+    server_addr: SocketAddr,
+    rounds: usize,
+) {
+    for _ in 0..rounds {
+        let mut progressed = false;
+
+        let client_tx = client.drain_transmits(64).await.expect("drain client");
+        for tx in client_tx {
+            progressed = true;
+            assert_eq!(tx.destination, server_addr);
+            let _ = server
+                .submit_datagram(client_addr, tx.payload)
+                .await
+                .expect("deliver client->server");
+        }
+
+        let server_tx = server.drain_transmits(64).await.expect("drain server");
+        for tx in server_tx {
+            progressed = true;
+            assert_eq!(tx.destination, client_addr);
+            let _ = client
+                .submit_datagram(server_addr, tx.payload)
+                .await
+                .expect("deliver server->client");
+        }
+
+        if !progressed {
+            break;
+        }
+    }
 }
 
 fn test_server_and_client_configs() -> (
