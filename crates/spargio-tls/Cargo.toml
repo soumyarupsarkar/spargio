@@ -1,6 +1,6 @@
 [package]
 name = "spargio-tls"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "TLS companion crate for spargio (rustls/futures-rustls bridge)"
@@ -9,8 +9,8 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 [dependencies]
 futures-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
-spargio = { version = "0.3.0", path = "../..", features = ["uring-native"] }
-spargio-protocols = { version = "0.3.0", path = "../spargio-protocols", features = ["uring-native"] }
+spargio = { version = "0.4.0", path = "../..", features = ["uring-native"] }
+spargio-protocols = { version = "0.4.0", path = "../spargio-protocols", features = ["uring-native"] }
 
 [dev-dependencies]
 futures = "0.3"
