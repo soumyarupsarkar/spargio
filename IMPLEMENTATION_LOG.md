@@ -7395,3 +7395,223 @@ Executed and passing:
 
 - `cargo test -p spargio-quic --test quic_tdd native_proto_driver_post_handshake_datagram_roundtrip_tracks_state -- --exact`
 - `cargo test -p spargio-quic --test quic_tdd`
+
+## Update: Full QUIC native cutover execution plan (multi-agent parallel breakdown) (2026-03-02)
+
+Captured an explicit agent-by-agent plan for finishing full native QUIC
+integration (`QuicEndpoint`/`QuicConnection` on `NativeProtoDriver`, bridge as
+explicit fallback only).
+
+### Agent A (critical path): public native-path cutover spine
+
+Scope:
+
+- replace `QuicEndpoint` native backend internals so
+  `connect`/`connect_with`/`accept`/`wait_idle` route through
+  `NativeProtoDriver` instead of `NativeEndpointDispatch`.
+- rewire `QuicConnection` native backend internals so
+  `closed`/`open_uni`/`open_bi`/`accept_uni`/`accept_bi`/datagram ops route
+  through `NativeProtoDriver` commands.
+- preserve current timeout, backpressure, and error-shape contracts.
+
+Red/green slices:
+
+1. endpoint op dispatch red tests against bridge-runtime counters.
+2. connection op dispatch red tests against bridge-runtime counters.
+3. green implementation for endpoint + connection command routing.
+
+Primary files:
+
+- `crates/spargio-quic/src/lib.rs`
+- `crates/spargio-quic/tests/native_cutover_tdd.rs`
+- `crates/spargio-quic/tests/quic_tdd.rs`
+
+Dependencies:
+
+- none (first mover).
+
+### Agent B: stream abstraction and API-coupling migration
+
+Scope:
+
+- remove hard native-path reliance on concrete `quinn` stream types for public
+  operations while preserving ergonomic API shape.
+- implement a stable stream wrapper strategy compatible with driver-owned stream
+  IDs and command-based progression.
+- keep `LocalQuicConnection`/`QuicSendConnection` behavior equivalent.
+
+Red/green slices:
+
+1. red tests for stream open/accept/read/write/finish/reset parity under native
+   backend without direct Tokio actor usage.
+2. green wrapper + plumbing implementation.
+
+Primary files:
+
+- `crates/spargio-quic/src/lib.rs`
+- `crates/spargio-quic/tests/quic_tdd.rs`
+
+Dependencies:
+
+- starts after Agent A selects/lands endpoint/connection command contracts.
+
+### Agent C: lifecycle, metrics, and close-state parity hardening
+
+Scope:
+
+- ensure native cutover preserves lifecycle semantics (`close`, `closed`,
+  `wait_idle`, remote-loss propagation).
+- ensure metric counters and event emission remain parity-correct
+  (connect/accept/streams/datagrams/timeouts/close transitions).
+
+Red/green slices:
+
+1. red parity tests for close/idle and metric snapshots.
+2. green implementation updates for metric increments and event mapping.
+
+Primary files:
+
+- `crates/spargio-quic/src/lib.rs`
+- `crates/spargio-quic/tests/quic_tdd.rs`
+
+Dependencies:
+
+- can start test authoring in parallel; final green depends on Agent A changes.
+
+### Agent D: interop + soak + perf gate re-qualification
+
+Scope:
+
+- re-run and adjust interop matrix against native-default public path.
+- expand soak/fault assertions for native cutover regressions.
+- validate and refresh perf-gate fixtures/threshold notes only where
+  materially justified.
+
+Red/green slices:
+
+1. red on interop/soak/perf scripts when cutover shifts behavior.
+2. green script/test/fixture updates with documented rationale.
+
+Primary files:
+
+- `crates/spargio-quic/tests/interop_tdd.rs`
+- `crates/spargio-quic/tests/soak_tdd.rs`
+- `scripts/quic_interop_matrix.sh`
+- `scripts/quic_soak_fault.sh`
+- `scripts/quic_perf_gate.sh`
+- `tests/quic_perf_guardrail_tdd.rs`
+
+Dependencies:
+
+- runs after Agent A/B/C stabilization.
+
+### Agent E: docs and rollout-status sync
+
+Scope:
+
+- update README done/not-done QUIC language to reflect full native cutover.
+- sync implementation log summary and operations notes.
+- ensure docs tests for status consistency remain green.
+
+Red/green slices:
+
+1. docs status tests red for stale statements.
+2. green README/book/log updates.
+
+Primary files:
+
+- `README.md`
+- `IMPLEMENTATION_LOG.md`
+- `tests/docs_tdd.rs`
+- `book/src/*` (if needed)
+
+Dependencies:
+
+- runs after Agent A-D conclusions.
+
+### Parallel execution graph
+
+- lane 1 (critical): Agent A.
+- lane 2 (prep parallel): Agent C test authoring.
+- lane 3 (prep parallel): Agent B design + test scaffolding.
+- lane 4 (post-cutover): Agent B implementation + Agent C green fixes.
+- lane 5 (qualification): Agent D.
+- lane 6 (final sync): Agent E.
+
+### Merge order recommendation
+
+1. Agent A foundational cutover PR.
+2. Agent B stream/wrapper parity PR.
+3. Agent C lifecycle/metrics parity PR.
+4. Agent D qualification/perf PR.
+5. Agent E docs/status PR.
+
+### Exit criteria for "full QUIC native integration"
+
+- native backend public API path no longer depends on Tokio bridge runtime
+  constructs for endpoint/connection operations.
+- bridge backend remains explicit compatibility fallback only.
+- interop, soak, and perf gates pass with updated baselines and rationale.
+- README and docs no longer list QUIC native cutover as in-progress.
+
+## Update: Agent A+B milestone (public native-path cutover to NativeProtoDriver + stream wrappers) with Red/Green TDD (2026-03-02)
+
+Implemented the critical cutover slice so default native `QuicEndpoint`/`QuicConnection`
+operations route through `NativeProtoDriver` (with UDP ingress/egress/timer pump), while
+bridge backend remains explicit fallback. Added stream wrapper types so the public API keeps
+`write_all` / `read_to_end` / `finish` ergonomics without exposing Tokio-bound internals.
+
+### Red phase
+
+Added failing coverage in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_connected_event_marks_connection_established`
+- `native_proto_driver_stream_write_read_roundtrip_over_proto_connection`
+
+Initial red surfaced missing native-proto capabilities:
+
+- no connection-established signal/state for handshake completion gating
+- no stream payload write/read command surface on driver-backed connections
+
+### Green phase
+
+Updated `crates/spargio-quic/src/lib.rs`:
+
+- `NativeProtoConnectionState` now tracks `established`.
+- `NativeProtoEvent` now includes `ConnectionEstablished`.
+- `drive_native_proto_connections(...)` now maps `quinn_proto::Event::Connected` into
+  state/event transitions.
+- added native stream payload command surface:
+  - `WriteStreamOnConnection`
+  - `ReadStreamOnConnection`
+  - public driver helpers:
+    - `write_stream_on_connection(...)`
+    - `read_stream_on_connection(...)`
+- added no-wait driver helpers used by sync API points (`finish/reset/close/send_datagram`) to
+  avoid nested executor re-entry.
+- introduced `NativeProtoEndpointBackend`:
+  - owns per-endpoint spargio runtime + native driver + UDP socket
+  - runs ingress/egress/timer pump tasks
+  - tracks accept queue / known connection IDs
+  - provides handshake/idle/closed wait helpers with timeout semantics
+- native `QuicEndpoint::server/client` constructors now initialize `NativeProtoEndpointBackend`
+  and route native operations through driver-backed flow.
+- native `QuicConnection` now supports driver-backed mode via `NativeProtoConnectionHandle`.
+- introduced stream wrappers:
+  - `QuicSendStream`
+  - `QuicRecvStream`
+- updated connection APIs to return wrappers (bridge and native) while preserving ergonomic calls
+  used by tests (`write_all`, `read_to_end`, `finish`).
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --tests`
+- `cargo test --test docs_tdd`
+
+Interop + cutover tests now pass with native default path using driver-backed backend:
+
+- `interop_tdd` (raw quinn <-> spargio)
+- `native_cutover_tdd`

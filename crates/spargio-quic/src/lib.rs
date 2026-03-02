@@ -8,7 +8,7 @@
 //! - explicit local (`!Send`) and send-handoff connection wrappers.
 
 use spargio::{RuntimeError, RuntimeHandle};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -217,6 +217,7 @@ pub struct NativeProtoStreamState {
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct NativeProtoConnectionState {
+    pub established: bool,
     pub closed: bool,
     pub streams_opened_uni: u64,
     pub streams_opened_bi: u64,
@@ -288,6 +289,7 @@ pub struct NativeProtoStats {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum NativeProtoEvent {
     ConnectionRegistered { connection_id: u64 },
+    ConnectionEstablished { connection_id: u64 },
     ConnectionClosed { connection_id: u64 },
     TimeoutFired { generation: u64 },
     OversizedDatagram { size: usize, max_size: usize },
@@ -405,10 +407,18 @@ impl NativeProtoDriver {
         NativeProtoRolloutStage::Experimental
     }
 
+    pub fn start_sync(handle: &RuntimeHandle, options: NativeProtoDriverOptions) -> io::Result<Self> {
+        Self::start_impl(handle, options)
+    }
+
     pub async fn start(
         handle: &RuntimeHandle,
         options: NativeProtoDriverOptions,
     ) -> io::Result<Self> {
+        Self::start_impl(handle, options)
+    }
+
+    fn start_impl(handle: &RuntimeHandle, options: NativeProtoDriverOptions) -> io::Result<Self> {
         if usize::from(options.owner_shard()) >= handle.shard_count() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -791,6 +801,42 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    pub async fn write_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: Vec<u8>,
+    ) -> io::Result<usize> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::WriteStreamOnConnection {
+            connection_id,
+            stream_id,
+            payload,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
+    pub async fn read_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::ReadStreamOnConnection {
+            connection_id,
+            stream_id,
+            max_bytes,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -803,6 +849,53 @@ impl NativeProtoDriver {
         self.closed.store(true, Ordering::Release);
         self.tx.send(NativeProtoCommand::Closed).ok();
         Ok(())
+    }
+
+    pub fn shutdown_nowait(&self) {
+        if self.is_closed() {
+            return;
+        }
+        self.closed.store(true, Ordering::Release);
+        self.tx.send(NativeProtoCommand::Closed).ok();
+    }
+
+    pub fn close_connection_for_test_nowait(&self, connection_id: u64) -> io::Result<()> {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::CloseConnectionForTest {
+            connection_id,
+            reply: reply_tx,
+        })
+    }
+
+    pub fn send_datagram_on_connection_for_test_nowait(
+        &self,
+        connection_id: u64,
+        payload: Vec<u8>,
+    ) -> io::Result<()> {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::SendDatagramOnConnectionForTest {
+            connection_id,
+            payload,
+            reply: reply_tx,
+        })
+    }
+
+    pub fn finish_stream_nowait(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::FinishStream {
+            connection_id,
+            stream_id,
+            reply: reply_tx,
+        })
+    }
+
+    pub fn reset_stream_nowait(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::ResetStream {
+            connection_id,
+            stream_id,
+            reply: reply_tx,
+        })
     }
 
     fn send_command(&self, cmd: NativeProtoCommand) -> io::Result<()> {
@@ -921,6 +1014,28 @@ impl NativeProtoDriverSend {
         stream_id: u64,
     ) -> io::Result<NativeProtoStreamState> {
         self.inner.stream_state(connection_id, stream_id).await
+    }
+
+    pub async fn write_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: Vec<u8>,
+    ) -> io::Result<usize> {
+        self.inner
+            .write_stream_on_connection(connection_id, stream_id, payload)
+            .await
+    }
+
+    pub async fn read_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        self.inner
+            .read_stream_on_connection(connection_id, stream_id, max_bytes)
+            .await
     }
 
     pub async fn set_transport_tuning(&self, tuning: NativeProtoTransportTuning) -> io::Result<()> {
@@ -1177,6 +1292,18 @@ enum NativeProtoCommand {
         stream_id: u64,
         reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoStreamState>>,
     },
+    WriteStreamOnConnection {
+        connection_id: u64,
+        stream_id: u64,
+        payload: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<io::Result<usize>>,
+    },
+    ReadStreamOnConnection {
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+        reply: tokio::sync::oneshot::Sender<io::Result<Option<Vec<u8>>>>,
+    },
     SetTransportTuning {
         tuning: NativeProtoTransportTuning,
         reply: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -1209,6 +1336,7 @@ struct NativeProtoConnectionPump {
     pending_uni_accept: VecDeque<u64>,
     pending_bi_accept: VecDeque<(u64, u64)>,
     pending_datagrams: VecDeque<Vec<u8>>,
+    pending_stream_data: HashMap<u64, VecDeque<Vec<u8>>>,
     streams: HashMap<u64, NativeProtoStreamState>,
     state: NativeProtoConnectionState,
 }
@@ -1633,6 +1761,7 @@ async fn native_proto_driver_loop(
                     conn.pending_uni_accept.clear();
                     conn.pending_bi_accept.clear();
                     conn.pending_datagrams.clear();
+                    conn.pending_stream_data.clear();
                     if let Some(handle) = handle_by_connection_id.get(&connection_id).copied() {
                         if let Some(proto_connection) = proto_connections.get_mut(&handle) {
                             let now_std = native_proto_now(epoch, now);
@@ -1853,6 +1982,7 @@ async fn native_proto_driver_loop(
                                 Some(stream_id) => {
                                     let stream_id = u64::from(stream_id);
                                     conn.streams.entry(stream_id).or_default();
+                                    conn.pending_stream_data.entry(stream_id).or_default();
                                     conn.state.streams_opened_uni =
                                         conn.state.streams_opened_uni.saturating_add(1);
                                     stats.streams_opened_uni =
@@ -1876,6 +2006,7 @@ async fn native_proto_driver_loop(
                         next_stream_id = next_stream_id.saturating_add(1);
                         conn.pending_uni_accept.push_back(stream_id);
                         conn.streams.entry(stream_id).or_default();
+                        conn.pending_stream_data.entry(stream_id).or_default();
                         conn.state.streams_opened_uni =
                             conn.state.streams_opened_uni.saturating_add(1);
                         stats.streams_opened_uni = stats.streams_opened_uni.saturating_add(1);
@@ -1928,6 +2059,7 @@ async fn native_proto_driver_loop(
                                 Some(stream_id) => {
                                     let stream_id = u64::from(stream_id);
                                     conn.streams.entry(stream_id).or_default();
+                                    conn.pending_stream_data.entry(stream_id).or_default();
                                     Ok(stream_id)
                                 }
                                 None => Err(io::Error::new(
@@ -1977,6 +2109,7 @@ async fn native_proto_driver_loop(
                                     let stream_id = u64::from(stream_id);
                                     let pair = (stream_id, stream_id);
                                     conn.streams.entry(stream_id).or_default();
+                                    conn.pending_stream_data.entry(stream_id).or_default();
                                     conn.state.streams_opened_bi =
                                         conn.state.streams_opened_bi.saturating_add(1);
                                     stats.streams_opened_bi =
@@ -2001,6 +2134,7 @@ async fn native_proto_driver_loop(
                         let pair = (stream_id, stream_id);
                         conn.pending_bi_accept.push_back(pair);
                         conn.streams.entry(stream_id).or_default();
+                        conn.pending_stream_data.entry(stream_id).or_default();
                         conn.state.streams_opened_bi =
                             conn.state.streams_opened_bi.saturating_add(1);
                         stats.streams_opened_bi = stats.streams_opened_bi.saturating_add(1);
@@ -2054,6 +2188,7 @@ async fn native_proto_driver_loop(
                                     let stream_id = u64::from(stream_id);
                                     let pair = (stream_id, stream_id);
                                     conn.streams.entry(stream_id).or_default();
+                                    conn.pending_stream_data.entry(stream_id).or_default();
                                     Ok(pair)
                                 }
                                 None => Err(io::Error::new(
@@ -2277,6 +2412,202 @@ async fn native_proto_driver_loop(
                 };
                 let _ = reply.send(result);
             }
+            NativeProtoCommand::WriteStreamOnConnection {
+                connection_id,
+                stream_id,
+                payload,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let mut should_drive = false;
+                let mut result = if payload.is_empty() {
+                    Ok(0)
+                } else if let Some(conn) = connections.get_mut(&connection_id) {
+                    if conn.state.closed {
+                        Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("native proto connection {connection_id} is closed"),
+                        ))
+                    } else if let Some(handle) = handle_by_connection_id.get(&connection_id).copied()
+                    {
+                        if let Some(proto_connection) = proto_connections.get_mut(&handle) {
+                            let stream_id_proto = match proto_stream_id_from_u64(stream_id) {
+                                Ok(id) => id,
+                                Err(err) => {
+                                    let _ = reply.send(Err(err));
+                                    continue;
+                                }
+                            };
+                            match proto_connection.send_stream(stream_id_proto).write(&payload) {
+                                Ok(written) => {
+                                    should_drive = written > 0;
+                                    Ok(written)
+                                }
+                                Err(err) => Err(proto_write_error_to_io(err)),
+                            }
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("missing native proto handle for connection {connection_id}"),
+                            ))
+                        }
+                    } else if conn.streams.contains_key(&stream_id) {
+                        conn.pending_stream_data
+                            .entry(stream_id)
+                            .or_default()
+                            .push_back(payload);
+                        Ok(conn
+                            .pending_stream_data
+                            .get(&stream_id)
+                            .and_then(|items| items.back())
+                            .map_or(0, Vec::len))
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown native proto stream {stream_id}"),
+                        ))
+                    }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                if result.is_ok() && should_drive {
+                    let now_std = native_proto_now(epoch, now);
+                    if let Err(err) = drive_native_proto_connections(
+                        now_std,
+                        &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
+                        &mut proto_connections,
+                        &mut proto_connection_events,
+                        &mut pending_transmits,
+                        max_pending_transmits,
+                        fault_spec,
+                        &mut fault_stats,
+                        &mut stats,
+                        &mut events,
+                        &mut scratch,
+                    ) {
+                        result = Err(err);
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::ReadStreamOnConnection {
+                connection_id,
+                stream_id,
+                max_bytes,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let mut should_drive = false;
+                let mut result = if max_bytes == 0 {
+                    Ok(Some(Vec::new()))
+                } else if let Some(conn) = connections.get_mut(&connection_id) {
+                    if conn.state.closed {
+                        Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("native proto connection {connection_id} is closed"),
+                        ))
+                    } else if let Some(handle) = handle_by_connection_id.get(&connection_id).copied()
+                    {
+                        if let Some(proto_connection) = proto_connections.get_mut(&handle) {
+                            let stream_id_proto = match proto_stream_id_from_u64(stream_id) {
+                                Ok(id) => id,
+                                Err(err) => {
+                                    let _ = reply.send(Err(err));
+                                    continue;
+                                }
+                            };
+                            match proto_connection.recv_stream(stream_id_proto).read(true) {
+                                Ok(mut chunks) => {
+                                    let next = chunks.next(max_bytes).map_err(proto_read_error_to_io);
+                                    let finalize = chunks.finalize();
+                                    should_drive = finalize.should_transmit();
+                                    match next {
+                                        Ok(Some(chunk)) => Ok(Some(chunk.bytes.to_vec())),
+                                        Ok(None) => Ok(None),
+                                        Err(err) => Err(err),
+                                    }
+                                }
+                                Err(err) => Err(proto_readable_error_to_io(err)),
+                            }
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("missing native proto handle for connection {connection_id}"),
+                            ))
+                        }
+                    } else if conn.streams.contains_key(&stream_id) {
+                        if let Some(buf) = conn
+                            .pending_stream_data
+                            .entry(stream_id)
+                            .or_default()
+                            .pop_front()
+                        {
+                            if buf.len() <= max_bytes {
+                                Ok(Some(buf))
+                            } else {
+                                let split = max_bytes;
+                                let head = buf[..split].to_vec();
+                                let tail = buf[split..].to_vec();
+                                conn.pending_stream_data
+                                    .entry(stream_id)
+                                    .or_default()
+                                    .push_front(tail);
+                                Ok(Some(head))
+                            }
+                        } else if conn
+                            .streams
+                            .get(&stream_id)
+                            .map(|state| state.finished)
+                            .unwrap_or(false)
+                        {
+                            Ok(None)
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "native proto stream read blocked",
+                            ))
+                        }
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown native proto stream {stream_id}"),
+                        ))
+                    }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                if result.is_ok() && should_drive {
+                    let now_std = native_proto_now(epoch, now);
+                    if let Err(err) = drive_native_proto_connections(
+                        now_std,
+                        &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
+                        &mut proto_connections,
+                        &mut proto_connection_events,
+                        &mut pending_transmits,
+                        max_pending_transmits,
+                        fault_spec,
+                        &mut fault_stats,
+                        &mut stats,
+                        &mut events,
+                        &mut scratch,
+                    ) {
+                        result = Err(err);
+                    }
+                }
+                let _ = reply.send(result);
+            }
             NativeProtoCommand::SetTransportTuning {
                 tuning: next_tuning,
                 reply,
@@ -2423,29 +2754,44 @@ fn drive_native_proto_connections(
                 scratch.clear();
             }
             while let Some(event) = connection.poll() {
-                if let quinn_proto::Event::ConnectionLost { .. } = event {
-                    if let Some(connection_id) = connection_id_by_handle.get(&handle).copied() {
-                        let mut emit_connection_closed = false;
-                        if let Some(connection) = connections.get_mut(&connection_id) {
-                            if !connection.state.closed {
-                                emit_connection_closed = true;
+                match event {
+                    quinn_proto::Event::Connected => {
+                        if let Some(connection_id) = connection_id_by_handle.get(&handle).copied() {
+                            if let Some(connection) = connections.get_mut(&connection_id) {
+                                connection.state.established = true;
                             }
-                            connection.state.closed = true;
-                            connection.pending_uni_accept.clear();
-                            connection.pending_bi_accept.clear();
-                            connection.pending_datagrams.clear();
-                        }
-                        if emit_connection_closed {
-                            stats.connections_closed = stats.connections_closed.saturating_add(1);
                             push_native_event(
                                 events,
-                                NativeProtoEvent::ConnectionClosed { connection_id },
+                                NativeProtoEvent::ConnectionEstablished { connection_id },
                             );
                         }
-                        handle_by_connection_id.remove(&connection_id);
                     }
-                    retired_handles.push(handle);
-                    break;
+                    quinn_proto::Event::ConnectionLost { .. } => {
+                        if let Some(connection_id) = connection_id_by_handle.get(&handle).copied() {
+                            let mut emit_connection_closed = false;
+                            if let Some(connection) = connections.get_mut(&connection_id) {
+                                if !connection.state.closed {
+                                    emit_connection_closed = true;
+                                }
+                                connection.state.closed = true;
+                                connection.pending_uni_accept.clear();
+                                connection.pending_bi_accept.clear();
+                                connection.pending_datagrams.clear();
+                                connection.pending_stream_data.clear();
+                            }
+                            if emit_connection_closed {
+                                stats.connections_closed = stats.connections_closed.saturating_add(1);
+                                push_native_event(
+                                    events,
+                                    NativeProtoEvent::ConnectionClosed { connection_id },
+                                );
+                            }
+                            handle_by_connection_id.remove(&connection_id);
+                        }
+                        retired_handles.push(handle);
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2517,6 +2863,47 @@ fn proto_finish_error_to_io(err: quinn_proto::FinishError) -> io::Error {
         quinn_proto::FinishError::ClosedStream => {
             io::Error::new(io::ErrorKind::NotFound, "native proto stream is closed")
         }
+    }
+}
+
+fn proto_write_error_to_io(err: quinn_proto::WriteError) -> io::Error {
+    match err {
+        quinn_proto::WriteError::Blocked => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native proto stream write blocked",
+        ),
+        quinn_proto::WriteError::Stopped(code) => io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("native proto stream stopped by peer ({code})"),
+        ),
+        quinn_proto::WriteError::ClosedStream => {
+            io::Error::new(io::ErrorKind::NotFound, "native proto stream is closed")
+        }
+    }
+}
+
+fn proto_readable_error_to_io(err: quinn_proto::ReadableError) -> io::Error {
+    match err {
+        quinn_proto::ReadableError::ClosedStream => {
+            io::Error::new(io::ErrorKind::NotFound, "native proto stream is closed")
+        }
+        quinn_proto::ReadableError::IllegalOrderedRead => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native proto ordered read after unordered read",
+        ),
+    }
+}
+
+fn proto_read_error_to_io(err: quinn_proto::ReadError) -> io::Error {
+    match err {
+        quinn_proto::ReadError::Blocked => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native proto stream read blocked",
+        ),
+        quinn_proto::ReadError::Reset(code) => io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("native proto stream reset by peer ({code})"),
+        ),
     }
 }
 
@@ -2799,6 +3186,488 @@ struct QuicMetricsInner {
     operation_timeouts: AtomicU64,
     native_ops_dispatched: AtomicU64,
     bridge_ops_dispatched: AtomicU64,
+}
+
+const NATIVE_PROTO_PUMP_READ_SIZE: usize = 64 * 1024;
+const NATIVE_PROTO_PUMP_BATCH: usize = 64;
+const NATIVE_PROTO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+struct NativeProtoEndpointRuntime {
+    runtime: Mutex<Option<spargio::Runtime>>,
+}
+
+#[derive(Clone)]
+struct NativeProtoConnectionHandle {
+    backend: Arc<NativeProtoEndpointBackend>,
+    connection_id: u64,
+}
+
+struct NativeProtoEndpointBackend {
+    driver: NativeProtoDriver,
+    socket: Arc<std::net::UdpSocket>,
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    accept_queue: Arc<Mutex<VecDeque<u64>>>,
+    known_connections: Arc<Mutex<HashSet<u64>>>,
+    runtime_owner: Arc<NativeProtoEndpointRuntime>,
+}
+
+impl NativeProtoEndpointBackend {
+    fn start(
+        bind_addr: SocketAddr,
+        server_config: Option<quinn::ServerConfig>,
+        max_pending_transmits: usize,
+    ) -> io::Result<Arc<Self>> {
+        let runtime = spargio::Runtime::builder()
+            .shards(1)
+            .build()
+            .map_err(runtime_error_to_io)?;
+        let handle = runtime.handle();
+        let socket = std::net::UdpSocket::bind(bind_addr)?;
+        socket.set_nonblocking(true)?;
+        let local_addr = socket.local_addr()?;
+        let mut driver_options =
+            NativeProtoDriverOptions::default().with_max_pending_transmits(max_pending_transmits);
+        if let Some(config) = server_config {
+            driver_options = driver_options.with_server_config(config);
+        }
+        let driver = NativeProtoDriver::start_sync(&handle, driver_options)?;
+        let backend = Arc::new(Self {
+            driver,
+            socket: Arc::new(socket),
+            local_addr,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            accept_queue: Arc::new(Mutex::new(VecDeque::new())),
+            known_connections: Arc::new(Mutex::new(HashSet::new())),
+            runtime_owner: Arc::new(NativeProtoEndpointRuntime {
+                runtime: Mutex::new(Some(runtime)),
+            }),
+        });
+        backend.spawn_pump_tasks(handle)?;
+        Ok(backend)
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    fn driver(&self) -> NativeProtoDriver {
+        self.driver.clone()
+    }
+
+    fn remember_connection(&self, connection_id: u64) {
+        if let Ok(mut known) = self.known_connections.lock() {
+            known.insert(connection_id);
+        }
+    }
+
+    fn forget_connection(&self, connection_id: u64) {
+        if let Ok(mut known) = self.known_connections.lock() {
+            known.remove(&connection_id);
+        }
+    }
+
+    async fn wait_for_accept(&self, timeout: Option<Duration>) -> io::Result<u64> {
+        let started = std::time::Instant::now();
+        loop {
+            self.refresh_events().await?;
+            if let Ok(mut queue) = self.accept_queue.lock() {
+                if let Some(connection_id) = queue.pop_front() {
+                    self.remember_connection(connection_id);
+                    return Ok(connection_id);
+                }
+            }
+            if let Some(limit) = timeout {
+                if started.elapsed() >= limit {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "quic accept timed out"));
+                }
+            }
+            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_established(
+        &self,
+        connection_id: u64,
+        timeout: Option<Duration>,
+        timeout_msg: &'static str,
+    ) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            self.refresh_events().await?;
+            let state = self.driver.connection_state(connection_id).await?;
+            if state.established {
+                self.remember_connection(connection_id);
+                return Ok(());
+            }
+            if state.closed {
+                self.forget_connection(connection_id);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("native proto connection {connection_id} closed during handshake"),
+                ));
+            }
+            if let Some(limit) = timeout {
+                if started.elapsed() >= limit {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_msg));
+                }
+            }
+            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_closed(
+        &self,
+        connection_id: u64,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            self.refresh_events().await?;
+            match self.driver.connection_state(connection_id).await {
+                Ok(state) => {
+                    if state.closed {
+                        self.forget_connection(connection_id);
+                        return Ok(());
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    self.forget_connection(connection_id);
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+            if let Some(limit) = timeout {
+                if started.elapsed() >= limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "quic connection closed() wait timed out",
+                    ));
+                }
+            }
+            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_idle(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            self.refresh_events().await?;
+            let ids = if let Ok(known) = self.known_connections.lock() {
+                known.iter().copied().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if ids.is_empty() {
+                return Ok(());
+            }
+
+            let mut open_remaining = 0usize;
+            for connection_id in ids {
+                match self.driver.connection_state(connection_id).await {
+                    Ok(state) => {
+                        if state.closed {
+                            self.forget_connection(connection_id);
+                        } else {
+                            open_remaining += 1;
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        self.forget_connection(connection_id);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            if open_remaining == 0 {
+                return Ok(());
+            }
+            if let Some(limit) = timeout {
+                if started.elapsed() >= limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "quic endpoint wait_idle timed out",
+                    ));
+                }
+            }
+            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn refresh_events(&self) -> io::Result<()> {
+        let events = self.driver.drain_events(NATIVE_PROTO_PUMP_BATCH).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut accept_queue = self
+            .accept_queue
+            .lock()
+            .expect("native proto accept queue lock poisoned");
+        let mut known = self
+            .known_connections
+            .lock()
+            .expect("native proto known connections lock poisoned");
+        for event in events {
+            match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => {
+                    accept_queue.push_back(connection_id);
+                    known.insert(connection_id);
+                }
+                NativeProtoEvent::ConnectionEstablished { connection_id } => {
+                    known.insert(connection_id);
+                }
+                NativeProtoEvent::ConnectionClosed { connection_id } => {
+                    known.remove(&connection_id);
+                }
+                NativeProtoEvent::TimeoutFired { .. }
+                | NativeProtoEvent::OversizedDatagram { .. }
+                | NativeProtoEvent::Backpressure { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_pump_tasks(self: &Arc<Self>, handle: RuntimeHandle) -> io::Result<()> {
+        let ingress_backend = self.clone();
+        handle
+            .spawn_stealable(async move {
+                let mut buf = vec![0u8; NATIVE_PROTO_PUMP_READ_SIZE];
+                loop {
+                    if ingress_backend.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (payload, remote) = match ingress_backend.socket.recv_from(&mut buf) {
+                        Ok((received, remote)) => (buf[..received].to_vec(), remote),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            continue;
+                        }
+                    };
+                    match ingress_backend.driver.submit_datagram(remote, payload).await {
+                        Ok(_) => {}
+                        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => break,
+                        Err(_) => {}
+                    }
+                }
+            })
+            .map_err(runtime_error_to_io)?;
+
+        let egress_backend = self.clone();
+        handle
+            .spawn_stealable(async move {
+                loop {
+                    if egress_backend.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = egress_backend
+                        .driver
+                        .advance_clock_for_test(NATIVE_PROTO_POLL_INTERVAL)
+                        .await;
+                    match egress_backend
+                        .driver
+                        .drain_transmits(NATIVE_PROTO_PUMP_BATCH)
+                        .await
+                    {
+                        Ok(transmits) => {
+                            for transmit in transmits {
+                                if egress_backend
+                                    .socket
+                                    .send_to(&transmit.payload, transmit.destination)
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => break,
+                        Err(_) => {}
+                    }
+                    spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                }
+            })
+            .map_err(runtime_error_to_io)?;
+        Ok(())
+    }
+}
+
+impl Drop for NativeProtoEndpointBackend {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.driver.shutdown_nowait();
+        if let Ok(mut runtime) = self.runtime_owner.runtime.lock() {
+            let _ = runtime.take();
+        }
+    }
+}
+
+enum QuicSendStreamKind {
+    Quinn(quinn::SendStream),
+    Native {
+        connection: NativeProtoConnectionHandle,
+        stream_id: u64,
+        timeout: Option<Duration>,
+    },
+}
+
+pub struct QuicSendStream {
+    kind: QuicSendStreamKind,
+}
+
+impl QuicSendStream {
+    pub async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
+        match &mut self.kind {
+            QuicSendStreamKind::Quinn(stream) => stream.write_all(data).await.map_err(io::Error::other),
+            QuicSendStreamKind::Native {
+                connection,
+                stream_id,
+                timeout,
+            } => {
+                let started = std::time::Instant::now();
+                while !data.is_empty() {
+                    match connection
+                        .backend
+                        .driver()
+                        .write_stream_on_connection(
+                            connection.connection_id,
+                            *stream_id,
+                            data.to_vec(),
+                        )
+                        .await
+                    {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "native proto write returned zero",
+                            ));
+                        }
+                        Ok(written) => {
+                            let consumed = written.min(data.len());
+                            data = &data[consumed..];
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if let Some(limit) = timeout {
+                                if started.elapsed() >= *limit {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "quic stream write timed out",
+                                    ));
+                                }
+                            }
+                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        match &mut self.kind {
+            QuicSendStreamKind::Quinn(stream) => stream.finish().map_err(io::Error::other),
+            QuicSendStreamKind::Native {
+                connection,
+                stream_id,
+                ..
+            } => connection
+                .backend
+                .driver()
+                .finish_stream_nowait(connection.connection_id, *stream_id),
+        }
+    }
+
+    pub fn reset(&mut self, code: u32) -> io::Result<()> {
+        match &mut self.kind {
+            QuicSendStreamKind::Quinn(stream) => stream
+                .reset(code.into())
+                .map_err(io::Error::other),
+            QuicSendStreamKind::Native {
+                connection,
+                stream_id,
+                ..
+            } => connection
+                .backend
+                .driver()
+                .reset_stream_nowait(connection.connection_id, *stream_id),
+        }
+    }
+}
+
+enum QuicRecvStreamKind {
+    Quinn(quinn::RecvStream),
+    Native {
+        connection: NativeProtoConnectionHandle,
+        stream_id: u64,
+        timeout: Option<Duration>,
+    },
+}
+
+pub struct QuicRecvStream {
+    kind: QuicRecvStreamKind,
+}
+
+impl QuicRecvStream {
+    pub async fn read_to_end(&mut self, size_limit: usize) -> io::Result<Vec<u8>> {
+        match &mut self.kind {
+            QuicRecvStreamKind::Quinn(stream) => {
+                stream.read_to_end(size_limit).await.map_err(io::Error::other)
+            }
+            QuicRecvStreamKind::Native {
+                connection,
+                stream_id,
+                timeout,
+            } => {
+                let mut out = Vec::new();
+                let started = std::time::Instant::now();
+                loop {
+                    let remaining = size_limit.saturating_sub(out.len());
+                    if remaining == 0 && size_limit != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "native proto stream exceeded read_to_end limit",
+                        ));
+                    }
+                    match connection
+                        .backend
+                        .driver()
+                        .read_stream_on_connection(
+                            connection.connection_id,
+                            *stream_id,
+                            remaining.max(1),
+                        )
+                        .await
+                    {
+                        Ok(Some(chunk)) => {
+                            if out.len().saturating_add(chunk.len()) > size_limit {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "native proto stream exceeded read_to_end limit",
+                                ));
+                            }
+                            out.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => return Ok(out),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if let Some(limit) = timeout {
+                                if started.elapsed() >= *limit {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "quic stream read timed out",
+                                    ));
+                                }
+                            }
+                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3271,6 +4140,7 @@ async fn native_connection_dispatch_loop(
 pub struct QuicEndpoint {
     endpoint: Option<quinn::Endpoint>,
     native_dispatch: Option<NativeEndpointDispatch>,
+    native_proto_backend: Option<Arc<NativeProtoEndpointBackend>>,
     default_client_config: Arc<Mutex<Option<quinn::ClientConfig>>>,
     options: QuicEndpointOptions,
     metrics: QuicMetrics,
@@ -3288,12 +4158,16 @@ impl QuicEndpoint {
         options: QuicEndpointOptions,
     ) -> io::Result<Self> {
         validate_endpoint_options(options)?;
-        let endpoint = match options.backend() {
-            QuicBackend::Native => native_server_endpoint(server_config, bind_addr)?,
-            QuicBackend::Bridge => {
-                with_bridge_runtime_context(|| quinn::Endpoint::server(server_config, bind_addr))?
-            }
-        };
+        if options.backend() == QuicBackend::Native {
+            let backend = NativeProtoEndpointBackend::start(
+                bind_addr,
+                Some(server_config),
+                options.max_inflight_ops(),
+            )?;
+            return Self::from_native_backend_with_options(backend, options);
+        }
+        let endpoint =
+            with_bridge_runtime_context(|| quinn::Endpoint::server(server_config, bind_addr))?;
         Self::from_endpoint_with_options(endpoint, options)
     }
 
@@ -3306,10 +4180,12 @@ impl QuicEndpoint {
         options: QuicEndpointOptions,
     ) -> io::Result<Self> {
         validate_endpoint_options(options)?;
-        let endpoint = match options.backend() {
-            QuicBackend::Native => native_client_endpoint(bind_addr)?,
-            QuicBackend::Bridge => with_bridge_runtime_context(|| quinn::Endpoint::client(bind_addr))?,
-        };
+        if options.backend() == QuicBackend::Native {
+            let backend =
+                NativeProtoEndpointBackend::start(bind_addr, None, options.max_inflight_ops())?;
+            return Self::from_native_backend_with_options(backend, options);
+        }
+        let endpoint = with_bridge_runtime_context(|| quinn::Endpoint::client(bind_addr))?;
         Self::from_endpoint_with_options(endpoint, options)
     }
 
@@ -3332,6 +4208,28 @@ impl QuicEndpoint {
         Ok(Self {
             endpoint: Some(endpoint),
             native_dispatch,
+            native_proto_backend: None,
+            default_client_config: Arc::new(Mutex::new(None)),
+            options,
+            metrics,
+            limiter: Arc::new(InflightLimiter::new(
+                options.max_inflight_ops(),
+                "quic endpoint",
+            )),
+        })
+    }
+
+    fn from_native_backend_with_options(
+        backend: Arc<NativeProtoEndpointBackend>,
+        options: QuicEndpointOptions,
+    ) -> io::Result<Self> {
+        validate_endpoint_options(options)?;
+        let metrics = QuicMetrics::default();
+        metrics.inc_endpoints_created();
+        Ok(Self {
+            endpoint: None,
+            native_dispatch: None,
+            native_proto_backend: Some(backend),
             default_client_config: Arc::new(Mutex::new(None)),
             options,
             metrics,
@@ -3347,6 +4245,9 @@ impl QuicEndpoint {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        if let Some(backend) = &self.native_proto_backend {
+            return Ok(backend.local_addr());
+        }
         self.endpoint_ref().local_addr()
     }
 
@@ -3358,11 +4259,15 @@ impl QuicEndpoint {
                 .expect("quic endpoint client config lock poisoned");
             *default_client_config = Some(config.clone());
         }
-        self.endpoint_mut().set_default_client_config(config);
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.set_default_client_config(config);
+        }
     }
 
     pub fn set_server_config(&mut self, config: Option<quinn::ServerConfig>) {
-        self.endpoint_mut().set_server_config(config);
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.set_server_config(config);
+        }
     }
 
     pub fn metrics_snapshot(&self) -> QuicMetricsSnapshot {
@@ -3380,14 +4285,42 @@ impl QuicEndpoint {
         let connected = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                let default_config = self
-                    .default_client_config
-                    .lock()
-                    .expect("quic endpoint client config lock poisoned")
-                    .clone();
-                self.native_dispatch_ref()?
-                    .connect(default_config, addr, server_name, self.options.connect_timeout())
-                    .await
+                if let Some(native_backend) = &self.native_proto_backend {
+                    let default_config = self
+                        .default_client_config
+                        .lock()
+                        .expect("quic endpoint client config lock poisoned")
+                        .clone()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "no default quic client config set",
+                            )
+                        })?;
+                    let connection_id = native_backend
+                        .driver()
+                        .connect_for_test(default_config, addr, &server_name)
+                        .await?;
+                    native_backend.remember_connection(connection_id);
+                    native_backend
+                        .wait_for_established(
+                            connection_id,
+                            self.options.connect_timeout(),
+                            "quic connect timed out",
+                        )
+                        .await?;
+                    Ok(self.wrap_native_connection(native_backend.clone(), connection_id))
+                } else {
+                    let default_config = self
+                        .default_client_config
+                        .lock()
+                        .expect("quic endpoint client config lock poisoned")
+                        .clone();
+                    self.native_dispatch_ref()?
+                        .connect(default_config, addr, server_name, self.options.connect_timeout())
+                        .await
+                        .and_then(|connection| self.wrap_connection(connection))
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
@@ -3403,19 +4336,14 @@ impl QuicEndpoint {
                     },
                 )
                 .await
+                .and_then(|connection| self.wrap_connection(connection))
             }
         };
         match connected {
-            Ok(connection) => match self.wrap_connection(connection) {
-                Ok(connection) => {
-                    self.metrics.inc_connects_succeeded();
-                    Ok(connection)
-                }
-                Err(err) => {
-                    self.metrics.inc_connects_failed();
-                    Err(err)
-                }
-            },
+            Ok(connection) => {
+                self.metrics.inc_connects_succeeded();
+                Ok(connection)
+            }
             Err(err) => {
                 if err.kind() == io::ErrorKind::TimedOut {
                     self.metrics.inc_connect_timeouts();
@@ -3440,9 +4368,26 @@ impl QuicEndpoint {
         let connected = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .connect_with(config, addr, server_name, self.options.connect_timeout())
-                    .await
+                if let Some(native_backend) = &self.native_proto_backend {
+                    let connection_id = native_backend
+                        .driver()
+                        .connect_for_test(config, addr, &server_name)
+                        .await?;
+                    native_backend.remember_connection(connection_id);
+                    native_backend
+                        .wait_for_established(
+                            connection_id,
+                            self.options.connect_timeout(),
+                            "quic connect timed out",
+                        )
+                        .await?;
+                    Ok(self.wrap_native_connection(native_backend.clone(), connection_id))
+                } else {
+                    self.native_dispatch_ref()?
+                        .connect_with(config, addr, server_name, self.options.connect_timeout())
+                        .await
+                        .and_then(|connection| self.wrap_connection(connection))
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
@@ -3458,19 +4403,14 @@ impl QuicEndpoint {
                     },
                 )
                 .await
+                .and_then(|connection| self.wrap_connection(connection))
             }
         };
         match connected {
-            Ok(connection) => match self.wrap_connection(connection) {
-                Ok(connection) => {
-                    self.metrics.inc_connects_succeeded();
-                    Ok(connection)
-                }
-                Err(err) => {
-                    self.metrics.inc_connects_failed();
-                    Err(err)
-                }
-            },
+            Ok(connection) => {
+                self.metrics.inc_connects_succeeded();
+                Ok(connection)
+            }
             Err(err) => {
                 if err.kind() == io::ErrorKind::TimedOut {
                     self.metrics.inc_connect_timeouts();
@@ -3490,9 +4430,29 @@ impl QuicEndpoint {
         let accepted = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .accept(self.options.accept_timeout(), op_timeout)
-                    .await
+                if let Some(native_backend) = &self.native_proto_backend {
+                    let connection_id = native_backend.wait_for_accept(self.options.accept_timeout()).await?;
+                    native_backend
+                        .wait_for_established(
+                            connection_id,
+                            op_timeout,
+                            "quic incoming handshake timed out",
+                        )
+                        .await?;
+                    Ok(Some(self.wrap_native_connection(
+                        native_backend.clone(),
+                        connection_id,
+                    )))
+                } else {
+                    self.native_dispatch_ref()?
+                        .accept(self.options.accept_timeout(), op_timeout)
+                        .await
+                        .and_then(|connection| {
+                            connection
+                                .map(|inner| self.wrap_connection(inner))
+                                .transpose()
+                        })
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
@@ -3516,19 +4476,18 @@ impl QuicEndpoint {
                     },
                 )
                 .await
+                .and_then(|connection| {
+                    connection
+                        .map(|inner| self.wrap_connection(inner))
+                        .transpose()
+                })
             }
         };
         match accepted {
-            Ok(Some(connection)) => match self.wrap_connection(connection) {
-                Ok(connection) => {
-                    self.metrics.inc_accepts_succeeded();
-                    Ok(Some(connection))
-                }
-                Err(err) => {
-                    self.metrics.inc_accepts_failed();
-                    Err(err)
-                }
-            },
+            Ok(Some(connection)) => {
+                self.metrics.inc_accepts_succeeded();
+                Ok(Some(connection))
+            }
             Ok(None) => Ok(None),
             Err(err) => {
                 if err.kind() == io::ErrorKind::TimedOut {
@@ -3543,7 +4502,22 @@ impl QuicEndpoint {
     }
 
     pub fn close(&self, code: u32, reason: &[u8]) {
-        self.endpoint_ref().close(code.into(), reason);
+        if let Some(endpoint) = self.endpoint.as_ref() {
+            endpoint.close(code.into(), reason);
+        }
+        if let Some(backend) = &self.native_proto_backend {
+            let known = backend
+                .known_connections
+                .lock()
+                .map(|set| set.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for connection_id in known {
+                let _ = backend
+                    .driver()
+                    .close_connection_for_test_nowait(connection_id);
+                backend.forget_connection(connection_id);
+            }
+        }
         self.metrics.inc_endpoint_closes();
     }
 
@@ -3552,9 +4526,13 @@ impl QuicEndpoint {
         let waited = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .wait_idle(self.options.operation_timeout())
-                    .await
+                if let Some(native_backend) = &self.native_proto_backend {
+                    native_backend.wait_idle(self.options.operation_timeout()).await
+                } else {
+                    self.native_dispatch_ref()?
+                        .wait_idle(self.options.operation_timeout())
+                        .await
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
@@ -3586,12 +4564,32 @@ impl QuicEndpoint {
         };
         self.metrics.inc_connections_opened();
         Ok(QuicConnection {
-            connection,
+            connection: Some(connection),
             native_dispatch,
+            native_proto: None,
             options: self.options,
             metrics: self.metrics.clone(),
             limiter: self.limiter.clone(),
         })
+    }
+
+    fn wrap_native_connection(
+        &self,
+        backend: Arc<NativeProtoEndpointBackend>,
+        connection_id: u64,
+    ) -> QuicConnection {
+        self.metrics.inc_connections_opened();
+        QuicConnection {
+            connection: None,
+            native_dispatch: None,
+            native_proto: Some(NativeProtoConnectionHandle {
+                backend,
+                connection_id,
+            }),
+            options: self.options,
+            metrics: self.metrics.clone(),
+            limiter: self.limiter.clone(),
+        }
     }
 
     fn endpoint_ref(&self) -> &quinn::Endpoint {
@@ -3621,6 +4619,7 @@ impl Drop for QuicEndpoint {
         if let Some(dispatch) = self.native_dispatch.take() {
             dispatch.shutdown_nowait();
         }
+        let _ = self.native_proto_backend.take();
         let Some(endpoint) = self.endpoint.take() else {
             return;
         };
@@ -3642,8 +4641,9 @@ impl Drop for QuicEndpoint {
 
 #[derive(Clone)]
 pub struct QuicConnection {
-    connection: quinn::Connection,
+    connection: Option<quinn::Connection>,
     native_dispatch: Option<NativeConnectionDispatch>,
+    native_proto: Option<NativeProtoConnectionHandle>,
     options: QuicEndpointOptions,
     metrics: QuicMetrics,
     limiter: Arc<InflightLimiter>,
@@ -3651,23 +4651,46 @@ pub struct QuicConnection {
 
 impl QuicConnection {
     pub fn stable_id(&self) -> usize {
-        self.connection.stable_id()
+        if let Some(native) = &self.native_proto {
+            return native.connection_id as usize;
+        }
+        self.connection
+            .as_ref()
+            .map(quinn::Connection::stable_id)
+            .unwrap_or_default()
     }
 
     pub fn stats(&self) -> quinn::ConnectionStats {
-        self.connection.stats()
+        self.connection
+            .as_ref()
+            .map(quinn::Connection::stats)
+            .unwrap_or_default()
     }
 
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.connection.max_datagram_size()
+        self.connection
+            .as_ref()
+            .and_then(quinn::Connection::max_datagram_size)
     }
 
     pub fn datagram_send_buffer_space(&self) -> usize {
-        self.connection.datagram_send_buffer_space()
+        self.connection
+            .as_ref()
+            .map(quinn::Connection::datagram_send_buffer_space)
+            .unwrap_or(0)
     }
 
     pub fn close(&self, code: u32, reason: &[u8]) {
-        self.connection.close(code.into(), reason);
+        if let Some(native) = &self.native_proto {
+            let _ = native
+                .backend
+                .driver()
+                .close_connection_for_test_nowait(native.connection_id);
+            native.backend.forget_connection(native.connection_id);
+        }
+        if let Some(connection) = &self.connection {
+            connection.close(code.into(), reason);
+        }
         self.metrics.inc_connection_closes();
     }
 
@@ -3676,15 +4699,22 @@ impl QuicConnection {
         let out = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .closed(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    native
+                        .backend
+                        .wait_for_closed(native.connection_id, self.options.operation_timeout())
+                        .await
+                } else {
+                    self.native_dispatch_ref()?
+                        .closed(self.options.operation_timeout())
+                        .await
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let closed = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.closed(),
+                    self.connection_ref()?.closed(),
                     "quic connection closed() wait timed out",
                 )
                 .await?;
@@ -3703,24 +4733,65 @@ impl QuicConnection {
         out
     }
 
-    pub async fn open_uni(&self) -> io::Result<quinn::SendStream> {
+    pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let stream = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .open_uni(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    let started = std::time::Instant::now();
+                    loop {
+                        match native
+                            .backend
+                            .driver()
+                            .open_uni_on_connection(native.connection_id)
+                            .await
+                        {
+                            Ok(stream_id) => {
+                                break Ok(QuicSendStream {
+                                    kind: QuicSendStreamKind::Native {
+                                        connection: native.clone(),
+                                        stream_id,
+                                        timeout: self.options.operation_timeout(),
+                                    },
+                                });
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                if let Some(limit) = self.options.operation_timeout() {
+                                    if started.elapsed() >= limit {
+                                        break Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "quic open_uni timed out",
+                                        ));
+                                    }
+                                }
+                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                } else {
+                    self.native_dispatch_ref()?
+                        .open_uni(self.options.operation_timeout())
+                        .await
+                        .map(|stream| QuicSendStream {
+                            kind: QuicSendStreamKind::Quinn(stream),
+                        })
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let opened = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.open_uni(),
+                    self.connection_ref()?.open_uni(),
                     "quic open_uni timed out",
                 )
                 .await?;
-                opened.map_err(quinn_connection_error_to_io)
+                opened
+                    .map_err(quinn_connection_error_to_io)
+                    .map(|stream| QuicSendStream {
+                        kind: QuicSendStreamKind::Quinn(stream),
+                    })
             }
         };
         let stream = match stream {
@@ -3736,24 +4807,88 @@ impl QuicConnection {
         Ok(stream)
     }
 
-    pub async fn open_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let streams = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .open_bi(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    let started = std::time::Instant::now();
+                    loop {
+                        match native
+                            .backend
+                            .driver()
+                            .open_bi_on_connection(native.connection_id)
+                            .await
+                        {
+                            Ok((send_id, recv_id)) => {
+                                break Ok((
+                                    QuicSendStream {
+                                        kind: QuicSendStreamKind::Native {
+                                            connection: native.clone(),
+                                            stream_id: send_id,
+                                            timeout: self.options.operation_timeout(),
+                                        },
+                                    },
+                                    QuicRecvStream {
+                                        kind: QuicRecvStreamKind::Native {
+                                            connection: native.clone(),
+                                            stream_id: recv_id,
+                                            timeout: self.options.operation_timeout(),
+                                        },
+                                    },
+                                ));
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                if let Some(limit) = self.options.operation_timeout() {
+                                    if started.elapsed() >= limit {
+                                        break Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "quic open_bi timed out",
+                                        ));
+                                    }
+                                }
+                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                } else {
+                    self.native_dispatch_ref()?
+                        .open_bi(self.options.operation_timeout())
+                        .await
+                        .map(|(send, recv)| {
+                            (
+                                QuicSendStream {
+                                    kind: QuicSendStreamKind::Quinn(send),
+                                },
+                                QuicRecvStream {
+                                    kind: QuicRecvStreamKind::Quinn(recv),
+                                },
+                            )
+                        })
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let opened = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.open_bi(),
+                    self.connection_ref()?.open_bi(),
                     "quic open_bi timed out",
                 )
                 .await?;
-                opened.map_err(quinn_connection_error_to_io)
+                opened
+                    .map_err(quinn_connection_error_to_io)
+                    .map(|(send, recv)| {
+                        (
+                            QuicSendStream {
+                                kind: QuicSendStreamKind::Quinn(send),
+                            },
+                            QuicRecvStream {
+                                kind: QuicRecvStreamKind::Quinn(recv),
+                            },
+                        )
+                    })
             }
         };
         let streams = match streams {
@@ -3769,24 +4904,65 @@ impl QuicConnection {
         Ok(streams)
     }
 
-    pub async fn accept_uni(&self) -> io::Result<quinn::RecvStream> {
+    pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let stream = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .accept_uni(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    let started = std::time::Instant::now();
+                    loop {
+                        match native
+                            .backend
+                            .driver()
+                            .accept_uni_on_connection(native.connection_id)
+                            .await
+                        {
+                            Ok(stream_id) => {
+                                break Ok(QuicRecvStream {
+                                    kind: QuicRecvStreamKind::Native {
+                                        connection: native.clone(),
+                                        stream_id,
+                                        timeout: self.options.operation_timeout(),
+                                    },
+                                });
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                if let Some(limit) = self.options.operation_timeout() {
+                                    if started.elapsed() >= limit {
+                                        break Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "quic accept_uni timed out",
+                                        ));
+                                    }
+                                }
+                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                } else {
+                    self.native_dispatch_ref()?
+                        .accept_uni(self.options.operation_timeout())
+                        .await
+                        .map(|stream| QuicRecvStream {
+                            kind: QuicRecvStreamKind::Quinn(stream),
+                        })
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let accepted = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.accept_uni(),
+                    self.connection_ref()?.accept_uni(),
                     "quic accept_uni timed out",
                 )
                 .await?;
-                accepted.map_err(quinn_connection_error_to_io)
+                accepted
+                    .map_err(quinn_connection_error_to_io)
+                    .map(|stream| QuicRecvStream {
+                        kind: QuicRecvStreamKind::Quinn(stream),
+                    })
             }
         };
         let stream = match stream {
@@ -3802,24 +4978,88 @@ impl QuicConnection {
         Ok(stream)
     }
 
-    pub async fn accept_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let streams = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .accept_bi(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    let started = std::time::Instant::now();
+                    loop {
+                        match native
+                            .backend
+                            .driver()
+                            .accept_bi_on_connection(native.connection_id)
+                            .await
+                        {
+                            Ok((send_id, recv_id)) => {
+                                break Ok((
+                                    QuicSendStream {
+                                        kind: QuicSendStreamKind::Native {
+                                            connection: native.clone(),
+                                            stream_id: send_id,
+                                            timeout: self.options.operation_timeout(),
+                                        },
+                                    },
+                                    QuicRecvStream {
+                                        kind: QuicRecvStreamKind::Native {
+                                            connection: native.clone(),
+                                            stream_id: recv_id,
+                                            timeout: self.options.operation_timeout(),
+                                        },
+                                    },
+                                ));
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                if let Some(limit) = self.options.operation_timeout() {
+                                    if started.elapsed() >= limit {
+                                        break Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "quic accept_bi timed out",
+                                        ));
+                                    }
+                                }
+                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                } else {
+                    self.native_dispatch_ref()?
+                        .accept_bi(self.options.operation_timeout())
+                        .await
+                        .map(|(send, recv)| {
+                            (
+                                QuicSendStream {
+                                    kind: QuicSendStreamKind::Quinn(send),
+                                },
+                                QuicRecvStream {
+                                    kind: QuicRecvStreamKind::Quinn(recv),
+                                },
+                            )
+                        })
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let accepted = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.accept_bi(),
+                    self.connection_ref()?.accept_bi(),
                     "quic accept_bi timed out",
                 )
                 .await?;
-                accepted.map_err(quinn_connection_error_to_io)
+                accepted
+                    .map_err(quinn_connection_error_to_io)
+                    .map(|(send, recv)| {
+                        (
+                            QuicSendStream {
+                                kind: QuicSendStreamKind::Quinn(send),
+                            },
+                            QuicRecvStream {
+                                kind: QuicRecvStreamKind::Quinn(recv),
+                            },
+                        )
+                    })
             }
         };
         let streams = match streams {
@@ -3844,9 +5084,16 @@ impl QuicConnection {
             QuicBackend::Native => self.metrics.inc_native_ops_dispatched(),
             QuicBackend::Bridge => self.metrics.inc_bridge_ops_dispatched(),
         }
-        self.connection
-            .send_datagram(data.into().into())
-            .map_err(quinn_send_datagram_error_to_io)?;
+        if let Some(native) = &self.native_proto {
+            native
+                .backend
+                .driver()
+                .send_datagram_on_connection_for_test_nowait(native.connection_id, data.into())?;
+        } else {
+            self.connection_ref()?
+                .send_datagram(data.into().into())
+                .map_err(quinn_send_datagram_error_to_io)?;
+        }
         self.metrics.inc_datagrams_sent();
         Ok(())
     }
@@ -3856,15 +5103,41 @@ impl QuicConnection {
         let payload = match self.options.backend() {
             QuicBackend::Native => {
                 self.metrics.inc_native_ops_dispatched();
-                self.native_dispatch_ref()?
-                    .read_datagram(self.options.operation_timeout())
-                    .await
+                if let Some(native) = &self.native_proto {
+                    let started = std::time::Instant::now();
+                    loop {
+                        match native
+                            .backend
+                            .driver()
+                            .recv_datagram_on_connection_for_test(native.connection_id)
+                            .await
+                        {
+                            Ok(payload) => break Ok(payload),
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                if let Some(limit) = self.options.operation_timeout() {
+                                    if started.elapsed() >= limit {
+                                        break Err(io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            "quic read_datagram timed out",
+                                        ));
+                                    }
+                                }
+                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                } else {
+                    self.native_dispatch_ref()?
+                        .read_datagram(self.options.operation_timeout())
+                        .await
+                }
             }
             QuicBackend::Bridge => {
                 self.metrics.inc_bridge_ops_dispatched();
                 let read = await_with_timeout(
                     self.options.operation_timeout(),
-                    self.connection.read_datagram(),
+                    self.connection_ref()?.read_datagram(),
                     "quic read_datagram timed out",
                 )
                 .await?;
@@ -3897,6 +5170,15 @@ impl QuicConnection {
         }
     }
 
+    fn connection_ref(&self) -> io::Result<&quinn::Connection> {
+        self.connection.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "quic connection handle is not quinn-backed",
+            )
+        })
+    }
+
     fn native_dispatch_ref(&self) -> io::Result<&NativeConnectionDispatch> {
         self.native_dispatch.as_ref().ok_or_else(|| {
             io::Error::new(
@@ -3921,19 +5203,19 @@ impl QuicSendConnection {
         self.inner.close(code, reason);
     }
 
-    pub async fn open_uni(&self) -> io::Result<quinn::SendStream> {
+    pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         self.inner.open_uni().await
     }
 
-    pub async fn open_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.open_bi().await
     }
 
-    pub async fn accept_uni(&self) -> io::Result<quinn::RecvStream> {
+    pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         self.inner.accept_uni().await
     }
 
-    pub async fn accept_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.accept_bi().await
     }
 
@@ -3967,19 +5249,19 @@ impl LocalQuicConnection {
         self.inner.close(code, reason);
     }
 
-    pub async fn open_uni(&self) -> io::Result<quinn::SendStream> {
+    pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         self.inner.open_uni().await
     }
 
-    pub async fn open_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.open_bi().await
     }
 
-    pub async fn accept_uni(&self) -> io::Result<quinn::RecvStream> {
+    pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         self.inner.accept_uni().await
     }
 
-    pub async fn accept_bi(&self) -> io::Result<(quinn::SendStream, quinn::RecvStream)> {
+    pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.accept_bi().await
     }
 

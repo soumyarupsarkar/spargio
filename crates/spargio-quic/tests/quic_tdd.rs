@@ -963,13 +963,11 @@ fn native_proto_driver_post_handshake_bi_stream_open_is_accepted_by_server() {
             .expect("connect for test");
 
         exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
-        let server_conn = server
-            .drain_events(64)
-            .await
-            .expect("server events")
-            .into_iter()
+        let server_initial_events = server.drain_events(64).await.expect("server events");
+        let server_conn = server_initial_events
+            .iter()
             .find_map(|event| match event {
-                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(*connection_id),
                 _ => None,
             })
             .expect("server connection id");
@@ -1017,13 +1015,11 @@ fn native_proto_driver_remote_close_marks_peer_connection_closed() {
             .expect("connect for test");
         exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
 
-        let server_conn = server
-            .drain_events(64)
-            .await
-            .expect("server events")
-            .into_iter()
+        let server_initial_events = server.drain_events(64).await.expect("server events");
+        let server_conn = server_initial_events
+            .iter()
             .find_map(|event| match event {
-                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(*connection_id),
                 _ => None,
             })
             .expect("server connection id");
@@ -1068,13 +1064,11 @@ fn native_proto_driver_remote_close_emits_connection_closed_event() {
             .expect("connect for test");
         exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
 
-        let server_conn = server
-            .drain_events(64)
-            .await
-            .expect("server events")
-            .into_iter()
+        let server_initial_events = server.drain_events(64).await.expect("server events");
+        let server_conn = server_initial_events
+            .iter()
             .find_map(|event| match event {
-                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(*connection_id),
                 _ => None,
             })
             .expect("server connection id");
@@ -1092,6 +1086,66 @@ fn native_proto_driver_remote_close_emits_connection_closed_event() {
                 NativeProtoEvent::ConnectionClosed { connection_id } if *connection_id == client_conn
             )),
             "peer close should emit ConnectionClosed event for client-side connection id"
+        );
+    });
+}
+
+#[test]
+fn native_proto_driver_connected_event_marks_connection_established() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5686);
+        let client_addr = localhost_addr(5687);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let mut server_initial_events = server.drain_events(64).await.expect("server events");
+        let server_conn = server_initial_events
+            .iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(*connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        let client_state = client.connection_state(client_conn).await.expect("client state");
+        let server_state = server.connection_state(server_conn).await.expect("server state");
+        assert!(client_state.established);
+        assert!(server_state.established);
+
+        let client_events = client.drain_events(64).await.expect("client events");
+        let mut server_events = server.drain_events(64).await.expect("server events");
+        server_initial_events.append(&mut server_events);
+        assert!(
+            client_events.iter().any(|event| matches!(
+                event,
+                NativeProtoEvent::ConnectionEstablished { connection_id } if *connection_id == client_conn
+            )),
+            "client should emit ConnectionEstablished"
+        );
+        assert!(
+            server_initial_events.iter().any(|event| matches!(
+                event,
+                NativeProtoEvent::ConnectionEstablished { connection_id } if *connection_id == server_conn
+            )),
+            "server should emit ConnectionEstablished"
         );
     });
 }
@@ -1143,6 +1197,97 @@ fn native_proto_driver_close_transitions_increment_closed_stats() {
         let client_stats = client.stats().await.expect("client stats");
         assert_eq!(server_stats.connections_closed, 1);
         assert_eq!(client_stats.connections_closed, 1);
+    });
+}
+
+#[test]
+fn native_proto_driver_stream_write_read_roundtrip_over_proto_connection() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5696);
+        let client_addr = localhost_addr(5697);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let server_conn = server
+            .drain_events(64)
+            .await
+            .expect("server events")
+            .into_iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        let (client_send, client_recv) = client
+            .open_bi_on_connection(client_conn)
+            .await
+            .expect("client open bi");
+        client
+            .write_stream_on_connection(client_conn, client_send, b"native-stream".to_vec())
+            .await
+            .expect("client stream write");
+        client
+            .finish_stream(client_conn, client_send)
+            .await
+            .expect("client finish");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let (server_send, server_recv) = server
+            .accept_bi_on_connection(server_conn)
+            .await
+            .expect("server accept bi");
+        let server_read = server
+            .read_stream_on_connection(server_conn, server_recv, 128)
+            .await
+            .expect("server read")
+            .expect("server chunk");
+        assert_eq!(server_read, b"native-stream");
+        let server_eof = server
+            .read_stream_on_connection(server_conn, server_recv, 128)
+            .await
+            .expect("server eof read");
+        assert!(server_eof.is_none(), "server should observe eof after finish");
+
+        server
+            .write_stream_on_connection(server_conn, server_send, b"native-ack".to_vec())
+            .await
+            .expect("server stream write");
+        server
+            .finish_stream(server_conn, server_send)
+            .await
+            .expect("server finish");
+        exchange_driver_transmits(&server, server_addr, &client, client_addr, 64).await;
+
+        let client_read = client
+            .read_stream_on_connection(client_conn, client_recv, 128)
+            .await
+            .expect("client read")
+            .expect("client chunk");
+        assert_eq!(client_read, b"native-ack");
+        let client_eof = client
+            .read_stream_on_connection(client_conn, client_recv, 128)
+            .await
+            .expect("client eof read");
+        assert!(client_eof.is_none(), "client should observe eof after finish");
     });
 }
 
