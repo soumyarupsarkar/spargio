@@ -317,7 +317,12 @@ fn quic_connection_native_backend_dispatches_connection_ops() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_before = server.metrics_snapshot();
@@ -374,7 +379,12 @@ fn quic_connection_bridge_backend_dispatches_connection_ops() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_before = server.metrics_snapshot();
@@ -1030,7 +1040,10 @@ fn native_proto_driver_remote_close_marks_peer_connection_closed() {
             .expect("server close");
         exchange_driver_transmits(&server, server_addr, &client, client_addr, 64).await;
 
-        let client_state = client.connection_state(client_conn).await.expect("client state");
+        let client_state = client
+            .connection_state(client_conn)
+            .await
+            .expect("client state");
         assert!(
             client_state.closed,
             "peer close should be reflected in client-side connection state"
@@ -1125,8 +1138,14 @@ fn native_proto_driver_connected_event_marks_connection_established() {
             })
             .expect("server connection id");
 
-        let client_state = client.connection_state(client_conn).await.expect("client state");
-        let server_state = server.connection_state(server_conn).await.expect("server state");
+        let client_state = client
+            .connection_state(client_conn)
+            .await
+            .expect("client state");
+        let server_state = server
+            .connection_state(server_conn)
+            .await
+            .expect("server state");
         assert!(client_state.established);
         assert!(server_state.established);
 
@@ -1265,7 +1284,10 @@ fn native_proto_driver_stream_write_read_roundtrip_over_proto_connection() {
             .read_stream_on_connection(server_conn, server_recv, 128)
             .await
             .expect("server eof read");
-        assert!(server_eof.is_none(), "server should observe eof after finish");
+        assert!(
+            server_eof.is_none(),
+            "server should observe eof after finish"
+        );
 
         server
             .write_stream_on_connection(server_conn, server_send, b"native-ack".to_vec())
@@ -1287,7 +1309,10 @@ fn native_proto_driver_stream_write_read_roundtrip_over_proto_connection() {
             .read_stream_on_connection(client_conn, client_recv, 128)
             .await
             .expect("client eof read");
-        assert!(client_eof.is_none(), "client should observe eof after finish");
+        assert!(
+            client_eof.is_none(),
+            "client should observe eof after finish"
+        );
     });
 }
 
@@ -1350,8 +1375,14 @@ fn native_proto_driver_post_handshake_datagram_roundtrip_tracks_state() {
             .expect("client recv datagram");
         assert_eq!(client_incoming, b"s2c-dgram");
 
-        let client_state = client.connection_state(client_conn).await.expect("client state");
-        let server_state = server.connection_state(server_conn).await.expect("server state");
+        let client_state = client
+            .connection_state(client_conn)
+            .await
+            .expect("client state");
+        let server_state = server
+            .connection_state(server_conn)
+            .await
+            .expect("server state");
         assert_eq!(client_state.datagrams_sent, 1);
         assert_eq!(client_state.datagrams_received, 1);
         assert_eq!(server_state.datagrams_sent, 1);

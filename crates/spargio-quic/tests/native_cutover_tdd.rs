@@ -31,7 +31,12 @@ fn native_backend_data_path_avoids_bridge_task_spawn() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_task = async {
@@ -88,7 +93,12 @@ fn bridge_backend_data_path_uses_bridge_task_spawn() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_task = async {
@@ -141,7 +151,12 @@ fn native_backend_endpoint_lifecycle_avoids_bridge_runtime_context_entry() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_task = async {
@@ -201,7 +216,12 @@ fn bridge_backend_endpoint_lifecycle_uses_bridge_runtime_context_entry() {
                     .expect("accept")
                     .expect("incoming connection")
             },
-            async { client.connect(server_addr, "localhost").await.expect("connect") },
+            async {
+                client
+                    .connect(server_addr, "localhost")
+                    .await
+                    .expect("connect")
+            },
         );
 
         let server_task = async {
