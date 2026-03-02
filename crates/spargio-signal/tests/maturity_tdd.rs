@@ -26,7 +26,7 @@ fn signal_hub_broadcasts_to_multiple_subscribers() {
 
 #[test]
 fn signal_stream_recv_timeout_returns_none() {
-    let hub = SignalHub::new([signal_hook::consts::SIGUSR2]).expect("hub");
+    let hub = SignalHub::new([signal_hook::consts::SIGWINCH]).expect("hub");
     let stream = hub.subscribe();
     let got = block_on(async {
         stream
@@ -46,4 +46,25 @@ fn ctrl_c_stream_still_constructs() {
             .expect_err("expected timeout")
     });
     assert_eq!(err, spargio::TimeoutError);
+}
+
+#[test]
+fn signal_stream_recv_matching_filters_unwanted_signal() {
+    let hub =
+        SignalHub::new([signal_hook::consts::SIGUSR1, signal_hook::consts::SIGUSR2]).expect("hub");
+    let stream = hub.subscribe();
+
+    signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("raise usr1");
+    signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("raise usr2");
+
+    let got = block_on(async {
+        spargio::timeout(
+            Duration::from_millis(250),
+            stream.recv_matching(&[signal_hook::consts::SIGUSR2]),
+        )
+        .await
+        .expect("timeout")
+        .expect("recv matching")
+    });
+    assert_eq!(got, signal_hook::consts::SIGUSR2);
 }

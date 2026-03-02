@@ -1,5 +1,8 @@
 use futures::executor::block_on;
-use spargio_protocols::{BlockingOptions, tls_blocking_with_options};
+use spargio_protocols::{
+    BlockingOptions, quic_blocking_with_options, tls_blocking_with_options,
+    ws_blocking_with_options,
+};
 use std::io;
 use std::time::Duration;
 
@@ -21,6 +24,52 @@ fn blocking_options_enforce_timeout() {
 
     let err = block_on(async {
         tls_blocking_with_options(
+            &rt.handle(),
+            BlockingOptions::default().with_timeout(Duration::from_millis(5)),
+            || {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok::<usize, io::Error>(1)
+            },
+        )
+        .await
+        .expect_err("expected timeout")
+    });
+
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn ws_blocking_options_enforce_timeout() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    let err = block_on(async {
+        ws_blocking_with_options(
+            &rt.handle(),
+            BlockingOptions::default().with_timeout(Duration::from_millis(5)),
+            || {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok::<usize, io::Error>(1)
+            },
+        )
+        .await
+        .expect_err("expected timeout")
+    });
+
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn quic_blocking_options_enforce_timeout() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    let err = block_on(async {
+        quic_blocking_with_options(
             &rt.handle(),
             BlockingOptions::default().with_timeout(Duration::from_millis(5)),
             || {

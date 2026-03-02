@@ -54,3 +54,33 @@ fn spawned_child_wait_timeout_is_enforced() {
     });
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 }
+
+#[test]
+fn child_output_consumes_handle_and_followup_wait_fails() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    let err = block_on(async {
+        let child = if cfg!(windows) {
+            CommandBuilder::new("cmd")
+                .args(["/C", "echo hello"])
+                .spawn(&rt.handle())
+                .await
+                .expect("spawn")
+        } else {
+            CommandBuilder::new("sh")
+                .args(["-c", "echo hello"])
+                .spawn(&rt.handle())
+                .await
+                .expect("spawn")
+        };
+        let _ = child.output().await.expect("output");
+        child
+            .wait()
+            .await
+            .expect_err("wait should fail after output consumed")
+    });
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+}

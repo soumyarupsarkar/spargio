@@ -106,3 +106,62 @@ fn ws_client_server_roundtrip_text_message() {
         server.await.expect("server");
     });
 }
+
+#[test]
+fn ws_client_connect_socket_addr_normalizes_path_without_slash() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let handle = rt.handle();
+
+    block_on(async {
+        let listener = TcpListener::bind_socket_addr(
+            handle.clone(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .await
+        .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = handle
+            .spawn_stealable({
+                let listener = listener.clone();
+                async move {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut ws = accept_with_options(
+                        stream,
+                        WsOptions::default().with_timeout(Duration::from_millis(250)),
+                    )
+                    .await
+                    .expect("ws accept");
+                    if let Some(Ok(Message::Text(text))) = ws.next().await {
+                        ws.send(Message::Text(text)).await.expect("send");
+                    } else {
+                        panic!("expected text frame");
+                    }
+                }
+            })
+            .expect("spawn");
+
+        let (mut client, _response) = connect_socket_addr_with_options(
+            handle.clone(),
+            addr,
+            "chat",
+            WsOptions::default().with_timeout(Duration::from_millis(250)),
+        )
+        .await
+        .expect("connect");
+
+        client
+            .send(Message::Text("path-ok".into()))
+            .await
+            .expect("client send");
+        match client.next().await {
+            Some(Ok(Message::Text(text))) => assert_eq!(text, "path-ok"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        server.await.expect("server");
+    });
+}

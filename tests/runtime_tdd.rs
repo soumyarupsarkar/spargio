@@ -575,6 +575,25 @@ fn runtime_builder_thread_affinity_option_builds_runtime() {
     drop(rt);
 }
 
+#[test]
+fn runtime_builder_steal_victim_stride_is_reported_and_clamped() {
+    let clamped = Runtime::builder()
+        .shards(2)
+        .steal_victim_stride(0)
+        .build()
+        .expect("runtime");
+    let clamped_stats = clamped.handle().stats_snapshot();
+    assert_eq!(clamped_stats.steal_victim_stride, 1);
+
+    let configured = Runtime::builder()
+        .shards(2)
+        .steal_victim_stride(3)
+        .build()
+        .expect("runtime");
+    let configured_stats = configured.handle().stats_snapshot();
+    assert_eq!(configured_stats.steal_victim_stride, 3);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coalesced_hot_count_accumulates_across_batches() {
     const HOT_TAG: u16 = 61;

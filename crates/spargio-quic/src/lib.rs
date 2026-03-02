@@ -1,9 +1,11 @@
 //! QUIC companion APIs for spargio runtimes.
 //!
-//! This crate keeps a practical `quinn` integration path while moving toward a
-//! native long-term design. It now provides:
-//! - a persistent Tokio bridge executor (no per-call runtime creation),
-//! - endpoint/connection wrappers with stream/datagram helpers,
+//! This crate provides a native-default QUIC path backed by `quinn-proto`
+//! (`NativeProtoDriver` + UDP ingress/egress/timer pump), plus an explicit
+//! bridge fallback path for compatibility. It now provides:
+//! - native-default endpoint/connection wrappers with stream/datagram helpers,
+//! - explicit bridge backend (`QuicBackend::Bridge`) using a persistent Tokio
+//!   bridge executor (no per-call runtime creation),
 //! - per-endpoint metrics snapshots and in-flight backpressure limits,
 //! - explicit local (`!Send`) and send-handoff connection wrappers.
 

@@ -963,6 +963,7 @@ pub struct RuntimeStats {
     pub stealable_backpressure: u64,
     pub steal_attempts: u64,
     pub steal_success: u64,
+    pub steal_victim_stride: usize,
     pub ring_msgs_submitted: u64,
     pub ring_msgs_completed: u64,
     pub ring_msgs_failed: u64,
@@ -1030,6 +1031,7 @@ pub struct RuntimeBuilder {
     hot_counter_wake_threshold: u64,
     stealable_queue_capacity: usize,
     steal_budget: usize,
+    steal_victim_stride: usize,
     #[cfg(target_os = "linux")]
     io_uring: IoUringBuildConfig,
 }
@@ -1048,6 +1050,7 @@ impl Default for RuntimeBuilder {
             hot_counter_wake_threshold: 1,
             stealable_queue_capacity: 4096,
             steal_budget: 64,
+            steal_victim_stride: 1,
             #[cfg(target_os = "linux")]
             io_uring: IoUringBuildConfig::default(),
         }
@@ -1136,6 +1139,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn steal_victim_stride(mut self, stride: usize) -> Self {
+        self.steal_victim_stride = stride.max(1);
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub fn io_uring_sqpoll(mut self, idle_ms: Option<u32>) -> Self {
         self.io_uring.sqpoll_idle_ms = idle_ms;
@@ -1202,7 +1210,10 @@ impl RuntimeBuilder {
         let hot_msg_tags = Arc::new(hot_msg_tag_bits);
         let coalesced_hot_msg_tags =
             Arc::new(build_hot_msg_tag_lookup(&self.coalesced_hot_msg_tags));
-        let stats = Arc::new(RuntimeStatsInner::new(self.shards));
+        let stats = Arc::new(RuntimeStatsInner::new(
+            self.shards,
+            self.steal_victim_stride,
+        ));
 
         let shared = Arc::new(RuntimeShared {
             runtime_id,
@@ -1290,6 +1301,7 @@ impl RuntimeBuilder {
                                 coalesced_hot_msg_tags,
                                 self.hot_counter_wake_threshold,
                                 self.steal_budget,
+                                self.steal_victim_stride,
                                 backend,
                                 stats,
                             )
@@ -2752,10 +2764,22 @@ pub mod fs {
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const READ_TO_END_CHUNK: usize = 64 * 1024;
+    static CREATE_DIR_ALL_BLOCKING_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    #[doc(hidden)]
+    pub fn create_dir_all_blocking_fallback_count_for_test() -> u64 {
+        CREATE_DIR_ALL_BLOCKING_FALLBACK_COUNT.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_create_dir_all_blocking_fallback_count_for_test() {
+        CREATE_DIR_ALL_BLOCKING_FALLBACK_COUNT.store(0, Ordering::Relaxed);
+    }
 
     #[derive(Debug, Clone, Copy, Default)]
     pub struct OpenOptions {
@@ -2970,8 +2994,43 @@ pub mod fs {
     }
 
     pub async fn create_dir_all<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
-        let path = path.as_ref().to_path_buf();
-        run_blocking(handle, move || std::fs::create_dir_all(path)).await
+        let path_ref = path.as_ref();
+        if path_ref.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        // Preserve std behavior for complex relative forms (`.`/`..`) by
+        // using the compatibility blocking path.
+        if path_ref.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        }) {
+            CREATE_DIR_ALL_BLOCKING_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            let path = path_ref.to_path_buf();
+            return run_blocking(handle, move || std::fs::create_dir_all(path)).await;
+        }
+
+        let mut current = PathBuf::new();
+        for component in path_ref.components() {
+            match component {
+                Component::RootDir => {
+                    current.push(component.as_os_str());
+                    continue;
+                }
+                Component::Normal(part) => current.push(part),
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => continue,
+            }
+
+            match create_dir(handle, &current).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn remove_file<P: AsRef<Path>>(handle: &RuntimeHandle, path: P) -> io::Result<()> {
@@ -4783,6 +4842,7 @@ struct RuntimeStatsInner {
     stealable_backpressure: AtomicU64,
     steal_attempts: AtomicU64,
     steal_success: AtomicU64,
+    steal_victim_stride: usize,
     ring_msgs_submitted: AtomicU64,
     ring_msgs_completed: AtomicU64,
     ring_msgs_failed: AtomicU64,
@@ -4792,7 +4852,7 @@ struct RuntimeStatsInner {
 }
 
 impl RuntimeStatsInner {
-    fn new(shards: usize) -> Self {
+    fn new(shards: usize, steal_victim_stride: usize) -> Self {
         let mut shard_command_depths = Vec::with_capacity(shards);
         let mut pending_native_ops_by_shard = Vec::with_capacity(shards);
         for _ in 0..shards {
@@ -4813,6 +4873,7 @@ impl RuntimeStatsInner {
             stealable_backpressure: AtomicU64::new(0),
             steal_attempts: AtomicU64::new(0),
             steal_success: AtomicU64::new(0),
+            steal_victim_stride: steal_victim_stride.max(1),
             ring_msgs_submitted: AtomicU64::new(0),
             ring_msgs_completed: AtomicU64::new(0),
             ring_msgs_failed: AtomicU64::new(0),
@@ -4850,6 +4911,7 @@ impl RuntimeStatsInner {
             stealable_backpressure: self.stealable_backpressure.load(Ordering::Relaxed),
             steal_attempts: self.steal_attempts.load(Ordering::Relaxed),
             steal_success: self.steal_success.load(Ordering::Relaxed),
+            steal_victim_stride: self.steal_victim_stride,
             ring_msgs_submitted: self.ring_msgs_submitted.load(Ordering::Relaxed),
             ring_msgs_completed: self.ring_msgs_completed.load(Ordering::Relaxed),
             ring_msgs_failed: self.ring_msgs_failed.load(Ordering::Relaxed),
@@ -8801,6 +8863,7 @@ fn run_shard(
     coalesced_hot_msg_tags: Arc<Vec<bool>>,
     hot_counter_wake_threshold: u64,
     steal_budget: usize,
+    steal_victim_stride: usize,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
 ) {
@@ -8850,6 +8913,7 @@ fn run_shard(
             shard_id,
             &stealable_deques,
             steal_budget,
+            steal_victim_stride,
             &mut steal_cursor,
             &spawner,
             &stats,
@@ -8908,6 +8972,7 @@ fn run_shard(
                 shard_id,
                 &stealable_deques,
                 steal_budget,
+                steal_victim_stride,
                 &mut steal_cursor,
                 &spawner,
                 &stats,
@@ -8928,6 +8993,7 @@ fn run_shard(
             shard_id,
             &stealable_deques,
             steal_budget,
+            steal_victim_stride,
             &mut steal_cursor,
             &spawner,
             &stats,
@@ -9016,6 +9082,7 @@ fn drain_stealable_tasks(
     shard_id: ShardId,
     stealable_deques: &StealableInboxes,
     steal_budget: usize,
+    steal_victim_stride: usize,
     steal_cursor: &mut usize,
     spawner: &LocalSpawner,
     stats: &RuntimeStatsInner,
@@ -9059,14 +9126,16 @@ fn drain_stealable_tasks(
     }
 
     let shard_count = stealable_deques.len();
+    let stride = steal_victim_stride.max(1) % shard_count.max(1);
+    let stride = if stride == 0 { 1 } else { stride };
     let max_attempts = shard_count.saturating_sub(1);
     let mut attempts = 0usize;
     while remaining > 0 && attempts < max_attempts {
         let mut victim_idx = *steal_cursor % shard_count;
-        *steal_cursor = (*steal_cursor + 1) % shard_count;
+        *steal_cursor = (*steal_cursor + stride) % shard_count;
         if victim_idx == local_idx {
             victim_idx = *steal_cursor % shard_count;
-            *steal_cursor = (*steal_cursor + 1) % shard_count;
+            *steal_cursor = (*steal_cursor + stride) % shard_count;
         }
         if victim_idx == local_idx {
             break;
