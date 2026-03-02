@@ -8,7 +8,7 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
 futures = "0.3"
-spargio = { path = "../.." }
+spargio = { version = "0.3.0", path = "../.." }
 
 [features]
 default = []

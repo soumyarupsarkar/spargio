@@ -36,26 +36,39 @@ jobs:
             exit 1
           fi
 
-      - name: Publish spargio-macros
+      - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
+
+          dry_run=false
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --manifest-path spargio-macros/Cargo.toml --dry-run
-          else
-            cargo publish --manifest-path spargio-macros/Cargo.toml
+            dry_run=true
           fi
 
-      - name: Wait for crates.io index propagation
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: sleep 30
+          publish_manifest() {
+            local manifest="$1"
+            echo "Publishing ${manifest}"
+            if [ "${dry_run}" = "true" ]; then
+              cargo publish --manifest-path "${manifest}" --dry-run \
+                --config 'patch.crates-io.spargio.path="."' \
+                --config 'patch.crates-io.spargio-macros.path="spargio-macros"' \
+                --config 'patch.crates-io.spargio-protocols.path="crates/spargio-protocols"'
+            else
+              cargo publish --manifest-path "${manifest}"
+              # Let crates.io index propagate before dependent crates.
+              sleep 30
+            fi
+          }
 
-      - name: Publish spargio
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run
-          else
-            cargo publish
-          fi
+          # Dependency order:
+          # spargio-macros -> spargio -> spargio-protocols -> (signal/process/quic) -> (tls/ws)
+          publish_manifest "spargio-macros/Cargo.toml"
+          publish_manifest "Cargo.toml"
+          publish_manifest "crates/spargio-protocols/Cargo.toml"
+          publish_manifest "crates/spargio-signal/Cargo.toml"
+          publish_manifest "crates/spargio-process/Cargo.toml"
+          publish_manifest "crates/spargio-quic/Cargo.toml"
+          publish_manifest "crates/spargio-tls/Cargo.toml"
+          publish_manifest "crates/spargio-ws/Cargo.toml"

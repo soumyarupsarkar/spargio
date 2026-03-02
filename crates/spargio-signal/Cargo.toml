@@ -8,7 +8,7 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
 signal-hook = "0.3"
-spargio = { path = "../.." }
+spargio = { version = "0.3.0", path = "../.." }
 
 [dev-dependencies]
 futures = "0.3"

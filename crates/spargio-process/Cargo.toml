@@ -7,7 +7,7 @@ description = "Process companion crate for spargio"
 repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
-spargio = { path = "../.." }
+spargio = { version = "0.3.0", path = "../.." }
 
 [dev-dependencies]
 futures = "0.3"
