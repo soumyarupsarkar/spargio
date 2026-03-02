@@ -7293,3 +7293,41 @@ Executed and passing:
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic --test soak_tdd`
 - `cargo test -p spargio-quic`
+
+## Update: R2 continuation (connection-closed lifecycle event) with Red/Green TDD (2026-03-02)
+
+Implemented another native-proto lifecycle slice so remote close transitions are
+observable through the event stream, not only via polled connection state.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_remote_close_emits_connection_closed_event`
+
+Initial red behavior:
+
+- peer close updated no lifecycle event; client-side event drain only contained
+  prior events such as registration, with no explicit close transition signal.
+
+### Green phase
+
+Updated `crates/spargio-quic/src/lib.rs`:
+
+- extended `NativeProtoEvent` with:
+  - `ConnectionClosed { connection_id: u64 }`
+- explicit close command path now emits `ConnectionClosed` exactly once when a
+  tracked connection transitions from open to closed.
+- protocol-driven close path in `drive_native_proto_connections(...)` now emits
+  `ConnectionClosed` on `quinn_proto::Event::ConnectionLost` before handle
+  retirement and mapping cleanup.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_remote_close_emits_connection_closed_event -- --exact`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic`

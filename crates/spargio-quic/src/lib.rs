@@ -287,6 +287,7 @@ pub struct NativeProtoStats {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum NativeProtoEvent {
     ConnectionRegistered { connection_id: u64 },
+    ConnectionClosed { connection_id: u64 },
     TimeoutFired { generation: u64 },
     OversizedDatagram { size: usize, max_size: usize },
     Backpressure { scope: &'static str },
@@ -1622,7 +1623,11 @@ async fn native_proto_driver_loop(
             } => {
                 commands_processed = commands_processed.saturating_add(1);
                 let mut should_drive = false;
+                let mut emit_connection_closed = false;
                 let mut result = if let Some(conn) = connections.get_mut(&connection_id) {
+                    if !conn.state.closed {
+                        emit_connection_closed = true;
+                    }
                     conn.state.closed = true;
                     conn.pending_uni_accept.clear();
                     conn.pending_bi_accept.clear();
@@ -1645,6 +1650,12 @@ async fn native_proto_driver_loop(
                         format!("unknown native proto connection {connection_id}"),
                     ))
                 };
+                if emit_connection_closed {
+                    push_native_event(
+                        &mut events,
+                        NativeProtoEvent::ConnectionClosed { connection_id },
+                    );
+                }
                 if result.is_ok() && should_drive {
                     let now_std = native_proto_now(epoch, now);
                     if let Err(err) = drive_native_proto_connections(
@@ -2412,11 +2423,21 @@ fn drive_native_proto_connections(
             while let Some(event) = connection.poll() {
                 if let quinn_proto::Event::ConnectionLost { .. } = event {
                     if let Some(connection_id) = connection_id_by_handle.get(&handle).copied() {
+                        let mut emit_connection_closed = false;
                         if let Some(connection) = connections.get_mut(&connection_id) {
+                            if !connection.state.closed {
+                                emit_connection_closed = true;
+                            }
                             connection.state.closed = true;
                             connection.pending_uni_accept.clear();
                             connection.pending_bi_accept.clear();
                             connection.pending_datagrams.clear();
+                        }
+                        if emit_connection_closed {
+                            push_native_event(
+                                events,
+                                NativeProtoEvent::ConnectionClosed { connection_id },
+                            );
                         }
                         handle_by_connection_id.remove(&connection_id);
                     }

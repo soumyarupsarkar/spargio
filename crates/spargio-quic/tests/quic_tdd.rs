@@ -1043,6 +1043,60 @@ fn native_proto_driver_remote_close_marks_peer_connection_closed() {
 }
 
 #[test]
+fn native_proto_driver_remote_close_emits_connection_closed_event() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5680);
+        let client_addr = localhost_addr(5681);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let server_conn = server
+            .drain_events(64)
+            .await
+            .expect("server events")
+            .into_iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        server
+            .close_connection_for_test(server_conn)
+            .await
+            .expect("server close");
+        exchange_driver_transmits(&server, server_addr, &client, client_addr, 64).await;
+
+        let client_events = client.drain_events(64).await.expect("client events");
+        assert!(
+            client_events.iter().any(|event| matches!(
+                event,
+                NativeProtoEvent::ConnectionClosed { connection_id } if *connection_id == client_conn
+            )),
+            "peer close should emit ConnectionClosed event for client-side connection id"
+        );
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)
