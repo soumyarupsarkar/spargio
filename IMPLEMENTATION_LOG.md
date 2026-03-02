@@ -7250,3 +7250,46 @@ Executed and passing:
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
 - `cargo test --test docs_tdd`
+
+## Update: R2 continuation (remote close propagation into native connection state) with Red/Green TDD (2026-03-02)
+
+Implemented another R2 protocol-progression slice so a peer-initiated close is
+observable through `NativeProtoConnectionState.closed` on the remote side.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_remote_close_marks_peer_connection_closed`
+
+Initial red behavior:
+
+- server `close_connection_for_test(...)` produced close traffic, but the client
+  driver never reflected `ConnectionLost` into its tracked synthetic connection
+  state, so `connection_state(...).closed` remained `false`.
+
+### Green phase
+
+Updated `crates/spargio-quic/src/lib.rs`:
+
+- wired reverse mapping `connection_id_by_handle` for all protocol-backed
+  connection registrations (`connect_for_test` and server accept path).
+- extended `drive_native_proto_connections(...)` to poll application events via
+  `quinn_proto::Connection::poll()` and handle `Event::ConnectionLost`.
+- on connection-lost:
+  - mark corresponding `NativeProtoConnectionState.closed = true`.
+  - clear pending synthetic queues for that connection.
+  - remove handle mappings and protocol connection state while preserving
+    synthetic connection ID visibility for state queries.
+- ensured explicit close-path teardown also removes reverse handle mappings.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_remote_close_marks_peer_connection_closed -- --exact`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic --test soak_tdd`
+- `cargo test -p spargio-quic`

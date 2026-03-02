@@ -1246,6 +1246,7 @@ async fn native_proto_driver_loop(
         VecDeque<quinn_proto::ConnectionEvent>,
     > = HashMap::new();
     let mut handle_by_connection_id: HashMap<u64, quinn_proto::ConnectionHandle> = HashMap::new();
+    let mut connection_id_by_handle: HashMap<quinn_proto::ConnectionHandle, u64> = HashMap::new();
     let mut tuning = NativeProtoTransportTuning::default();
     let mut stats = NativeProtoStats::default();
     let mut events: VecDeque<NativeProtoEvent> = VecDeque::new();
@@ -1348,6 +1349,7 @@ async fn native_proto_driver_loop(
                                     next_connection_id = next_connection_id.saturating_add(1);
                                     connections.entry(connection_id).or_default();
                                     handle_by_connection_id.insert(connection_id, handle);
+                                    connection_id_by_handle.insert(handle, connection_id);
                                     proto_connections.insert(handle, connection);
                                     stats.connections_registered =
                                         stats.connections_registered.saturating_add(1);
@@ -1433,6 +1435,9 @@ async fn native_proto_driver_loop(
                     Ok(()) => match drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -1523,6 +1528,9 @@ async fn native_proto_driver_loop(
                 let _ = drive_native_proto_connections(
                     now_std,
                     &mut endpoint,
+                    &mut connections,
+                    &mut handle_by_connection_id,
+                    &mut connection_id_by_handle,
                     &mut proto_connections,
                     &mut proto_connection_events,
                     &mut pending_transmits,
@@ -1576,6 +1584,7 @@ async fn native_proto_driver_loop(
                             next_connection_id = next_connection_id.saturating_add(1);
                             connections.entry(connection_id).or_default();
                             handle_by_connection_id.insert(connection_id, handle);
+                            connection_id_by_handle.insert(handle, connection_id);
                             proto_connections.insert(handle, connection);
                             stats.connections_registered =
                                 stats.connections_registered.saturating_add(1);
@@ -1586,6 +1595,9 @@ async fn native_proto_driver_loop(
                             match drive_native_proto_connections(
                                 now_std,
                                 &mut endpoint,
+                                &mut connections,
+                                &mut handle_by_connection_id,
+                                &mut connection_id_by_handle,
                                 &mut proto_connections,
                                 &mut proto_connection_events,
                                 &mut pending_transmits,
@@ -1638,6 +1650,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -1652,6 +1667,7 @@ async fn native_proto_driver_loop(
                     }
                 }
                 if let Some(handle) = handle_by_connection_id.remove(&connection_id) {
+                    connection_id_by_handle.remove(&handle);
                     proto_connections.remove(&handle);
                     proto_connection_events.remove(&handle);
                 }
@@ -1739,6 +1755,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -1860,6 +1879,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -1982,6 +2004,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -2106,6 +2131,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -2190,6 +2218,9 @@ async fn native_proto_driver_loop(
                     if let Err(err) = drive_native_proto_connections(
                         now_std,
                         &mut endpoint,
+                        &mut connections,
+                        &mut handle_by_connection_id,
+                        &mut connection_id_by_handle,
                         &mut proto_connections,
                         &mut proto_connection_events,
                         &mut pending_transmits,
@@ -2320,6 +2351,9 @@ fn native_proto_now(epoch: std::time::Instant, now: Duration) -> std::time::Inst
 fn drive_native_proto_connections(
     now: std::time::Instant,
     endpoint: &mut quinn_proto::Endpoint,
+    connections: &mut HashMap<u64, NativeProtoConnectionPump>,
+    handle_by_connection_id: &mut HashMap<u64, quinn_proto::ConnectionHandle>,
+    connection_id_by_handle: &mut HashMap<quinn_proto::ConnectionHandle, u64>,
     proto_connections: &mut HashMap<quinn_proto::ConnectionHandle, quinn_proto::Connection>,
     proto_connection_events: &mut HashMap<
         quinn_proto::ConnectionHandle,
@@ -2336,6 +2370,7 @@ fn drive_native_proto_connections(
     let mut generated = 0usize;
     loop {
         let mut endpoint_events = Vec::new();
+        let mut retired_handles = Vec::new();
         let handles = proto_connections.keys().copied().collect::<Vec<_>>();
         for handle in handles {
             let Some(connection) = proto_connections.get_mut(&handle) else {
@@ -2374,8 +2409,28 @@ fn drive_native_proto_connections(
                 }
                 scratch.clear();
             }
+            while let Some(event) = connection.poll() {
+                if let quinn_proto::Event::ConnectionLost { .. } = event {
+                    if let Some(connection_id) = connection_id_by_handle.get(&handle).copied() {
+                        if let Some(connection) = connections.get_mut(&connection_id) {
+                            connection.state.closed = true;
+                            connection.pending_uni_accept.clear();
+                            connection.pending_bi_accept.clear();
+                            connection.pending_datagrams.clear();
+                        }
+                        handle_by_connection_id.remove(&connection_id);
+                    }
+                    retired_handles.push(handle);
+                    break;
+                }
+            }
         }
         if endpoint_events.is_empty() {
+            for handle in retired_handles {
+                proto_connections.remove(&handle);
+                proto_connection_events.remove(&handle);
+                connection_id_by_handle.remove(&handle);
+            }
             break;
         }
         for (handle, endpoint_event) in endpoint_events {
@@ -2389,6 +2444,11 @@ fn drive_native_proto_connections(
                         .push_back(connection_event);
                 }
             }
+        }
+        for handle in retired_handles {
+            proto_connections.remove(&handle);
+            proto_connection_events.remove(&handle);
+            connection_id_by_handle.remove(&handle);
         }
     }
     Ok(generated)
