@@ -7154,3 +7154,60 @@ Executed and passing:
 - `cargo test -p spargio-quic --test quic_tdd`
 - `cargo test -p spargio-quic --test native_cutover_tdd`
 - `cargo test -p spargio-quic --test interop_tdd`
+
+## Update: R2 continuation (payload-carrying transmits + server-accept path) with Red/Green TDD (2026-03-01)
+
+Implemented the next native-proto progression slice so driver transmits include
+actual datagram payload bytes, and so a driver configured with server config can
+accept client `connect_for_test` traffic over the same command surface.
+
+### Red phase
+
+Added failing test in `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_server_config_accepts_client_transmits`
+
+Initial red failure surfaced a protocol gap:
+
+- `submit_datagram(...)` incorrectly enforced app-datagram tuning limits on raw
+  protocol ingress datagrams, rejecting valid Initial packets.
+
+### Green phase
+
+Updated `crates/spargio-quic/src/lib.rs`:
+
+- `NativeProtoDriverOptions` now supports optional server mode:
+  - added `server_config: Option<quinn::ServerConfig>`
+  - added `with_server_config(...)`
+- owner loop now initializes endpoint with optional server config and allows
+  incoming accepts when configured.
+- `NativeProtoTransmit` now carries `payload: Vec<u8>` in addition to metadata.
+- `push_native_transmit(...)` and all transmit producers now preserve payload
+  bytes from scratch buffers (`transmit_payload(...)` helper).
+- `SubmitDatagram` `NewConnection` handling:
+  - when server-configured, uses `Endpoint::accept(...)` and registers the new
+    protocol connection handle + synthetic connection ID mapping.
+  - otherwise preserves explicit `refuse(...)` behavior.
+- corrected datagram-size semantics:
+  - removed tuning max-size enforcement from raw `submit_datagram(...)` ingress.
+  - kept/enforced tuning max-size on app datagram API
+    `send_datagram_on_connection_for_test(...)`, with stats/event accounting.
+
+Test updates:
+
+- updated `NativeProtoTransmit` test fixtures to include payload bytes.
+- adjusted oversized-datagram test to validate app-datagram path:
+  - `native_proto_driver_rejects_oversized_datagram_per_tuning` now uses
+    `send_datagram_on_connection_for_test(...)`.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_server_config_accepts_client_transmits`
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_rejects_oversized_datagram_per_tuning`
+- `cargo test -p spargio-quic --test quic_tdd`
+- `cargo test -p spargio-quic --test native_cutover_tdd`
+- `cargo test -p spargio-quic --test interop_tdd`
+- `cargo test -p spargio-quic`
+- `cargo test --test docs_tdd`

@@ -131,10 +131,11 @@ where
     spawn_on_bridge_runtime(options.timeout(), "quic bridge operation timed out", f).await
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NativeProtoDriverOptions {
     owner_shard: spargio::ShardId,
     max_pending_transmits: usize,
+    server_config: Option<quinn::ServerConfig>,
 }
 
 impl Default for NativeProtoDriverOptions {
@@ -142,6 +143,7 @@ impl Default for NativeProtoDriverOptions {
         Self {
             owner_shard: 0,
             max_pending_transmits: DEFAULT_MAX_INFLIGHT_OPS,
+            server_config: None,
         }
     }
 }
@@ -152,7 +154,7 @@ impl NativeProtoDriverOptions {
         self
     }
 
-    pub fn owner_shard(self) -> spargio::ShardId {
+    pub fn owner_shard(&self) -> spargio::ShardId {
         self.owner_shard
     }
 
@@ -161,8 +163,17 @@ impl NativeProtoDriverOptions {
         self
     }
 
-    pub fn max_pending_transmits(self) -> usize {
+    pub fn max_pending_transmits(&self) -> usize {
         self.max_pending_transmits
+    }
+
+    pub fn with_server_config(mut self, server_config: quinn::ServerConfig) -> Self {
+        self.server_config = Some(server_config);
+        self
+    }
+
+    pub fn server_config(&self) -> Option<quinn::ServerConfig> {
+        self.server_config.clone()
     }
 }
 
@@ -181,6 +192,7 @@ pub struct NativeProtoTransmit {
     pub size: usize,
     pub segment_size: Option<usize>,
     pub src_ip: Option<IpAddr>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -413,6 +425,8 @@ impl NativeProtoDriver {
         let closed = Arc::new(AtomicBool::new(false));
         let closed_for_task = closed.clone();
         let owner_shard = options.owner_shard();
+        let max_pending_transmits = options.max_pending_transmits();
+        let server_config = options.server_config();
 
         handle
             .spawn_local_on(owner_shard, move |ctx| async move {
@@ -421,7 +435,8 @@ impl NativeProtoDriver {
                     owner_shard,
                     ctx.shard_id(),
                     rx,
-                    options.max_pending_transmits(),
+                    max_pending_transmits,
+                    server_config,
                     closed_for_task,
                 )
                 .await;
@@ -1202,11 +1217,13 @@ async fn native_proto_driver_loop(
     executing_shard: spargio::ShardId,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<NativeProtoCommand>,
     max_pending_transmits: usize,
+    server_config: Option<quinn::ServerConfig>,
     closed: Arc<AtomicBool>,
 ) {
+    let allow_incoming_accept = server_config.is_some();
     let mut endpoint = quinn_proto::Endpoint::new(
         Arc::new(quinn_proto::EndpointConfig::default()),
-        None,
+        server_config.map(Arc::new),
         true,
         None,
     );
@@ -1266,25 +1283,6 @@ async fn native_proto_driver_loop(
             } => {
                 commands_processed = commands_processed.saturating_add(1);
                 let mut generated_transmits = 0usize;
-                if payload.len() > tuning.max_datagram_size {
-                    stats.datagrams_oversized = stats.datagrams_oversized.saturating_add(1);
-                    push_native_event(
-                        &mut events,
-                        NativeProtoEvent::OversizedDatagram {
-                            size: payload.len(),
-                            max_size: tuning.max_datagram_size,
-                        },
-                    );
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "datagram size {} exceeds max_datagram_size {}",
-                            payload.len(),
-                            tuning.max_datagram_size
-                        ),
-                    )));
-                    continue;
-                }
                 if fault_spec.drop_inbound {
                     fault_stats.inbound_dropped = fault_stats.inbound_dropped.saturating_add(1);
                     let _ = reply.send(Ok(NativeProtoIngressReport {
@@ -1311,9 +1309,11 @@ async fn native_proto_driver_loop(
                                 fault_stats.egress_dropped.saturating_add(1);
                             Ok(())
                         } else {
+                            let payload = transmit_payload(scratch.as_slice(), tx.size);
                             match push_native_transmit(
                                 &mut pending_transmits,
                                 tx,
+                                payload,
                                 max_pending_transmits,
                             ) {
                                 Ok(()) => Ok(()),
@@ -1341,37 +1341,94 @@ async fn native_proto_driver_loop(
                         Ok(())
                     }
                     Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
-                        let tx = endpoint.refuse(incoming, &mut scratch);
-                        generated_transmits = 1;
-                        if fault_spec.drop_egress {
-                            fault_stats.egress_dropped =
-                                fault_stats.egress_dropped.saturating_add(1);
-                            Ok(())
-                        } else {
-                            match push_native_transmit(
-                                &mut pending_transmits,
-                                tx,
-                                max_pending_transmits,
-                            ) {
-                                Ok(()) => Ok(()),
+                        if allow_incoming_accept {
+                            match endpoint.accept(incoming, now_std, &mut scratch, None) {
+                                Ok((handle, connection)) => {
+                                    let connection_id = next_connection_id;
+                                    next_connection_id = next_connection_id.saturating_add(1);
+                                    connections.entry(connection_id).or_default();
+                                    handle_by_connection_id.insert(connection_id, handle);
+                                    proto_connections.insert(handle, connection);
+                                    stats.connections_registered =
+                                        stats.connections_registered.saturating_add(1);
+                                    push_native_event(
+                                        &mut events,
+                                        NativeProtoEvent::ConnectionRegistered { connection_id },
+                                    );
+                                    Ok(())
+                                }
                                 Err(err) => {
-                                    if err.kind() == io::ErrorKind::WouldBlock {
-                                        stats.backpressure_hits =
-                                            stats.backpressure_hits.saturating_add(1);
-                                        push_native_event(
-                                            &mut events,
-                                            NativeProtoEvent::Backpressure {
-                                                scope: "egress_queue",
-                                            },
-                                        );
+                                    if let Some(tx) = err.response {
+                                        generated_transmits = generated_transmits.saturating_add(1);
+                                        if fault_spec.drop_egress {
+                                            fault_stats.egress_dropped =
+                                                fault_stats.egress_dropped.saturating_add(1);
+                                            Ok(())
+                                        } else {
+                                            let payload = transmit_payload(scratch.as_slice(), tx.size);
+                                            match push_native_transmit(
+                                                &mut pending_transmits,
+                                                tx,
+                                                payload,
+                                                max_pending_transmits,
+                                            ) {
+                                                Ok(()) => Ok(()),
+                                                Err(err) => {
+                                                    if err.kind() == io::ErrorKind::WouldBlock {
+                                                        stats.backpressure_hits =
+                                                            stats.backpressure_hits.saturating_add(1);
+                                                        push_native_event(
+                                                            &mut events,
+                                                            NativeProtoEvent::Backpressure {
+                                                                scope: "egress_queue",
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(err)
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        Ok(())
                                     }
-                                    Err(err)
+                                }
+                            }
+                        } else {
+                            let tx = endpoint.refuse(incoming, &mut scratch);
+                            generated_transmits = generated_transmits.saturating_add(1);
+                            if fault_spec.drop_egress {
+                                fault_stats.egress_dropped =
+                                    fault_stats.egress_dropped.saturating_add(1);
+                                Ok(())
+                            } else {
+                                let payload = transmit_payload(scratch.as_slice(), tx.size);
+                                match push_native_transmit(
+                                    &mut pending_transmits,
+                                    tx,
+                                    payload,
+                                    max_pending_transmits,
+                                ) {
+                                    Ok(()) => Ok(()),
+                                    Err(err) => {
+                                        if err.kind() == io::ErrorKind::WouldBlock {
+                                            stats.backpressure_hits =
+                                                stats.backpressure_hits.saturating_add(1);
+                                            push_native_event(
+                                                &mut events,
+                                                NativeProtoEvent::Backpressure {
+                                                    scope: "egress_queue",
+                                                },
+                                            );
+                                        }
+                                        Err(err)
+                                    }
                                 }
                             }
                         }
                     }
                     None => Ok(()),
                 };
+                scratch.clear();
                 let result = match initial {
                     Ok(()) => match drive_native_proto_connections(
                         now_std,
@@ -1623,6 +1680,14 @@ async fn native_proto_driver_loop(
                 commands_processed = commands_processed.saturating_add(1);
                 let mut should_drive = false;
                 let mut result = if payload.len() > tuning.max_datagram_size {
+                    stats.datagrams_oversized = stats.datagrams_oversized.saturating_add(1);
+                    push_native_event(
+                        &mut events,
+                        NativeProtoEvent::OversizedDatagram {
+                            size: payload.len(),
+                            max_size: tuning.max_datagram_size,
+                        },
+                    );
                     Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
@@ -2223,6 +2288,7 @@ async fn native_proto_driver_loop(
 fn push_native_transmit(
     pending_transmits: &mut VecDeque<NativeProtoTransmit>,
     tx: quinn_proto::Transmit,
+    payload: Vec<u8>,
     max_pending_transmits: usize,
 ) -> io::Result<()> {
     if pending_transmits.len() >= max_pending_transmits {
@@ -2237,8 +2303,14 @@ fn push_native_transmit(
         size: tx.size,
         segment_size: tx.segment_size,
         src_ip: tx.src_ip,
+        payload,
     });
     Ok(())
+}
+
+fn transmit_payload(buf: &[u8], size: usize) -> Vec<u8> {
+    let end = size.min(buf.len());
+    buf[..end].to_vec()
 }
 
 fn native_proto_now(epoch: std::time::Instant, now: Duration) -> std::time::Instant {
@@ -2284,7 +2356,9 @@ fn drive_native_proto_connections(
                     scratch.clear();
                     continue;
                 }
-                if let Err(err) = push_native_transmit(pending_transmits, tx, max_pending_transmits)
+                let payload = transmit_payload(scratch.as_slice(), tx.size);
+                if let Err(err) =
+                    push_native_transmit(pending_transmits, tx, payload, max_pending_transmits)
                 {
                     if err.kind() == io::ErrorKind::WouldBlock {
                         stats.backpressure_hits = stats.backpressure_hits.saturating_add(1);

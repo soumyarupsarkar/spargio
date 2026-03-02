@@ -512,6 +512,7 @@ fn native_proto_driver_egress_queue_applies_backpressure() {
             size: 42,
             segment_size: None,
             src_ip: None,
+            payload: vec![0; 42],
         };
         driver
             .enqueue_transmit_for_test(tx.clone())
@@ -545,6 +546,7 @@ fn native_proto_driver_drain_is_fifo_and_batch_limited() {
                     size,
                     segment_size: None,
                     src_ip: None,
+                    payload: vec![0; size],
                 })
                 .await
                 .expect("enqueue");
@@ -868,6 +870,74 @@ fn native_proto_driver_close_connection_for_test_emits_close_transmit_for_proto_
 }
 
 #[test]
+fn native_proto_driver_server_config_accepts_client_transmits() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5650);
+        let client_addr = localhost_addr(5651);
+        let _client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+
+        for _ in 0..64 {
+            let mut progressed = false;
+
+            let client_tx = client.drain_transmits(64).await.expect("drain client");
+            for tx in client_tx {
+                progressed = true;
+                assert_eq!(tx.destination, server_addr);
+                let _ = server
+                    .submit_datagram(client_addr, tx.payload)
+                    .await
+                    .expect("deliver client->server");
+            }
+
+            let server_tx = server.drain_transmits(64).await.expect("drain server");
+            for tx in server_tx {
+                progressed = true;
+                assert_eq!(tx.destination, client_addr);
+                let _ = client
+                    .submit_datagram(server_addr, tx.payload)
+                    .await
+                    .expect("deliver server->client");
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        let server_stats = server.stats().await.expect("server stats");
+        assert!(
+            server_stats.connections_registered >= 1,
+            "server driver should register incoming connection when configured with server config"
+        );
+        let server_events = server.drain_events(64).await.expect("server events");
+        assert!(
+            server_events
+                .iter()
+                .any(|event| matches!(event, NativeProtoEvent::ConnectionRegistered { .. })),
+            "server should emit connection-registered event for accepted incoming"
+        );
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)
@@ -990,8 +1060,12 @@ fn native_proto_driver_rejects_oversized_datagram_per_tuning() {
             .set_transport_tuning(NativeProtoTransportTuning::default().with_max_datagram_size(16))
             .await
             .expect("set tuning");
+        let conn = driver
+            .register_connection_for_test()
+            .await
+            .expect("register conn");
         let err = driver
-            .submit_datagram(localhost_addr(5556), vec![1u8; 64])
+            .send_datagram_on_connection_for_test(conn, vec![1u8; 64])
             .await
             .expect_err("oversized datagram should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -1064,6 +1138,7 @@ fn native_proto_driver_event_log_captures_timeout_and_backpressure() {
             size: 1,
             segment_size: None,
             src_ip: None,
+            payload: vec![0; 1],
         };
         driver
             .enqueue_transmit_for_test(tx.clone())
@@ -1138,6 +1213,7 @@ fn native_proto_driver_reorders_egress_when_fault_enabled() {
                     size,
                     segment_size: None,
                     src_ip: None,
+                    payload: vec![0; size],
                 })
                 .await
                 .expect("enqueue");
