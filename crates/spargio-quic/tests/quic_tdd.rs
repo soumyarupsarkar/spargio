@@ -1147,6 +1147,74 @@ fn native_proto_driver_close_transitions_increment_closed_stats() {
 }
 
 #[test]
+fn native_proto_driver_post_handshake_datagram_roundtrip_tracks_state() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5700);
+        let client_addr = localhost_addr(5701);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let server_conn = server
+            .drain_events(64)
+            .await
+            .expect("server events")
+            .into_iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        client
+            .send_datagram_on_connection_for_test(client_conn, b"c2s-dgram".to_vec())
+            .await
+            .expect("client send datagram");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+        let server_incoming = server
+            .recv_datagram_on_connection_for_test(server_conn)
+            .await
+            .expect("server recv datagram");
+        assert_eq!(server_incoming, b"c2s-dgram");
+
+        server
+            .send_datagram_on_connection_for_test(server_conn, b"s2c-dgram".to_vec())
+            .await
+            .expect("server send datagram");
+        exchange_driver_transmits(&server, server_addr, &client, client_addr, 64).await;
+        let client_incoming = client
+            .recv_datagram_on_connection_for_test(client_conn)
+            .await
+            .expect("client recv datagram");
+        assert_eq!(client_incoming, b"s2c-dgram");
+
+        let client_state = client.connection_state(client_conn).await.expect("client state");
+        let server_state = server.connection_state(server_conn).await.expect("server state");
+        assert_eq!(client_state.datagrams_sent, 1);
+        assert_eq!(client_state.datagrams_received, 1);
+        assert_eq!(server_state.datagrams_sent, 1);
+        assert_eq!(server_state.datagrams_received, 1);
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)

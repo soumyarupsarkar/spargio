@@ -7369,3 +7369,29 @@ Executed and passing:
 - `cargo test -p spargio-quic --test native_cutover_tdd`
 - `cargo test -p spargio-quic --test interop_tdd`
 - `cargo test -p spargio-quic`
+
+## Update: R2 continuation (post-handshake datagram roundtrip contract coverage) (2026-03-02)
+
+Added explicit regression coverage for protocol-backed app datagram traffic
+across two native drivers after handshake.
+
+### Contract test added
+
+In `crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `native_proto_driver_post_handshake_datagram_roundtrip_tracks_state`
+
+Coverage validates:
+
+- client->server and server->client app datagram exchange over protocol-backed
+  connection IDs (`connect_for_test` + server accept path).
+- payload integrity on both directions.
+- per-connection datagram state accounting (`datagrams_sent` /
+  `datagrams_received`) on both peers.
+
+### Validation
+
+Executed and passing:
+
+- `cargo test -p spargio-quic --test quic_tdd native_proto_driver_post_handshake_datagram_roundtrip_tracks_state -- --exact`
+- `cargo test -p spargio-quic --test quic_tdd`
