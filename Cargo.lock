@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "spargio"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "compio",
  "criterion",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-macros"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-process"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "futures",
  "spargio",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-protocols"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "futures",
  "spargio",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-quic"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bytes",
  "futures",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-signal"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "futures",
  "signal-hook",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-tls"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "futures",
  "futures-rustls",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "spargio-ws"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-tungstenite",
  "futures",
