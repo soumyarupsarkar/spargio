@@ -60,6 +60,58 @@ What this does:
 - uses the current spawning shard as the default preferred shard.
 - shows routing to another shard only when ownership/session mapping is intentional.
 
+### When to Use Plain `Stealable`
+
+Use plain `Stealable` when your current shard is only an ingress/dispatcher and
+is not the ownership home for the work itself.
+
+Example pattern: shard `0` acts as an ingress dispatcher, then submits each
+request as plain `spawn_stealable(...)`. In Spargio, `Stealable` submissions
+get a round-robin preferred start shard automatically, and can still migrate
+later if steal heuristics decide migration is worth the cost.
+
+```rust
+use spargio::{net::TcpListener, RuntimeHandle};
+
+#[spargio::main]
+async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
+    let listener = TcpListener::bind(handle.clone(), "127.0.0.1:7001").await?;
+    let dispatcher = handle.clone();
+
+    // Dedicated ingress shard: accept and dispatch.
+    let ingress = handle.spawn_pinned(0, async move {
+        let mut workers = Vec::new();
+        for _ in 0..256 {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let worker = dispatcher
+                .spawn_stealable(async move {
+                    let payload = stream.recv(8 * 1024).await.expect("recv");
+                    if !payload.is_empty() {
+                        stream.write_all(b"ok").await.expect("reply");
+                    }
+                })
+                .expect("spawn_stealable");
+            workers.push(worker);
+        }
+
+        for worker in workers {
+            worker.await.expect("join");
+        }
+    })?;
+
+    ingress.await?;
+    Ok(())
+}
+```
+
+What this does:
+
+- keeps one shard focused on ingress/dispatch.
+- avoids forcing application work to stay near ingress.
+- uses `Stealable` to spread initial placement while preserving steal-based
+  rebalancing.
+- explicitly awaits dispatched tasks so task lifetime is clear in the example.
+
 ## Running !Send Work: `run_local_on` and `spawn_local_on`
 
 Use local APIs when your future captures non-`Send` state (for example `Rc`,

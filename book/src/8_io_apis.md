@@ -122,7 +122,7 @@ For custom SQE/CQE workflows not in core APIs:
 - `UringNativeAny::submit_unsafe`
 - `UringNativeAny::submit_unsafe_on_shard`
 
-Use safe wrappers around unsafe calls. See [Extending Spargio with Custom io_uring Opcodes](native_extensions.md).
+Use safe wrappers around unsafe calls. See [Extending Spargio with Custom io_uring Opcodes](11_native_extensions.md).
 
 ```rust
 #[cfg(all(feature = "uring-native", target_os = "linux"))]

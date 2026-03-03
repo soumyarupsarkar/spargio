@@ -149,6 +149,7 @@ For performance, different workload shapes favor different runtimes.
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
 - Work-stealing tuning guidance still needs deeper production case studies and calibration examples on top of the current knob and profiling documentation.
+- Work-stealing queue structure is still generic compared with Tokio's specialized scheduler queues; evaluate a better-optimized queue design (owner-fast-path + injection/steal structure) later.
 - Continue readability/editorial cleanup across README + `book/`: tighten wording, keep examples minimal but practical, and reduce ambiguous terminology.
 - Broaden documentation coverage while refactoring core modules for maintainability: keep API docs/book content aligned as runtime/fs/net surfaces continue to be split into smaller focused units.
 

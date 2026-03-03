@@ -75,7 +75,7 @@ What this does:
 - runs your workload under those settings
 - reads scheduler counters so you can judge whether changes improved locality/throughput tradeoffs
 
-For day-2 monitoring and rollout counters, see [Operations Guide](operations_guide.md).
+For day-2 monitoring and rollout counters, see [Operations Guide](13_operations_guide.md).
 
 ## Profile Before Guessing
 

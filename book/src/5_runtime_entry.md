@@ -20,7 +20,7 @@ Common controls include:
 - thread affinity
 
 For steal-control definitions and profiling workflow, see
-[Performance Guide](performance_guide.md#work-stealing-controls-and-profiling).
+[Performance Guide](12_performance_guide.md#work-stealing-controls-and-profiling).
 
 Example:
 

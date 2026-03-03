@@ -34,7 +34,7 @@ If you need one of the current gaps now, use these practical paths:
 - strict non-DNS connect/bind behavior:
   use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`).
 - operation not exposed in core runtime API:
-  build a safe wrapper on top of `submit_unsafe*` (see [Extending Spargio with Custom io_uring Opcodes](native_extensions.md)).
+  build a safe wrapper on top of `submit_unsafe*` (see [Extending Spargio with Custom io_uring Opcodes](11_native_extensions.md)).
 - metadata-heavy tooling with minimal blocking:
   use `metadata_lite` and `du`/`read_dir` helpers while full in-ring traversal remains unavailable.
 - multi-core QUIC listener scaling:

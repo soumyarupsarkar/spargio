@@ -13,7 +13,7 @@ Use `RuntimeHandle::stats_snapshot()` and track:
 
 Track these metrics across rollout stages, not only load tests.
 Knob definitions and profiling workflow live in
-[Performance Guide](performance_guide.md#work-stealing-controls-and-profiling).
+[Performance Guide](12_performance_guide.md#work-stealing-controls-and-profiling).
 
 ```rust
 use std::time::Duration;

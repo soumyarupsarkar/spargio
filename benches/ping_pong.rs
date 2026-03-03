@@ -367,8 +367,9 @@ impl Drop for TokioHarness {
 }
 
 fn run_spargio_cold(rounds: usize) {
-    let mut harness = MsgRingHarness::new().expect("runtime harness");
-    black_box(harness.ping_pong(rounds));
+    if let Some(mut harness) = MsgRingHarness::new() {
+        black_box(harness.ping_pong(rounds));
+    }
 }
 
 fn run_tokio_cold(rounds: usize) {

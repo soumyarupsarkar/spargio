@@ -8,12 +8,12 @@ Out-of-the-box, we support async disk I/O, network I/O (including TLS/WebSockets
 
 This book is organized for fast decision-making:
 
-- Start with [Quick Start](quick_start.md) if you want runnable code first.
-- Read [Task Placement and !Send Execution](runtime_model.md) before tuning placement or performance.
-- Use [I/O API Layers and Selection](io_apis.md) when choosing high-level vs native APIs.
-- Use [Companion Protocol Crates (TLS/WS/QUIC/Process/Signal)](protocol_crates.md) for TLS/WS/QUIC/process/signal.
-- Use [Extending Spargio with Custom io_uring Opcodes](native_extensions.md) when core APIs do not expose a needed operation.
-- Use [Performance Guide](performance_guide.md) and [Operations Guide](operations_guide.md) for production workflows.
+- Start with [Quick Start](2_quick_start.md) if you want runnable code first.
+- Read [Task Placement and !Send Execution](3_runtime_model.md) before tuning placement or performance.
+- Use [I/O API Layers and Selection](8_io_apis.md) when choosing high-level vs native APIs.
+- Use [Companion Protocol Crates (TLS/WS/QUIC/Process/Signal)](9_protocol_crates.md) for TLS/WS/QUIC/process/signal.
+- Use [Extending Spargio with Custom io_uring Opcodes](11_native_extensions.md) when core APIs do not expose a needed operation.
+- Use [Performance Guide](12_performance_guide.md) and [Operations Guide](13_operations_guide.md) for production workflows.
 
 ## Who This Book Is For
 
