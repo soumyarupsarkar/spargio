@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use spargio::{
-    BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, run, run_local_on, run_with,
-    sleep,
+    BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, StealableQueueBackend, run,
+    run_local_on, run_with, sleep,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -592,6 +592,38 @@ fn runtime_builder_steal_victim_stride_is_reported_and_clamped() {
         .expect("runtime");
     let configured_stats = configured.handle().stats_snapshot();
     assert_eq!(configured_stats.steal_victim_stride, 3);
+}
+
+#[test]
+fn runtime_builder_steal_policy_knobs_are_reported_and_clamped() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .steal_victim_probe_count(0)
+        .steal_batch_size(0)
+        .steal_fail_cost(0)
+        .steal_backoff_min(0)
+        .steal_backoff_max(0)
+        .steal_locality_margin(2)
+        .build()
+        .expect("runtime");
+    let stats = rt.handle().stats_snapshot();
+
+    assert_eq!(stats.steal_victim_probe_count, 1);
+    assert_eq!(stats.steal_batch_size, 1);
+    assert_eq!(stats.steal_fail_cost, 1);
+    assert_eq!(stats.steal_backoff_min, 1);
+    assert_eq!(stats.steal_backoff_max, 1);
+    assert_eq!(stats.steal_locality_margin, 2);
+}
+
+#[test]
+fn runtime_builder_supports_experimental_stealable_queue_backend() {
+    let rt = Runtime::builder()
+        .shards(2)
+        .stealable_queue_backend(StealableQueueBackend::SegQueueExperimental)
+        .build()
+        .expect("runtime");
+    drop(rt);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

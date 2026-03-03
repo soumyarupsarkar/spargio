@@ -116,7 +116,7 @@ For performance, different workload shapes favor different runtimes.
 - Sharded runtime with Linux `IoUring` backend.
 - Cross-shard typed/raw messaging, nowait sends, batching, and flush tickets.
 - Placement APIs: `Pinned`, `RoundRobin`, `Sticky`, `Stealable`, `StealablePreferred`.
-- Work-stealing scheduler MVP with backpressure and runtime stats.
+- Work-stealing scheduler with adaptive steal gating/backoff, victim probing, batch steals, wake coalescing, backpressure, and runtime stats.
 - Runtime primitives: `sleep`, `sleep_until`, `timeout`, `timeout_at`, `Interval`/`interval_at`, `Sleep` (resettable deadline timer), `CancellationToken`, and `TaskGroup` cooperative cancellation.
 - Runtime entry ergonomics: async-first `spargio::run(...)`, `spargio::run_with(builder, ...)`, and optional `#[spargio::main(...)]` via `macros`.
 - Runtime utility bridge knobs: `RuntimeHandle::spawn_blocking(...)` and `RuntimeBuilder::thread_affinity(...)`.
@@ -133,6 +133,7 @@ For performance, different workload shapes favor different runtimes.
 - Async-first boundary APIs: `call`, `call_with_timeout`, `recv`, `recv_timeout`, and `BoundaryTicket::wait_timeout`.
 - Explicit socket-address APIs that bypass DNS resolution: `connect_socket_addr*` and `bind_socket_addr`.
 - Benchmark suites: `benches/ping_pong.rs`, `benches/fanout_fanin.rs`, `benches/fs_api.rs` (Tokio/Spargio/Compio), and `benches/net_api.rs` (Tokio/Spargio/Compio).
+- Scheduler profiling lane with `callgrind`/`cachegrind`: `scripts/bench_scheduler_profile.sh` and ratio guardrail helper `scripts/scheduler_profile_guardrail.sh`.
 - Mixed-runtime boundary API: `spargio::boundary`.
 - Companion crate suite: `spargio-process`, `spargio-signal`, `spargio-protocols` (legacy blocking bridge helpers), `spargio-tls` (rustls/futures-rustls adapter), `spargio-ws` (async-tungstenite adapter), and `spargio-quic` with selectable backend mode (`QuicBackend::Native` default dispatch and explicit `QuicBackend::Bridge` compatibility fallback).
 - Native-vs-bridge QUIC cutover guardrails: native data path is validated to avoid bridge task spawning, while bridge mode remains explicit compatibility fallback.
@@ -151,7 +152,7 @@ For performance, different workload shapes favor different runtimes.
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
 - Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
-- Advanced work-stealing policy tuning beyond current MVP heuristics.
+- Further workload-specific work-stealing model calibration is still iterative (the adaptive policy is implemented, but thresholds/weights are expected to continue evolving with production traces).
 - Expand `book/` coverage into deeper API-selection, placement, and operations guides.
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) is explicitly deprioritized for now (backlog-only, not planned right now).
 
@@ -171,6 +172,8 @@ Benchmark helpers:
 ./scripts/bench_ping_guardrail.sh
 ./scripts/bench_fanout_guardrail.sh
 ./scripts/bench_kpi_guardrail.sh
+./scripts/bench_scheduler_profile.sh
+./scripts/scheduler_profile_guardrail.sh
 ./scripts/companion_ci_smoke.sh
 ./scripts/quic_interop_matrix.sh
 ./scripts/quic_perf_gate.sh

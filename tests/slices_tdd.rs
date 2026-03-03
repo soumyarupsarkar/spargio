@@ -275,3 +275,85 @@ fn steal_stats_track_attempts_and_success() {
     assert!(stats.steal_attempts > 0);
     assert!(stats.steal_success > 0);
 }
+
+#[test]
+fn steal_stats_expose_scan_and_locality_diagnostics() {
+    let rt = Runtime::builder()
+        .shards(3)
+        .steal_budget(32)
+        .steal_victim_probe_count(2)
+        .steal_batch_size(4)
+        .steal_locality_margin(1)
+        .build()
+        .expect("runtime");
+    let handle = rt.handle();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    let blocker = handle
+        .spawn_pinned(0, async move {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(80));
+            0usize
+        })
+        .expect("blocker");
+    started_rx.recv().expect("blocker started");
+
+    let mut joins = Vec::new();
+    for _ in 0..24 {
+        joins.push(
+            handle
+                .spawn_stealable_on(0, async {
+                    std::thread::sleep(Duration::from_millis(1));
+                    ShardCtx::current().expect("on shard").shard_id()
+                })
+                .expect("spawn stealable"),
+        );
+    }
+
+    for join in joins {
+        let _ = block_on(join).expect("join");
+    }
+    let _ = block_on(blocker).expect("blocker join");
+
+    let stats = handle.stats_snapshot();
+    assert!(stats.local_hit_ratio().is_finite());
+    assert!(stats.stolen_per_scan().is_finite());
+    assert!(stats.local_hit_ratio() >= 0.0 && stats.local_hit_ratio() <= 1.0);
+    assert!(stats.steal_scans <= stats.steal_attempts);
+    assert!(stats.steal_victim_probe_count >= 1);
+    assert!(stats.steal_batch_size >= 1);
+    assert!(stats.steal_backoff_max >= stats.steal_backoff_min);
+}
+
+#[test]
+fn stealable_wake_coalescing_tracks_bursty_submissions() {
+    let rt = Runtime::builder().shards(2).build().expect("runtime");
+    let handle = rt.handle();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    let blocker = handle
+        .spawn_pinned(0, async move {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_millis(60));
+            0usize
+        })
+        .expect("blocker");
+    started_rx.recv().expect("blocker started");
+
+    let mut joins = Vec::new();
+    for _ in 0..24 {
+        joins.push(
+            handle
+                .spawn_stealable_on(0, async { 1usize })
+                .expect("spawn stealable"),
+        );
+    }
+    for join in joins {
+        let _ = block_on(join).expect("join");
+    }
+    let _ = block_on(blocker).expect("blocker join");
+
+    let stats = handle.stats_snapshot();
+    assert!(stats.stealable_wake_sent >= 1);
+    assert!(stats.stealable_wake_coalesced >= 1);
+}

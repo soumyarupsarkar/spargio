@@ -88,3 +88,18 @@ jobs:
 
       - name: QUIC soak and fault qualification
         run: ./scripts/quic_soak_fault.sh
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Scheduler profiler lane
+        run: |
+          SUMMARY_JSON=target/scheduler_profiles/nightly_summary.json \
+          WARMUP=0.01 MEASURE=0.02 SAMPLES=10 \
+          ./scripts/bench_scheduler_profile.sh fanout_fanin_skewed spargio_io_uring
+          MAX_CALLGRIND_IR_RATIO=2.5 \
+          MAX_CACHEGRIND_D1MR_RATIO=2.5 \
+          MAX_CACHEGRIND_D1MW_RATIO=2.5 \
+          ./scripts/scheduler_profile_guardrail.sh \
+            tests/fixtures/scheduler_profile/fanout_fanin_skewed_spargio_io_uring.json \
+            target/scheduler_profiles/nightly_summary.json

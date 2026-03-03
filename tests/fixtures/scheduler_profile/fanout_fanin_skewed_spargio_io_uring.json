@@ -1,0 +1,8 @@
+{
+  "group": "fanout_fanin_skewed",
+  "bench": "spargio_io_uring",
+  "callgrind_ir": 26866827,
+  "cachegrind_ir": 26834021,
+  "cachegrind_d1mr": 12833,
+  "cachegrind_d1mw": 12280
+}

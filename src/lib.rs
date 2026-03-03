@@ -10,7 +10,9 @@ use futures::executor::{LocalPool, LocalSpawner};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use futures::future::join_all;
 use futures::future::{Either, select};
-use futures::task::{AtomicWaker, LocalSpawnExt};
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use futures::task::AtomicWaker;
+use futures::task::LocalSpawnExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -29,7 +31,9 @@ use io_uring::{IoUring, opcode, types};
 #[cfg(target_os = "linux")]
 use slab::Slab;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
+use std::os::fd::{FromRawFd, OwnedFd};
 
 pub type ShardId = u16;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -71,6 +75,23 @@ const NATIVE_WEAK_AFFINITY_TTL: Duration = Duration::from_millis(0);
 const NATIVE_STRONG_AFFINITY_TTL: Duration = Duration::from_millis(200);
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 const NATIVE_HARD_AFFINITY_TTL: Duration = Duration::from_secs(5);
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> CachePadded<T> {
+    fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 struct NativeLocalBufReplySlot {
@@ -949,6 +970,12 @@ pub enum TaskPlacement {
     StealablePreferred(ShardId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StealableQueueBackend {
+    Mutex,
+    SegQueueExperimental,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeStats {
     pub shard_command_depths: Vec<usize>,
@@ -961,9 +988,22 @@ pub struct RuntimeStats {
     pub stealable_executed: u64,
     pub stealable_stolen: u64,
     pub stealable_backpressure: u64,
+    pub stealable_local_hits: u64,
     pub steal_attempts: u64,
+    pub steal_scans: u64,
     pub steal_success: u64,
+    pub steal_skipped_backoff: u64,
+    pub steal_skipped_locality: u64,
+    pub steal_failed_streak_max: u64,
+    pub stealable_wake_sent: u64,
+    pub stealable_wake_coalesced: u64,
     pub steal_victim_stride: usize,
+    pub steal_victim_probe_count: usize,
+    pub steal_batch_size: usize,
+    pub steal_locality_margin: usize,
+    pub steal_fail_cost: usize,
+    pub steal_backoff_min: usize,
+    pub steal_backoff_max: usize,
     pub ring_msgs_submitted: u64,
     pub ring_msgs_completed: u64,
     pub ring_msgs_failed: u64,
@@ -994,6 +1034,20 @@ impl RuntimeStats {
             return 0.0;
         }
         self.steal_success as f64 / self.steal_attempts as f64
+    }
+
+    pub fn local_hit_ratio(&self) -> f64 {
+        if self.stealable_executed == 0 {
+            return 0.0;
+        }
+        self.stealable_local_hits as f64 / self.stealable_executed as f64
+    }
+
+    pub fn stolen_per_scan(&self) -> f64 {
+        if self.steal_scans == 0 {
+            return 0.0;
+        }
+        self.steal_success as f64 / self.steal_scans as f64
     }
 }
 
@@ -1030,8 +1084,15 @@ pub struct RuntimeBuilder {
     coalesced_hot_msg_tags: Vec<u16>,
     hot_counter_wake_threshold: u64,
     stealable_queue_capacity: usize,
+    stealable_queue_backend: StealableQueueBackend,
     steal_budget: usize,
     steal_victim_stride: usize,
+    steal_victim_probe_count: usize,
+    steal_batch_size: usize,
+    steal_locality_margin: usize,
+    steal_fail_cost: usize,
+    steal_backoff_min: usize,
+    steal_backoff_max: usize,
     #[cfg(target_os = "linux")]
     io_uring: IoUringBuildConfig,
 }
@@ -1049,8 +1110,15 @@ impl Default for RuntimeBuilder {
             coalesced_hot_msg_tags: Vec::new(),
             hot_counter_wake_threshold: 1,
             stealable_queue_capacity: 4096,
+            stealable_queue_backend: StealableQueueBackend::Mutex,
             steal_budget: 64,
             steal_victim_stride: 1,
+            steal_victim_probe_count: 2,
+            steal_batch_size: 4,
+            steal_locality_margin: 1,
+            steal_fail_cost: 1,
+            steal_backoff_min: 1,
+            steal_backoff_max: 32,
             #[cfg(target_os = "linux")]
             io_uring: IoUringBuildConfig::default(),
         }
@@ -1134,6 +1202,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn stealable_queue_backend(mut self, backend: StealableQueueBackend) -> Self {
+        self.stealable_queue_backend = backend;
+        self
+    }
+
     pub fn steal_budget(mut self, budget: usize) -> Self {
         self.steal_budget = budget.max(1);
         self
@@ -1141,6 +1214,42 @@ impl RuntimeBuilder {
 
     pub fn steal_victim_stride(mut self, stride: usize) -> Self {
         self.steal_victim_stride = stride.max(1);
+        self
+    }
+
+    pub fn steal_victim_probe_count(mut self, probes: usize) -> Self {
+        self.steal_victim_probe_count = probes.max(1);
+        self
+    }
+
+    pub fn steal_batch_size(mut self, batch_size: usize) -> Self {
+        self.steal_batch_size = batch_size.max(1);
+        self
+    }
+
+    pub fn steal_locality_margin(mut self, margin: usize) -> Self {
+        self.steal_locality_margin = margin;
+        self
+    }
+
+    pub fn steal_fail_cost(mut self, cost: usize) -> Self {
+        self.steal_fail_cost = cost.max(1);
+        self
+    }
+
+    pub fn steal_backoff_min(mut self, min_ticks: usize) -> Self {
+        self.steal_backoff_min = min_ticks.max(1);
+        if self.steal_backoff_max < self.steal_backoff_min {
+            self.steal_backoff_max = self.steal_backoff_min;
+        }
+        self
+    }
+
+    pub fn steal_backoff_max(mut self, max_ticks: usize) -> Self {
+        self.steal_backoff_max = max_ticks.max(1);
+        if self.steal_backoff_max < self.steal_backoff_min {
+            self.steal_backoff_min = self.steal_backoff_max;
+        }
         self
     }
 
@@ -1202,7 +1311,17 @@ impl RuntimeBuilder {
             senders.push(tx);
             receivers.push(rx);
         }
-        let stealable_inboxes = build_stealable_inboxes(self.shards);
+        let stealable_inboxes = build_stealable_inboxes(self.shards, self.stealable_queue_backend);
+        let stealable_wake_flags = build_stealable_wake_flags(self.shards);
+        let steal_policy = StealPolicyConfig {
+            victim_stride: self.steal_victim_stride.max(1),
+            victim_probe_count: self.steal_victim_probe_count.max(1),
+            batch_size: self.steal_batch_size.max(1),
+            locality_margin: self.steal_locality_margin,
+            fail_cost: self.steal_fail_cost.max(1),
+            backoff_min: self.steal_backoff_min.max(1),
+            backoff_max: self.steal_backoff_max.max(self.steal_backoff_min).max(1),
+        };
         let mut hot_msg_tag_bits = build_hot_msg_tag_lookup(&self.hot_msg_tags);
         for &tag in &self.coalesced_hot_msg_tags {
             hot_msg_tag_bits[usize::from(tag)] = true;
@@ -1210,16 +1329,14 @@ impl RuntimeBuilder {
         let hot_msg_tags = Arc::new(hot_msg_tag_bits);
         let coalesced_hot_msg_tags =
             Arc::new(build_hot_msg_tag_lookup(&self.coalesced_hot_msg_tags));
-        let stats = Arc::new(RuntimeStatsInner::new(
-            self.shards,
-            self.steal_victim_stride,
-        ));
+        let stats = Arc::new(RuntimeStatsInner::new(self.shards, steal_policy));
 
         let shared = Arc::new(RuntimeShared {
             runtime_id,
             backend: self.backend,
             command_txs: senders.clone(),
             stealable_inboxes: stealable_inboxes.clone(),
+            stealable_wake_flags: stealable_wake_flags.clone(),
             stealable_queue_capacity: self.stealable_queue_capacity,
             stats: stats.clone(),
             #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -1269,6 +1386,7 @@ impl RuntimeBuilder {
                     {
                         let remotes_for_shard = remotes.clone();
                         let stealable_deques = stealable_inboxes.clone();
+                        let stealable_wake_flags = stealable_wake_flags.clone();
                         let hot_msg_tags = hot_msg_tags.clone();
                         let coalesced_hot_msg_tags = coalesced_hot_msg_tags.clone();
                         let thread_affinity = thread_affinity.clone();
@@ -1297,11 +1415,12 @@ impl RuntimeBuilder {
                                 rx,
                                 remotes_for_shard,
                                 stealable_deques,
+                                stealable_wake_flags,
                                 hot_msg_tags,
                                 coalesced_hot_msg_tags,
                                 self.hot_counter_wake_threshold,
                                 self.steal_budget,
-                                self.steal_victim_stride,
+                                steal_policy,
                                 backend,
                                 stats,
                             )
@@ -4793,22 +4912,24 @@ where
     let Some(inbox) = shared.stealable_inboxes.get(usize::from(target)) else {
         return Err(RuntimeError::InvalidShard(target));
     };
-    let mut queue = inbox.lock().expect("stealable queue lock poisoned");
-    if queue.len() >= shared.stealable_queue_capacity {
+    if inbox
+        .try_push(
+            StealableTask {
+                task: Box::pin(async move {
+                    let out = fut.await;
+                    let _ = tx.send(out);
+                }),
+            },
+            shared.stealable_queue_capacity,
+        )
+        .is_err()
+    {
         shared
             .stats
             .stealable_backpressure
             .fetch_add(1, Ordering::Relaxed);
         return Err(RuntimeError::Overloaded);
     }
-    queue.push_back(StealableTask {
-        preferred_shard,
-        task: Box::pin(async move {
-            let out = fut.await;
-            let _ = tx.send(out);
-        }),
-    });
-    drop(queue);
     shared.notify_stealable_target(target);
 
     Ok(JoinHandle { rx: Some(rx) })
@@ -4823,15 +4944,116 @@ fn sticky_key_to_shard(key: u64, shards: usize) -> ShardId {
 }
 
 struct StealableTask {
-    preferred_shard: ShardId,
     task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
 }
 
-type StealableInboxes = Arc<Vec<Arc<Mutex<VecDeque<StealableTask>>>>>;
+enum StealableInbox {
+    Mutex {
+        queue: CachePadded<Mutex<VecDeque<StealableTask>>>,
+    },
+    SegQueue {
+        queue: SegQueue<StealableTask>,
+        len: CachePadded<AtomicUsize>,
+    },
+}
+
+impl StealableInbox {
+    fn try_push(&self, task: StealableTask, capacity: usize) -> Result<(), StealableTask> {
+        match self {
+            StealableInbox::Mutex { queue } => {
+                let mut guard = queue.lock().expect("stealable queue lock poisoned");
+                if guard.len() >= capacity {
+                    return Err(task);
+                }
+                guard.push_back(task);
+                Ok(())
+            }
+            StealableInbox::SegQueue { queue, len } => loop {
+                let current = len.load(Ordering::Relaxed);
+                if current >= capacity {
+                    return Err(task);
+                }
+                if len
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    queue.push(task);
+                    return Ok(());
+                }
+            },
+        }
+    }
+
+    fn pop_local(&self) -> Option<StealableTask> {
+        match self {
+            StealableInbox::Mutex { queue } => queue
+                .lock()
+                .expect("stealable queue lock poisoned")
+                .pop_front(),
+            StealableInbox::SegQueue { queue, len } => {
+                let task = queue.pop();
+                if task.is_some() {
+                    len.fetch_sub(1, Ordering::AcqRel);
+                }
+                task
+            }
+        }
+    }
+
+    fn pop_stolen(&self) -> Option<StealableTask> {
+        match self {
+            StealableInbox::Mutex { queue } => queue
+                .lock()
+                .expect("stealable queue lock poisoned")
+                .pop_back(),
+            StealableInbox::SegQueue { queue, len } => {
+                let task = queue.pop();
+                if task.is_some() {
+                    len.fetch_sub(1, Ordering::AcqRel);
+                }
+                task
+            }
+        }
+    }
+
+    fn len_estimate(&self) -> usize {
+        match self {
+            StealableInbox::Mutex { queue } => {
+                queue.lock().expect("stealable queue lock poisoned").len()
+            }
+            StealableInbox::SegQueue { len, .. } => len.load(Ordering::Relaxed),
+        }
+    }
+}
+
+type StealableInboxes = Arc<Vec<Arc<StealableInbox>>>;
+type StealableWakeFlags = Arc<Vec<CachePadded<AtomicBool>>>;
+
+#[derive(Debug, Clone, Copy)]
+struct StealPolicyConfig {
+    victim_stride: usize,
+    victim_probe_count: usize,
+    batch_size: usize,
+    locality_margin: usize,
+    fail_cost: usize,
+    backoff_min: usize,
+    backoff_max: usize,
+}
+
+#[derive(Default)]
+struct StealLoopState {
+    failed_streak: usize,
+    cooldown_remaining: usize,
+}
 
 struct RuntimeStatsInner {
-    shard_command_depths: Vec<AtomicUsize>,
-    pending_native_ops_by_shard: Vec<AtomicUsize>,
+    shard_command_depths: Vec<CachePadded<AtomicUsize>>,
+    pending_native_ops_by_shard: Vec<CachePadded<AtomicUsize>>,
     native_any_envelope_submitted: AtomicU64,
     native_any_local_fastpath_submitted: AtomicU64,
     native_any_local_direct_submitted: AtomicU64,
@@ -4840,9 +5062,16 @@ struct RuntimeStatsInner {
     stealable_executed: AtomicU64,
     stealable_stolen: AtomicU64,
     stealable_backpressure: AtomicU64,
+    stealable_local_hits: AtomicU64,
     steal_attempts: AtomicU64,
+    steal_scans: AtomicU64,
     steal_success: AtomicU64,
-    steal_victim_stride: usize,
+    steal_skipped_backoff: AtomicU64,
+    steal_skipped_locality: AtomicU64,
+    steal_failed_streak_max: AtomicU64,
+    stealable_wake_sent: AtomicU64,
+    stealable_wake_coalesced: AtomicU64,
+    steal_policy: StealPolicyConfig,
     ring_msgs_submitted: AtomicU64,
     ring_msgs_completed: AtomicU64,
     ring_msgs_failed: AtomicU64,
@@ -4852,12 +5081,12 @@ struct RuntimeStatsInner {
 }
 
 impl RuntimeStatsInner {
-    fn new(shards: usize, steal_victim_stride: usize) -> Self {
+    fn new(shards: usize, steal_policy: StealPolicyConfig) -> Self {
         let mut shard_command_depths = Vec::with_capacity(shards);
         let mut pending_native_ops_by_shard = Vec::with_capacity(shards);
         for _ in 0..shards {
-            shard_command_depths.push(AtomicUsize::new(0));
-            pending_native_ops_by_shard.push(AtomicUsize::new(0));
+            shard_command_depths.push(CachePadded::new(AtomicUsize::new(0)));
+            pending_native_ops_by_shard.push(CachePadded::new(AtomicUsize::new(0)));
         }
 
         Self {
@@ -4871,9 +5100,16 @@ impl RuntimeStatsInner {
             stealable_executed: AtomicU64::new(0),
             stealable_stolen: AtomicU64::new(0),
             stealable_backpressure: AtomicU64::new(0),
+            stealable_local_hits: AtomicU64::new(0),
             steal_attempts: AtomicU64::new(0),
+            steal_scans: AtomicU64::new(0),
             steal_success: AtomicU64::new(0),
-            steal_victim_stride: steal_victim_stride.max(1),
+            steal_skipped_backoff: AtomicU64::new(0),
+            steal_skipped_locality: AtomicU64::new(0),
+            steal_failed_streak_max: AtomicU64::new(0),
+            stealable_wake_sent: AtomicU64::new(0),
+            stealable_wake_coalesced: AtomicU64::new(0),
+            steal_policy,
             ring_msgs_submitted: AtomicU64::new(0),
             ring_msgs_completed: AtomicU64::new(0),
             ring_msgs_failed: AtomicU64::new(0),
@@ -4909,9 +5145,22 @@ impl RuntimeStatsInner {
             stealable_executed: self.stealable_executed.load(Ordering::Relaxed),
             stealable_stolen: self.stealable_stolen.load(Ordering::Relaxed),
             stealable_backpressure: self.stealable_backpressure.load(Ordering::Relaxed),
+            stealable_local_hits: self.stealable_local_hits.load(Ordering::Relaxed),
             steal_attempts: self.steal_attempts.load(Ordering::Relaxed),
+            steal_scans: self.steal_scans.load(Ordering::Relaxed),
             steal_success: self.steal_success.load(Ordering::Relaxed),
-            steal_victim_stride: self.steal_victim_stride,
+            steal_skipped_backoff: self.steal_skipped_backoff.load(Ordering::Relaxed),
+            steal_skipped_locality: self.steal_skipped_locality.load(Ordering::Relaxed),
+            steal_failed_streak_max: self.steal_failed_streak_max.load(Ordering::Relaxed),
+            stealable_wake_sent: self.stealable_wake_sent.load(Ordering::Relaxed),
+            stealable_wake_coalesced: self.stealable_wake_coalesced.load(Ordering::Relaxed),
+            steal_victim_stride: self.steal_policy.victim_stride,
+            steal_victim_probe_count: self.steal_policy.victim_probe_count,
+            steal_batch_size: self.steal_policy.batch_size,
+            steal_locality_margin: self.steal_policy.locality_margin,
+            steal_fail_cost: self.steal_policy.fail_cost,
+            steal_backoff_min: self.steal_policy.backoff_min,
+            steal_backoff_max: self.steal_policy.backoff_max,
             ring_msgs_submitted: self.ring_msgs_submitted.load(Ordering::Relaxed),
             ring_msgs_completed: self.ring_msgs_completed.load(Ordering::Relaxed),
             ring_msgs_failed: self.ring_msgs_failed.load(Ordering::Relaxed),
@@ -4960,6 +5209,15 @@ impl RuntimeStatsInner {
             .get(usize::from(shard))
             .map_or(0, |depth| depth.load(Ordering::Relaxed))
     }
+
+    fn observe_failed_streak(&self, failed_streak: usize) {
+        let failed_streak = failed_streak as u64;
+        let _ = self.steal_failed_streak_max.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.max(failed_streak)),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -4968,6 +5226,7 @@ struct RuntimeShared {
     backend: BackendKind,
     command_txs: Vec<Sender<Command>>,
     stealable_inboxes: StealableInboxes,
+    stealable_wake_flags: StealableWakeFlags,
     stealable_queue_capacity: usize,
     stats: Arc<RuntimeStatsInner>,
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
@@ -4988,15 +5247,38 @@ impl RuntimeShared {
     }
 
     fn notify_stealable_target(&self, target: ShardId) {
-        if let Some(ctx) = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.runtime_id) {
-            if ctx.shard_id() == target {
-                return;
-            }
-            let _ = ctx.enqueue_local_stealable_wake(target);
+        let Some(flag) = self.stealable_wake_flags.get(usize::from(target)) else {
+            return;
+        };
+        if flag.swap(true, Ordering::AcqRel) {
+            self.stats
+                .stealable_wake_coalesced
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
 
-        let _ = self.send_to(target, Command::StealableWake);
+        if let Some(ctx) = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.runtime_id) {
+            if ctx.shard_id() == target {
+                flag.store(false, Ordering::Release);
+                return;
+            }
+            if ctx.enqueue_local_stealable_wake(target).is_ok() {
+                self.stats
+                    .stealable_wake_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                flag.store(false, Ordering::Release);
+            }
+            return;
+        }
+
+        if self.send_to(target, Command::StealableWake).is_err() {
+            flag.store(false, Ordering::Release);
+        } else {
+            self.stats
+                .stealable_wake_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -8680,12 +8962,29 @@ impl IoUringDriver {
     }
 }
 
-fn build_stealable_inboxes(shards: usize) -> StealableInboxes {
+fn build_stealable_inboxes(shards: usize, backend: StealableQueueBackend) -> StealableInboxes {
     let mut queues = Vec::with_capacity(shards);
     for _ in 0..shards {
-        queues.push(Arc::new(Mutex::new(VecDeque::new())));
+        let queue = match backend {
+            StealableQueueBackend::Mutex => StealableInbox::Mutex {
+                queue: CachePadded::new(Mutex::new(VecDeque::new())),
+            },
+            StealableQueueBackend::SegQueueExperimental => StealableInbox::SegQueue {
+                queue: SegQueue::new(),
+                len: CachePadded::new(AtomicUsize::new(0)),
+            },
+        };
+        queues.push(Arc::new(queue));
     }
     Arc::new(queues)
+}
+
+fn build_stealable_wake_flags(shards: usize) -> StealableWakeFlags {
+    let mut flags = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        flags.push(CachePadded::new(AtomicBool::new(false)));
+    }
+    Arc::new(flags)
 }
 
 fn build_hot_msg_tag_lookup(tags: &[u16]) -> Vec<bool> {
@@ -8859,11 +9158,12 @@ fn run_shard(
     rx: Receiver<Command>,
     remotes: Vec<RemoteShard>,
     stealable_deques: StealableInboxes,
+    stealable_wake_flags: StealableWakeFlags,
     hot_msg_tags: Arc<Vec<bool>>,
     coalesced_hot_msg_tags: Arc<Vec<bool>>,
     hot_counter_wake_threshold: u64,
     steal_budget: usize,
-    steal_victim_stride: usize,
+    steal_policy: StealPolicyConfig,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
 ) {
@@ -8898,9 +9198,16 @@ fn run_shard(
     });
 
     let mut steal_cursor = (usize::from(shard_id) + 1) % stealable_deques.len().max(1);
+    let mut steal_state = StealLoopState::default();
+    if let Some(flag) = stealable_wake_flags.get(usize::from(shard_id)) {
+        flag.store(false, Ordering::Release);
+    }
 
     let mut stop = false;
     while !stop {
+        if let Some(flag) = stealable_wake_flags.get(usize::from(shard_id)) {
+            flag.store(false, Ordering::Release);
+        }
         pool.run_until_stalled();
         drain_local_commands(
             shard_id,
@@ -8913,8 +9220,9 @@ fn run_shard(
             shard_id,
             &stealable_deques,
             steal_budget,
-            steal_victim_stride,
+            steal_policy,
             &mut steal_cursor,
+            &mut steal_state,
             &spawner,
             &stats,
         );
@@ -8943,6 +9251,8 @@ fn run_shard(
                         &coalesced_hot_msg_tags,
                         &stats,
                         &local_commands,
+                        &stealable_wake_flags,
+                        &mut steal_state,
                     );
                     if stop {
                         break;
@@ -8972,8 +9282,9 @@ fn run_shard(
                 shard_id,
                 &stealable_deques,
                 steal_budget,
-                steal_victim_stride,
+                steal_policy,
                 &mut steal_cursor,
+                &mut steal_state,
                 &spawner,
                 &stats,
             );
@@ -8993,8 +9304,9 @@ fn run_shard(
             shard_id,
             &stealable_deques,
             steal_budget,
-            steal_victim_stride,
+            steal_policy,
             &mut steal_cursor,
+            &mut steal_state,
             &spawner,
             &stats,
         );
@@ -9029,7 +9341,7 @@ fn run_shard(
 
 fn handle_command(
     cmd: Command,
-    _shard_id: ShardId,
+    shard_id: ShardId,
     spawner: &LocalSpawner,
     event_state: &EventState,
     hot_event_state: &EventState,
@@ -9038,6 +9350,8 @@ fn handle_command(
     coalesced_hot_msg_tags: &[bool],
     stats: &RuntimeStatsInner,
     _local_commands: &RefCell<VecDeque<LocalCommand>>,
+    stealable_wake_flags: &StealableWakeFlags,
+    steal_state: &mut StealLoopState,
 ) -> bool {
     match cmd {
         Command::Spawn(fut) => {
@@ -9070,10 +9384,17 @@ fn handle_command(
         Command::SubmitNativeAny { op } => {
             _local_commands
                 .borrow_mut()
-                .push_back(op.into_local(_shard_id));
+                .push_back(op.into_local(shard_id));
             false
         }
-        Command::StealableWake => false,
+        Command::StealableWake => {
+            if let Some(flag) = stealable_wake_flags.get(usize::from(shard_id)) {
+                flag.store(false, Ordering::Release);
+            }
+            steal_state.failed_streak = 0;
+            steal_state.cooldown_remaining = 0;
+            false
+        }
         Command::Shutdown => true,
     }
 }
@@ -9082,19 +9403,20 @@ fn drain_stealable_tasks(
     shard_id: ShardId,
     stealable_deques: &StealableInboxes,
     steal_budget: usize,
-    steal_victim_stride: usize,
+    steal_policy: StealPolicyConfig,
     steal_cursor: &mut usize,
+    steal_state: &mut StealLoopState,
     spawner: &LocalSpawner,
     stats: &RuntimeStatsInner,
 ) -> bool {
     fn spawn_task(
-        shard_id: ShardId,
         task: StealableTask,
+        stolen: bool,
         spawner: &LocalSpawner,
         stats: &RuntimeStatsInner,
     ) {
         stats.stealable_executed.fetch_add(1, Ordering::Relaxed);
-        if task.preferred_shard != shard_id {
+        if stolen {
             stats.stealable_stolen.fetch_add(1, Ordering::Relaxed);
         }
         let _ = spawner.spawn_local(task.task);
@@ -9107,54 +9429,129 @@ fn drain_stealable_tasks(
         return false;
     };
     let mut remaining = budget;
+    let mut local_hits = 0u64;
 
     while remaining > 0 {
-        let task = local_deque
-            .lock()
-            .expect("stealable queue lock poisoned")
-            .pop_front();
+        let task = local_deque.pop_local();
         let Some(task) = task else {
             break;
         };
         drained = true;
         remaining -= 1;
-        spawn_task(shard_id, task, spawner, stats);
+        local_hits += 1;
+        spawn_task(task, false, spawner, stats);
+    }
+    if local_hits > 0 {
+        stats
+            .stealable_local_hits
+            .fetch_add(local_hits, Ordering::Relaxed);
+        steal_state.failed_streak = 0;
+        steal_state.cooldown_remaining = 0;
     }
 
     if remaining == 0 || stealable_deques.len() <= 1 {
         return drained;
     }
 
+    if steal_state.cooldown_remaining > 0 {
+        steal_state.cooldown_remaining -= 1;
+        stats.steal_skipped_backoff.fetch_add(1, Ordering::Relaxed);
+        return drained;
+    }
+
     let shard_count = stealable_deques.len();
-    let stride = steal_victim_stride.max(1) % shard_count.max(1);
+    let stride = steal_policy.victim_stride.max(1) % shard_count.max(1);
     let stride = if stride == 0 { 1 } else { stride };
-    let max_attempts = shard_count.saturating_sub(1);
+    let max_attempts = shard_count.saturating_sub(1).max(1);
     let mut attempts = 0usize;
+    let mut stole_any = false;
     while remaining > 0 && attempts < max_attempts {
-        let mut victim_idx = *steal_cursor % shard_count;
-        *steal_cursor = (*steal_cursor + stride) % shard_count;
-        if victim_idx == local_idx {
-            victim_idx = *steal_cursor % shard_count;
+        let mut best_victim = None;
+        let mut best_len = 0usize;
+        let probes = steal_policy.victim_probe_count.max(1);
+
+        for _ in 0..probes {
+            if attempts >= max_attempts {
+                break;
+            }
+
+            let mut candidate_idx = *steal_cursor % shard_count;
             *steal_cursor = (*steal_cursor + stride) % shard_count;
+            if candidate_idx == local_idx {
+                candidate_idx = *steal_cursor % shard_count;
+                *steal_cursor = (*steal_cursor + stride) % shard_count;
+            }
+            if candidate_idx == local_idx {
+                continue;
+            }
+
+            attempts += 1;
+            stats.steal_attempts.fetch_add(1, Ordering::Relaxed);
+            let candidate_len = stealable_deques[candidate_idx].len_estimate();
+            if candidate_len > best_len {
+                best_len = candidate_len;
+                best_victim = Some(candidate_idx);
+            }
         }
-        if victim_idx == local_idx {
+
+        let Some(victim_idx) = best_victim else {
             break;
+        };
+        stats.steal_scans.fetch_add(1, Ordering::Relaxed);
+
+        let estimated_time_saved = best_len;
+        let fail_streak_cost = steal_state.failed_streak.min(4);
+        let estimated_migration_cost =
+            1usize.saturating_add(fail_streak_cost.saturating_mul(steal_policy.fail_cost.max(1)));
+        if estimated_time_saved
+            <= estimated_migration_cost.saturating_add(steal_policy.locality_margin)
+        {
+            stats.steal_skipped_locality.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
 
-        attempts += 1;
-        stats.steal_attempts.fetch_add(1, Ordering::Relaxed);
-        let task = stealable_deques[victim_idx]
-            .lock()
-            .expect("stealable queue lock poisoned")
-            .pop_back();
-        let Some(task) = task else {
-            continue;
+        let dynamic_batch = if best_len
+            > estimated_migration_cost
+                .saturating_add(steal_policy.locality_margin)
+                .saturating_add(1)
+        {
+            steal_policy.batch_size.max(1).min(best_len)
+        } else {
+            1
         };
+        let to_take = dynamic_batch.min(remaining).max(1);
 
-        stats.steal_success.fetch_add(1, Ordering::Relaxed);
-        drained = true;
-        remaining -= 1;
-        spawn_task(shard_id, task, spawner, stats);
+        let mut stolen_now = 0u64;
+        for _ in 0..to_take {
+            let Some(task) = stealable_deques[victim_idx].pop_stolen() else {
+                break;
+            };
+            stolen_now += 1;
+            remaining -= 1;
+            drained = true;
+            spawn_task(task, true, spawner, stats);
+        }
+
+        if stolen_now > 0 {
+            stats.steal_success.fetch_add(stolen_now, Ordering::Relaxed);
+            stole_any = true;
+        }
+    }
+
+    if stole_any {
+        steal_state.failed_streak = 0;
+        steal_state.cooldown_remaining = 0;
+    } else if remaining > 0 {
+        steal_state.failed_streak = steal_state.failed_streak.saturating_add(1);
+        stats.observe_failed_streak(steal_state.failed_streak);
+
+        let shift = steal_state.failed_streak.saturating_sub(1).min(8) as u32;
+        let scale = 1usize.checked_shl(shift).unwrap_or(usize::MAX);
+        let cooldown = steal_policy
+            .backoff_min
+            .saturating_mul(scale)
+            .min(steal_policy.backoff_max.max(steal_policy.backoff_min));
+        steal_state.cooldown_remaining = cooldown.max(1);
     }
     drained
 }

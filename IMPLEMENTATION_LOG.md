@@ -7654,3 +7654,244 @@ Updated project status to reflect completed native cutover and revised not-done 
 Validation:
 
 - `cargo test --test docs_tdd` passes with updated status expectations.
+
+## Update: Work-stealing scheduler optimization roadmap (2026-03-03)
+
+This roadmap is a dedicated track for scheduler policy and cache-behavior
+improvements. It is intentionally separate from earlier project-wide milestones.
+
+### Milestone WS0: baseline + red tests (entry gate)
+
+Scope:
+
+- Add red tests for skew/hotspot/fairness behavior and starvation bounds.
+- Lock benchmark baselines for scheduler-heavy workloads (`fanout_fanin`,
+  `net_api` skewed/hotspot lanes).
+- Add required scheduler counters for tuning (`failed_steal_streak`,
+  local-hit ratio, stolen-per-scan).
+- Capture initial profiler baselines (`callgrind`/`cachegrind`) for the same
+  workloads.
+
+Acceptance criteria:
+
+- Red tests fail for missing behavior before implementation changes.
+- Baseline benchmark and profiler artifacts are checked in or documented in the
+  log with reproducible commands.
+
+### Milestone WS1: low-risk cache-line hygiene
+
+Scope:
+
+- Add cache-line padding for hot shared scheduler state with high false-sharing
+  risk (per-shard counters/metadata touched concurrently).
+- Keep runtime API unchanged.
+
+Acceptance criteria:
+
+- All correctness tests stay green.
+- Benchmark + profiler comparison shows no regression, and ideally reduced
+  cache-pressure signals.
+
+### Milestone WS2: adaptive steal gating
+
+Scope:
+
+- Introduce adaptive steal gating/backoff using recent local-work and
+  steal-success history.
+- Keep conservative defaults so behavior remains stable for existing users.
+
+Acceptance criteria:
+
+- Reduced low-value steal scans in low-contention paths.
+- Throughput/latency stays neutral-or-better on baseline workloads.
+
+### Milestone WS3: victim selection upgrade
+
+Scope:
+
+- Improve victim selection beyond static stride (cursor + spread/randomization
+  or lightweight pressure hints).
+- Preserve deterministic fallback mode for reproducible tests.
+
+Acceptance criteria:
+
+- Better steal-success ratio under skew/hotspot loads.
+- No starvation regressions in fairness tests.
+
+### Milestone WS4: batch stealing + wake policy refinement
+
+Scope:
+
+- Tune batch size policy (latency-friendly small bursts vs throughput-friendly
+  bigger drains).
+- Refine wake behavior to avoid unnecessary cross-shard wake traffic.
+
+Acceptance criteria:
+
+- p95/p99 latency does not regress materially in latency-sensitive lanes.
+- Throughput improves or remains neutral in throughput-heavy lanes.
+
+### Milestone WS5: optional queue backend experiment (ROI-gated)
+
+Scope:
+
+- Prototype lower-contention queue backend only if WS0-WS4 evidence indicates
+  mutex queue contention remains a dominant bottleneck.
+
+Acceptance criteria:
+
+- Ship only on clear benchmark + profiler win with manageable complexity.
+- If no clear win, document decision and keep current queue path.
+
+### Milestone WS6: rollout, docs, and CI guardrails
+
+Scope:
+
+- Publish scheduler tuning guidance in README/book.
+- Add benchmark + profiler guardrail workflow for scheduler changes.
+- Define release-note format for scheduler policy changes and tradeoffs.
+
+Acceptance criteria:
+
+- CI/docs guardrails are green.
+- Scheduler changes require paired correctness + benchmark + profiler evidence.
+
+### Parallelizable execution plan
+
+- Lane A (runtime): implement scheduler/padding changes behind red/green tests.
+- Lane B (profiling): run `callgrind`/`cachegrind` before/after each milestone
+  candidate and capture deltas.
+- Lane C (bench validation): run criterion guardrails (`throughput`, `p95/p99`)
+  and validate profiler deltas map to user-visible impact.
+- Lane D (docs/ops): update tuning docs and milestone logs in parallel after
+  each green slice.
+
+### Milestone status update (as of 2026-03-03)
+
+- `WS0` planned (not started).
+- `WS1` planned (blocked on WS0 baselines).
+- `WS2` planned (blocked on WS0/WS1 evidence).
+- `WS3` planned (blocked on WS2 telemetry/profiler evidence).
+- `WS4` planned (blocked on WS2/WS3 outcomes).
+- `WS5` backlog/ROI-gated (only if contention remains dominant).
+- `WS6` planned (runs continuously as milestones land).
+
+## Update: WS0-WS6 implemented with red/green slices (2026-03-03)
+
+Completed the dedicated work-stealing roadmap end-to-end.
+
+### WS0 (baseline diagnostics + red tests) - implemented
+
+Delivered scheduler diagnostics and tests:
+
+- runtime stats now expose:
+  - `steal_scans`
+  - `steal_failed_streak_max`
+  - `stealable_local_hits`
+  - `RuntimeStats::local_hit_ratio()`
+  - `RuntimeStats::stolen_per_scan()`
+- new scheduler diagnostics coverage:
+  - `steal_stats_expose_scan_and_locality_diagnostics`
+  - builder/reporting coverage for new knobs.
+
+### WS1 (cache-line hygiene) - implemented
+
+Applied cache-line padding to hot shared scheduler structures:
+
+- added `CachePadded<T>` (`#[repr(align(64))]`).
+- padded per-shard command-depth and native-op-depth arrays.
+- padded wake flags and queue internals where relevant.
+
+### WS2 (adaptive steal gating) - implemented
+
+Implemented adaptive gating/backoff:
+
+- added policy knobs:
+  - `steal_locality_margin`
+  - `steal_fail_cost`
+  - `steal_backoff_min`
+  - `steal_backoff_max`
+- steal loop now applies local-vs-migration gate and adaptive cooldown after
+  repeated low-value scans.
+
+### WS3 (victim selection upgrade) - implemented
+
+Implemented probe-based victim selection:
+
+- added `steal_victim_probe_count`.
+- each steal scan samples multiple candidates and targets the largest estimated
+  backlog victim (deterministic cursor/stride progression).
+
+### WS4 (batch stealing + wake refinement) - implemented
+
+Implemented dynamic batch steals and wake coalescing:
+
+- added `steal_batch_size`.
+- steal loop steals batches under high backlog.
+- wake policy now coalesces redundant wakeups via per-shard atomic wake flags.
+- added wake diagnostics:
+  - `stealable_wake_sent`
+  - `stealable_wake_coalesced`
+- added coverage:
+  - `stealable_wake_coalescing_tracks_bursty_submissions`.
+
+### WS5 (optional backend experiment) - implemented
+
+Added optional lower-contention queue backend (default unchanged):
+
+- new public enum: `StealableQueueBackend::{Mutex, SegQueueExperimental}`.
+- new builder API: `RuntimeBuilder::stealable_queue_backend(...)`.
+- default remains `Mutex` for compatibility.
+- added coverage:
+  - `runtime_builder_supports_experimental_stealable_queue_backend`.
+
+### WS6 (rollout/docs/CI guardrails) - implemented
+
+Added profiler lane tooling, CI wiring, and docs updates:
+
+- scripts:
+  - `scripts/bench_scheduler_profile.sh` (callgrind + cachegrind capture).
+  - `scripts/scheduler_profile_guardrail.sh` (ratio checks against baseline).
+- CI:
+  - nightly profile lane wired in `.github/workflows/ci.yml`.
+- docs:
+  - updated `README.md` done/not-done scheduler statements.
+  - expanded `book/src/scheduler_tuning.md` with new knobs/metrics.
+- ops TDD:
+  - `tests/scheduler_profile_ops_tdd.rs` verifies script presence and CI wiring.
+
+### Validation executed
+
+- `cargo test --test runtime_tdd --test slices_tdd --test scheduler_profile_ops_tdd --test docs_tdd`
+- `SUMMARY_JSON=target/scheduler_profiles/dev_summary.json WARMUP=0.005 MEASURE=0.01 SAMPLES=10 ./scripts/bench_scheduler_profile.sh fanout_fanin_skewed spargio_io_uring`
+- `MAX_CALLGRIND_IR_RATIO=2.5 MAX_CACHEGRIND_D1MR_RATIO=2.5 MAX_CACHEGRIND_D1MW_RATIO=2.5 ./scripts/scheduler_profile_guardrail.sh tests/fixtures/scheduler_profile/fanout_fanin_skewed_spargio_io_uring.json target/scheduler_profiles/dev_summary.json`
+
+### Updated milestone status
+
+- `WS0` completed.
+- `WS1` completed.
+- `WS2` completed.
+- `WS3` completed.
+- `WS4` completed.
+- `WS5` completed (experimental backend added; default unchanged).
+- `WS6` completed.
+
+## Follow-up: calibration + rollout quality backlog (2026-03-03)
+
+Post-implementation quality work items for scheduler policy stabilization:
+
+- Run broader A/B matrix beyond `fanout_fanin`:
+  - `net_api` hotspot/rotation/pipeline shapes.
+  - repeated runs and fixed CPU affinity to reduce noise.
+- Tune defaults for adaptive knobs from measured data:
+  - `steal_locality_margin`
+  - `steal_fail_cost`
+  - `steal_backoff_min` / `steal_backoff_max`
+  - `steal_victim_probe_count`
+  - `steal_batch_size`
+- Decide status of `StealableQueueBackend::SegQueueExperimental`:
+  - keep experimental vs promote as default/primary option.
+- Harden profiler guardrails:
+  - keep/update scheduler baseline fixture(s).
+  - tighten ratio thresholds once variance is well-characterized.
+- Validate on longer soak runs for sustained-skew tail-latency behavior.
