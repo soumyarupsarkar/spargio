@@ -116,6 +116,6 @@ This snippet keeps Tokio as the application entry runtime and calls
 
 ## What To Read Next
 
-- Choose placement and local execution: [Task Placement and !Send Execution](3_runtime_model.md)
-- Understand APIs and caveats: [I/O API Layers and Selection](8_io_apis.md)
+- Choose placement and local execution: [Task Placement and !Send Execution](03_runtime_model.md)
+- Understand APIs and caveats: [I/O API Layers and Selection](08_io_apis.md)
 - Production workflow: [Performance Guide](12_performance_guide.md)
