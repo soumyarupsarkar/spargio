@@ -141,16 +141,16 @@ For performance, different workload shapes favor different runtimes.
 - QUIC native default backend now runs on `quinn-proto` driver path (`NativeProtoDriver` + native UDP pump/timers) with stream/datagram operations routed through the driver; bridge mode remains explicit compatibility fallback.
 - Companion hardening lane: `scripts/companion_ci_smoke.sh` plus CI `companion-matrix` job.
 - QUIC qualification lanes: interop matrix (`scripts/quic_interop_matrix.sh`), soak/fault lane (`scripts/quic_soak_fault.sh`, nightly), and native-vs-bridge perf gate (`scripts/quic_perf_gate.sh`).
-- In-repo long-form docs scaffold: `book/` (`mdBook`) with protocol/API-selection and migration chapters.
+- In-repo user-facing `book/` (`mdBook`) covering quick start, task placement (`!Send` + stealable locality-first defaults), I/O API selection, protocol crates, native extensions, performance tuning, operations, migration, and status.
 - Reference mixed-mode service example.
 
 ## What's Not Done Yet
 
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
-- Work-stealing tuning guidance is not fully documented yet: add operator-facing docs for user-adjustable `RuntimeBuilder` knobs (`steal_*`, queue backend/capacity), defaults, and a metrics-driven tuning playbook using `RuntimeHandle::stats_snapshot()`.
-- Expand `book/` coverage into deeper API-selection, placement, and operations guides.
-- Broaden documentation coverage while refactoring core modules for maintainability: continue splitting large runtime/fs/net surfaces into smaller focused units and keep API docs/book content aligned with each refactor.
+- Work-stealing tuning guidance still needs deeper production case studies and calibration examples on top of the current knob and profiling documentation.
+- Continue readability/editorial cleanup across README + `book/`: tighten wording, keep examples minimal but practical, and reduce ambiguous terminology.
+- Broaden documentation coverage while refactoring core modules for maintainability: keep API docs/book content aligned as runtime/fs/net surfaces continue to be split into smaller focused units.
 
 ## Longer-term Improvement Ideas
 
