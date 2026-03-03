@@ -146,17 +146,21 @@ For performance, different workload shapes favor different runtimes.
 
 ## What's Not Done Yet
 
-- Full production-grade higher-level ecosystem parity is still in progress; companion crates now provide practical bridges and qualification lanes, but deeper protocol-specific maturity remains (broader TLS/WS tuning surfaces, richer process stdio orchestration, and deeper long-window failure coverage).
-- QUIC backend hardening is still in progress: native default path is driver-backed now, but long-window soak/fault/perf requalification depth and rollout maturity (`rollout_stage`) still need production validation.
-- Multi-endpoint QUIC sharding/fan-out orchestration is not built in yet: a single `QuicEndpoint` still owns one native transport backend, so multi-core listener scaling is currently a manual multi-endpoint deployment pattern.
-- Fully io_uring-submitted directory traversal is still in progress: `read_dir`/`du` APIs are built-in, but (as of 2026-03-03) upstream io_uring userspace/kernel ABIs do not expose a stable `getdents` opcode surface (`IORING_OP_GETDENTS`), so traversal currently uses a blocking-helper lane (`getdents64` with compatibility fallback) instead of pure in-ring submission.
 - Hostname-based `ToSocketAddrs` connect/bind paths can still block for DNS resolution; use explicit `SocketAddr` APIs (`connect_socket_addr*`, `bind_socket_addr`) for strictly non-DNS data-plane paths.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
-- Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
-- Further workload-specific work-stealing model calibration is still iterative (the adaptive policy is implemented, but thresholds/weights are expected to continue evolving with production traces).
 - Work-stealing tuning guidance is not fully documented yet: add operator-facing docs for user-adjustable `RuntimeBuilder` knobs (`steal_*`, queue backend/capacity), defaults, and a metrics-driven tuning playbook using `RuntimeHandle::stats_snapshot()`.
 - Expand `book/` coverage into deeper API-selection, placement, and operations guides.
+- Broaden documentation coverage while refactoring core modules for maintainability: continue splitting large runtime/fs/net surfaces into smaller focused units and keep API docs/book content aligned with each refactor.
+
+## Longer-term Improvement Ideas
+
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) is explicitly deprioritized for now (backlog-only, not planned right now).
+- Full production-grade higher-level ecosystem parity is still in progress; companion crates now provide practical bridges and qualification lanes, but deeper protocol-specific maturity remains (broader TLS/WS tuning surfaces, richer process stdio orchestration, and deeper long-window failure coverage).
+- QUIC backend hardening is still in progress: native default path is driver-backed now, but long-window soak/fault/perf requalification depth and rollout maturity (`rollout_stage`) still need production validation.
+- Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
+- Further workload-specific work-stealing model calibration is still iterative (the adaptive policy is implemented, but thresholds/weights are expected to continue evolving with production traces).
+- Multi-endpoint QUIC sharding/fan-out orchestration is not built in yet: a single `QuicEndpoint` still owns one native transport backend, so multi-core listener scaling is currently a manual multi-endpoint deployment pattern.
+- Fully io_uring-submitted directory traversal is still in progress: `read_dir`/`du` APIs are built-in, but (as of 2026-03-03) upstream io_uring userspace/kernel ABIs do not expose a stable `getdents` opcode surface (`IORING_OP_GETDENTS`), so traversal currently uses a blocking-helper lane (`getdents64` with compatibility fallback) instead of pure in-ring submission.
 
 ## Contributor Quick Start
 
