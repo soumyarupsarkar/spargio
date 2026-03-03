@@ -4,13 +4,13 @@
 
 Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across threads (a novel form of work-stealing).
 
-In our benchmarks (detailed below), `spargio` outperforms `compio` (and likely all share-nothing runtimes) in imbalanced or coordination-heavy workloads by up to 80%, and outperforms `tokio` for cases involving high coordination or disk I/O by up to 280%. `compio` leads for sustained, balanced workloads by up to 40%.
+In our benchmarks (detailed below), `spargio` outperforms `compio` (and likely all share-nothing runtimes) in imbalanced workloads by up to 70%, and outperforms `tokio` for cases involving high coordination or disk I/O by up to 320%. `compio` leads for sustained, balanced workloads by up to 70%.
 
 Out-of-the-box, we support async disk I/O, network I/O (including TLS/WebSockets/QUIC), process execution, and signal handling, and provide an extension API for additional `io_uring` operations. We support both `tokio`-style stealable tasks and `compio`-style pinned (thread-affine) tasks.
 
 ## Disclaimer
 
-`spargio` began as a proof of concept built with Codex to see if the idea is worth pursuing, and remains a work-in-progress. I have not reviewed all the code yet. Treat it as pre-alpha.
+`spargio` began as an experimental proof-of-concept built with Codex. I have not manually reviewed all the code yet. Use for evaluation only.
 
 ## Quick start
 
@@ -32,16 +32,16 @@ async fn main(handle: RuntimeHandle) -> std::io::Result<()> {
     let mut id = 0u64;
 
     loop {
-	let (stream, _) = listener.accept_round_robin().await?;
-	let (h, s, path) = (handle.clone(), stream.clone(), format!("ingest-out/{id}.bin"));
-	id += 1;
+        let (stream, _) = listener.accept_round_robin().await?;
+        let (h, s, path) = (handle.clone(), stream.clone(), format!("ingest-out/{id}.bin"));
+        id += 1;
 
-	stream.spawn_stealable_on_session(&handle, async move {
-	    let file = File::create(h, path).await.unwrap();
-	    let (n, buf) = s.recv_owned(vec![0; 64 * 1024]).await.unwrap();
-	    file.write_all_at(0, &buf[..n]).await.unwrap();
-	    file.fsync().await.unwrap();
-	}).expect("spawn");
+        stream.spawn_stealable_on_session(&handle, async move {
+            let file = File::create(h, path).await.unwrap();
+            let (n, buf) = s.recv_owned(vec![0; 64 * 1024]).await.unwrap();
+            file.write_all_at(0, &buf[..n]).await.unwrap();
+            file.fsync().await.unwrap();
+        }).expect("spawn");
     }
 }
 ```
@@ -74,11 +74,11 @@ In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a
 
 | Benchmark | Description | Tokio | Spargio | Speedup |
 | --- | --- | --- | --- | --- |
-| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.4911-1.5024 ms` | `394.83-396.21 us` | `3.8x` |
-| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `68.607-70.859 us` | `49.232-50.110 us` | `1.4x` |
-| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `553.31-561.83 us` | `284.23-287.50 us` | `2.0x` |
-| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.4534-1.4631 ms` | `1.3426-1.3480 ms` | `1.1x` |
-| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.4026-2.4220 ms` | `1.9979-2.0032 ms` | `1.2x` |
+| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.5306-1.5553 ms` | `370.15-371.56 us` | `4.2x` |
+| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `64.342-65.891 us` | `46.913-47.108 us` | `1.4x` |
+| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `440.24-446.64 us` | `230.40-239.74 us` | `1.9x` |
+| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.7615-2.0255 ms` | `1.2121-1.2220 ms` | `1.6x` |
+| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.4438-2.5203 ms` | `1.9872-1.9994 ms` | `1.2x` |
 
 Compio is not listed in this coordination-only table because it is share-nothing (thread-per-core), while these cases are focused on cross-shard coordination behavior.
 
@@ -86,28 +86,28 @@ Compio is not listed in this coordination-only table because it is share-nothing
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.6174-1.6565 ms` | `1.0008-1.0188 ms` | `1.4782-1.4978 ms` | `1.6x` | `1.5x` |
-| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `7.8804-8.1672 ms` | `6.1570-6.2793 ms` | `4.0877-5.0803 ms` | `1.3x` | `0.7x` |
-| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.7462-7.9687 ms` | `5.4356-5.5084 ms` | `6.4541-6.5632 ms` | `1.4x` | `1.2x` |
-| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `11.142-11.247 ms` | `10.745-10.813 ms` | `7.0631-7.1570 ms` | `1.0x` | `0.7x` |
+| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.5439-1.6181 ms` | `1.2135-1.2231 ms` | `1.5285-1.5615 ms` | `1.3x` | `1.3x` |
+| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `14.535-14.967 ms` | `6.6040-6.7887 ms` | `5.1460-5.4356 ms` | `2.2x` | `0.8x` |
+| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.3259-7.4036 ms` | `5.9017-6.0314 ms` | `6.5355-6.6399 ms` | `1.2x` | `1.1x` |
+| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `12.794-14.002 ms` | `12.089-12.133 ms` | `6.9627-7.0208 ms` | `1.1x` | `0.6x` |
 
 ### Imbalanced Native API workloads (Tokio vs Spargio vs Compio)
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `13.584-13.799 ms` | `13.191-13.375 ms` | `12.283-12.414 ms` | `1.0x` | `0.9x` |
-| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `8.7891-8.8560 ms` | `9.3683-9.4526 ms` | `16.870-16.982 ms` | `0.9x` | `1.8x` |
-| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `26.415-26.654 ms` | `29.113-29.517 ms` | `50.648-51.210 ms` | `0.9x` | `1.7x` |
-| `net_keyed_hotspot_rotation_4k` | 8 streams, rotating hotspot with keyed ownership routing | `9.3152-9.4912 ms` | `9.5691-9.7957 ms` | `16.781-16.994 ms` | `1.0x` | `1.7x` |
+| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `15.025-16.108 ms` | `13.814-14.547 ms` | `13.575-13.976 ms` | `1.1x` | `1.0x` |
+| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `10.041-10.153 ms` | `10.952-11.059 ms` | `18.667-18.901 ms` | `0.9x` | `1.7x` |
+| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `29.946-30.260 ms` | `33.616-33.781 ms` | `57.532-58.111 ms` | `0.9x` | `1.7x` |
+| `net_keyed_hotspot_rotation_4k` | 8 streams, rotating hotspot with keyed ownership routing | `10.556-10.642 ms` | `11.080-11.219 ms` | `18.402-18.592 ms` | `1.0x` | `1.7x` |
 
 ## Benchmark Interpretation
 
-TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput. Somewhat surprisingly, Tokio remains ahead in some rotating-hotspot network shapes.
+TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth latency workloads; Compio is strongest on sustained balanced stream throughput. Tokio is near parity with Spargio on rotating-hotspot network shapes.
 
 - Spargio leads in coordination-heavy cross-shard cases versus Tokio (`steady_ping_pong_rtt`, `steady_one_way_send_drain`, `cold_start_ping_pong`, `fanout_fanin_*`).
 - Spargio leads in low-depth fs/net latency (`fs_read_rtt_4k`, `net_echo_rtt_256b`) versus both Tokio and Compio.
 - Compio leads in sustained balanced stream throughput and static-hotspot imbalance (`net_stream_throughput_4k_window32`, `net_stream_imbalanced_4k_hot1_light7`), while Spargio is currently ahead of Tokio in both of those cases.
-- Tokio currently leads in rotating-hotspot stream/pipeline cases; keyed routing is near parity (`net_stream_hotspot_rotation_4k`, `net_pipeline_hotspot_rotation_4k_window32`, `net_keyed_hotspot_rotation_4k`).
+- Tokio and Spargio are near parity in rotating-hotspot stream/pipeline cases and keyed routing (`net_stream_hotspot_rotation_4k`, `net_pipeline_hotspot_rotation_4k_window32`, `net_keyed_hotspot_rotation_4k`).
 
 For performance, different workload shapes favor different runtimes.
 
@@ -153,6 +153,7 @@ For performance, different workload shapes favor different runtimes.
 - Remaining fs helper migration to native io_uring where it is not a clear win is deferred: `canonicalize`, `metadata`, `symlink_metadata`, and `set_permissions` currently use compatibility blocking paths (`create_dir_all` is native-first for straightforward paths; `metadata_lite` exists as native-first metadata alternative).
 - Production hardening beyond smoke lanes: deeper failure-injection/soak coverage, broader observability for companion protocol paths, and long-window p95/p99 gates.
 - Further workload-specific work-stealing model calibration is still iterative (the adaptive policy is implemented, but thresholds/weights are expected to continue evolving with production traces).
+- Work-stealing tuning guidance is not fully documented yet: add operator-facing docs for user-adjustable `RuntimeBuilder` knobs (`steal_*`, queue backend/capacity), defaults, and a metrics-driven tuning playbook using `RuntimeHandle::stats_snapshot()`.
 - Expand `book/` coverage into deeper API-selection, placement, and operations guides.
 - Optional Tokio-compat readiness emulation shim (`IORING_OP_POLL_ADD`) is explicitly deprioritized for now (backlog-only, not planned right now).
 

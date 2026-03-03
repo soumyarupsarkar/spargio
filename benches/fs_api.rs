@@ -268,8 +268,23 @@ struct SpargioFsHarness {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum SpargioFsPlacement {
+    StealablePreferred,
+    Pinned,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 impl SpargioFsHarness {
     fn new(path: &Path, blocks: u32) -> Option<Self> {
+        Self::new_with_placement(path, blocks, SpargioFsPlacement::StealablePreferred)
+    }
+
+    fn new_pinned(path: &Path, blocks: u32) -> Option<Self> {
+        Self::new_with_placement(path, blocks, SpargioFsPlacement::Pinned)
+    }
+
+    fn new_with_placement(path: &Path, blocks: u32, placement: SpargioFsPlacement) -> Option<Self> {
         let runtime = match Runtime::builder()
             .shards(2)
             .backend(BackendKind::IoUring)
@@ -299,73 +314,79 @@ impl SpargioFsHarness {
         let handle_for_worker = handle.clone();
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioFsCmd>();
-        let worker_join = handle
-            .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), async move {
-                let mut rtt_buf = vec![0u8; BLOCK_SIZE];
-                while let Some(cmd) = cmd_rx.next().await {
-                    match cmd {
-                        SpargioFsCmd::ReadRtt { rounds, reply } => {
-                            let mut checksum = 0u64;
-                            for i in 0..rounds {
-                                let block = (i as u32) % blocks;
-                                let offset = u64::from(block) * BLOCK_SIZE as u64;
-                                let buf = std::mem::take(&mut rtt_buf);
-                                let (got, returned) =
-                                    file.read_at_into(offset, buf).await.expect("read_at_into");
-                                rtt_buf = returned;
-                                assert_eq!(got, BLOCK_SIZE, "short read in spargio bench");
-                                checksum =
-                                    checksum.wrapping_add(u64::from(block) ^ u64::from(rtt_buf[0]));
+        let worker_fut = async move {
+            let mut rtt_buf = vec![0u8; BLOCK_SIZE];
+            while let Some(cmd) = cmd_rx.next().await {
+                match cmd {
+                    SpargioFsCmd::ReadRtt { rounds, reply } => {
+                        let mut checksum = 0u64;
+                        for i in 0..rounds {
+                            let block = (i as u32) % blocks;
+                            let offset = u64::from(block) * BLOCK_SIZE as u64;
+                            let buf = std::mem::take(&mut rtt_buf);
+                            let (got, returned) =
+                                file.read_at_into(offset, buf).await.expect("read_at_into");
+                            rtt_buf = returned;
+                            assert_eq!(got, BLOCK_SIZE, "short read in spargio bench");
+                            checksum =
+                                checksum.wrapping_add(u64::from(block) ^ u64::from(rtt_buf[0]));
+                        }
+                        let _ = reply.send(checksum);
+                    }
+                    SpargioFsCmd::ReadQd { rounds, qd, reply } => {
+                        let mut checksum = 0u64;
+                        let mut next = 0usize;
+                        while next < rounds {
+                            let batch = (rounds - next).min(qd.max(1));
+                            let mut reads = Vec::with_capacity(batch);
+                            for offset in 0..batch {
+                                let block = ((next + offset) as u32) % blocks;
+                                let file = file.clone();
+                                reads.push(async move {
+                                    let off = u64::from(block) * BLOCK_SIZE as u64;
+                                    let bytes =
+                                        file.read_at(off, BLOCK_SIZE).await.expect("read_at");
+                                    assert_eq!(
+                                        bytes.len(),
+                                        BLOCK_SIZE,
+                                        "short read in spargio bench"
+                                    );
+                                    u64::from(block) ^ u64::from(bytes[0])
+                                });
                             }
-                            let _ = reply.send(checksum);
-                        }
-                        SpargioFsCmd::ReadQd { rounds, qd, reply } => {
-                            let mut checksum = 0u64;
-                            let mut next = 0usize;
-                            while next < rounds {
-                                let batch = (rounds - next).min(qd.max(1));
-                                let mut reads = Vec::with_capacity(batch);
-                                for offset in 0..batch {
-                                    let block = ((next + offset) as u32) % blocks;
-                                    let file = file.clone();
-                                    reads.push(async move {
-                                        let off = u64::from(block) * BLOCK_SIZE as u64;
-                                        let bytes =
-                                            file.read_at(off, BLOCK_SIZE).await.expect("read_at");
-                                        assert_eq!(
-                                            bytes.len(),
-                                            BLOCK_SIZE,
-                                            "short read in spargio bench"
-                                        );
-                                        u64::from(block) ^ u64::from(bytes[0])
-                                    });
-                                }
-                                for value in join_all(reads).await {
-                                    checksum = checksum.wrapping_add(value);
-                                }
-                                next += batch;
+                            for value in join_all(reads).await {
+                                checksum = checksum.wrapping_add(value);
                             }
-                            let _ = reply.send(checksum);
+                            next += batch;
                         }
-                        SpargioFsCmd::MetadataLite { rounds, reply } => {
-                            let mut checksum = 0u64;
-                            for _ in 0..rounds {
-                                let meta =
-                                    spargio::fs::metadata_lite(&handle_for_worker, &metadata_path)
-                                        .await
-                                        .expect("metadata_lite");
-                                checksum = checksum.wrapping_add(meta.size);
-                            }
-                            let _ = reply.send(checksum);
+                        let _ = reply.send(checksum);
+                    }
+                    SpargioFsCmd::MetadataLite { rounds, reply } => {
+                        let mut checksum = 0u64;
+                        for _ in 0..rounds {
+                            let meta =
+                                spargio::fs::metadata_lite(&handle_for_worker, &metadata_path)
+                                    .await
+                                    .expect("metadata_lite");
+                            checksum = checksum.wrapping_add(meta.size);
                         }
-                        SpargioFsCmd::Shutdown { reply } => {
-                            let _ = reply.send(());
-                            break;
-                        }
+                        let _ = reply.send(checksum);
+                    }
+                    SpargioFsCmd::Shutdown { reply } => {
+                        let _ = reply.send(());
+                        break;
                     }
                 }
-            })
-            .ok()?;
+            }
+        };
+        let worker_join = match placement {
+            SpargioFsPlacement::StealablePreferred => handle
+                .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), worker_fut),
+            SpargioFsPlacement::Pinned => {
+                handle.spawn_with_placement(spargio::TaskPlacement::Pinned(1), worker_fut)
+            }
+        }
+        .ok()?;
 
         Some(Self {
             runtime,
@@ -591,6 +612,14 @@ fn bench_fs_read_rtt(c: &mut Criterion) {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioFsHarness::new_pinned(&fixture.path, fixture.blocks) {
+        black_box(spargio.read_rtt(32));
+        group.bench_function("spargio_pinned_fs_read_at_qd1", |b| {
+            b.iter(|| black_box(spargio.read_rtt(RTT_ROUNDS)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     if let Some(mut compio) = CompioFsHarness::new(&fixture.path, fixture.blocks) {
         black_box(compio.read_rtt(32));
         group.bench_function("compio_fs_read_at_qd1", |b| {
@@ -617,6 +646,14 @@ fn bench_fs_read_throughput(c: &mut Criterion) {
     if let Some(mut spargio) = SpargioFsHarness::new(&fixture.path, fixture.blocks) {
         black_box(spargio.read_qd(256, THROUGHPUT_QD));
         group.bench_function("spargio_fs_read_at_qd32", |b| {
+            b.iter(|| black_box(spargio.read_qd(THROUGHPUT_ROUNDS, THROUGHPUT_QD)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioFsHarness::new_pinned(&fixture.path, fixture.blocks) {
+        black_box(spargio.read_qd(256, THROUGHPUT_QD));
+        group.bench_function("spargio_pinned_fs_read_at_qd32", |b| {
             b.iter(|| black_box(spargio.read_qd(THROUGHPUT_ROUNDS, THROUGHPUT_QD)))
         });
     }

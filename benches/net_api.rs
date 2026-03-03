@@ -875,6 +875,13 @@ enum SpargioStreamInitMode {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum SpargioWorkerPlacement {
+    StealablePreferred,
+    Pinned,
+}
+
+#[cfg(all(feature = "uring-native", target_os = "linux"))]
 fn bench_env_parse<T: FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.parse().ok()
 }
@@ -1012,14 +1019,30 @@ struct SpargioNetHarness {
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 impl SpargioNetHarness {
     fn new() -> Option<Self> {
-        Self::new_with_stream_init_mode(SpargioStreamInitMode::SingleContext)
+        Self::new_with_stream_init_mode(
+            SpargioStreamInitMode::SingleContext,
+            SpargioWorkerPlacement::StealablePreferred,
+        )
+    }
+
+    fn new_pinned() -> Option<Self> {
+        Self::new_with_stream_init_mode(
+            SpargioStreamInitMode::SingleContext,
+            SpargioWorkerPlacement::Pinned,
+        )
     }
 
     fn new_distributed() -> Option<Self> {
-        Self::new_with_stream_init_mode(SpargioStreamInitMode::DistributedConnect)
+        Self::new_with_stream_init_mode(
+            SpargioStreamInitMode::DistributedConnect,
+            SpargioWorkerPlacement::StealablePreferred,
+        )
     }
 
-    fn new_with_stream_init_mode(stream_init: SpargioStreamInitMode) -> Option<Self> {
+    fn new_with_stream_init_mode(
+        stream_init: SpargioStreamInitMode,
+        worker_placement: SpargioWorkerPlacement,
+    ) -> Option<Self> {
         let base_builder = apply_spargio_bench_overrides(
             Runtime::builder()
                 .backend(BackendKind::IoUring)
@@ -1042,150 +1065,155 @@ impl SpargioNetHarness {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioNetCmd>();
         let handle = runtime.handle();
         let worker_handle = handle.clone();
-        let worker_join = handle
-            .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), async move {
-                let mut streams = Vec::with_capacity(IMBALANCED_STREAMS);
-                match stream_init {
-                    SpargioStreamInitMode::SingleContext => {
-                        for _ in 0..IMBALANCED_STREAMS {
-                            let stream =
-                                spargio::net::TcpStream::connect(worker_handle.clone(), addr)
-                                    .await
-                                    .expect("spargio connect");
-                            streams.push(SpargioBenchStream { stream });
-                        }
-                    }
-                    SpargioStreamInitMode::DistributedConnect => {
-                        let distributed = spargio::net::TcpStream::connect_many_round_robin(
-                            worker_handle.clone(),
-                            addr,
-                            IMBALANCED_STREAMS,
-                        )
-                        .await
-                        .expect("distributed stream connect");
-                        for stream in distributed {
-                            streams.push(SpargioBenchStream { stream });
-                        }
+        let worker_fut = async move {
+            let mut streams = Vec::with_capacity(IMBALANCED_STREAMS);
+            match stream_init {
+                SpargioStreamInitMode::SingleContext => {
+                    for _ in 0..IMBALANCED_STREAMS {
+                        let stream = spargio::net::TcpStream::connect(worker_handle.clone(), addr)
+                            .await
+                            .expect("spargio connect");
+                        streams.push(SpargioBenchStream { stream });
                     }
                 }
-                while let Some(cmd) = cmd_rx.next().await {
-                    match cmd {
-                        SpargioNetCmd::EchoRtt {
-                            rounds,
-                            payload,
-                            reply,
-                        } => {
-                            let stream = &streams.first().expect("spargio primary stream").stream;
-                            let value = spargio_echo_rtt(stream, rounds, payload).await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::EchoWindowed {
+                SpargioStreamInitMode::DistributedConnect => {
+                    let distributed = spargio::net::TcpStream::connect_many_round_robin(
+                        worker_handle.clone(),
+                        addr,
+                        IMBALANCED_STREAMS,
+                    )
+                    .await
+                    .expect("distributed stream connect");
+                    for stream in distributed {
+                        streams.push(SpargioBenchStream { stream });
+                    }
+                }
+            }
+            while let Some(cmd) = cmd_rx.next().await {
+                match cmd {
+                    SpargioNetCmd::EchoRtt {
+                        rounds,
+                        payload,
+                        reply,
+                    } => {
+                        let stream = &streams.first().expect("spargio primary stream").stream;
+                        let value = spargio_echo_rtt(stream, rounds, payload).await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::EchoWindowed {
+                        frames,
+                        payload,
+                        window,
+                        reply,
+                    } => {
+                        let stream = &streams.first().expect("spargio primary stream").stream;
+                        let value = spargio_echo_windowed(
+                            stream,
                             frames,
                             payload,
                             window,
-                            reply,
-                        } => {
-                            let stream = &streams.first().expect("spargio primary stream").stream;
-                            let value = spargio_echo_windowed(
-                                stream,
-                                frames,
-                                payload,
-                                window,
-                                SpargioRecvMode::Multishot,
-                            )
-                            .await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::EchoImbalanced {
+                            SpargioRecvMode::Multishot,
+                        )
+                        .await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::EchoImbalanced {
+                        heavy_frames,
+                        light_frames,
+                        payload,
+                        window,
+                        reply,
+                    } => {
+                        let value = spargio_echo_imbalanced(
+                            worker_handle.clone(),
+                            &streams,
                             heavy_frames,
                             light_frames,
                             payload,
                             window,
-                            reply,
-                        } => {
-                            let value = spargio_echo_imbalanced(
-                                worker_handle.clone(),
-                                &streams,
-                                heavy_frames,
-                                light_frames,
-                                payload,
-                                window,
-                            )
-                            .await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::EchoHotspotRotation {
+                        )
+                        .await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::EchoHotspotRotation {
+                        steps,
+                        heavy_frames,
+                        light_frames,
+                        payload,
+                        window,
+                        reply,
+                    } => {
+                        let value = spargio_echo_hotspot_rotation(
+                            worker_handle.clone(),
+                            &streams,
                             steps,
                             heavy_frames,
                             light_frames,
                             payload,
                             window,
-                            reply,
-                        } => {
-                            let value = spargio_echo_hotspot_rotation(
-                                worker_handle.clone(),
-                                &streams,
-                                steps,
-                                heavy_frames,
-                                light_frames,
-                                payload,
-                                window,
-                            )
-                            .await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::EchoPipelineHotspot {
+                        )
+                        .await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::EchoPipelineHotspot {
+                        frames_per_stream,
+                        payload,
+                        window,
+                        rotate_every,
+                        heavy_iters,
+                        light_iters,
+                        reply,
+                    } => {
+                        let value = spargio_echo_pipeline_hotspot(
+                            worker_handle.clone(),
+                            &streams,
                             frames_per_stream,
                             payload,
                             window,
                             rotate_every,
                             heavy_iters,
                             light_iters,
-                            reply,
-                        } => {
-                            let value = spargio_echo_pipeline_hotspot(
-                                worker_handle.clone(),
-                                &streams,
-                                frames_per_stream,
-                                payload,
-                                window,
-                                rotate_every,
-                                heavy_iters,
-                                light_iters,
-                            )
-                            .await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::EchoKeyedHotspot {
+                        )
+                        .await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::EchoKeyedHotspot {
+                        steps,
+                        heavy_frames,
+                        light_frames,
+                        payload,
+                        window,
+                        owner_shards,
+                        reply,
+                    } => {
+                        let value = spargio_echo_keyed_hotspot_rotation(
+                            worker_handle.clone(),
+                            &streams,
                             steps,
                             heavy_frames,
                             light_frames,
                             payload,
                             window,
                             owner_shards,
-                            reply,
-                        } => {
-                            let value = spargio_echo_keyed_hotspot_rotation(
-                                worker_handle.clone(),
-                                &streams,
-                                steps,
-                                heavy_frames,
-                                light_frames,
-                                payload,
-                                window,
-                                owner_shards,
-                            )
-                            .await;
-                            let _ = reply.send(value);
-                        }
-                        SpargioNetCmd::Shutdown { reply } => {
-                            let _ = reply.send(());
-                            break;
-                        }
+                        )
+                        .await;
+                        let _ = reply.send(value);
+                    }
+                    SpargioNetCmd::Shutdown { reply } => {
+                        let _ = reply.send(());
+                        break;
                     }
                 }
-            })
-            .ok()?;
+            }
+        };
+        let worker_join = match worker_placement {
+            SpargioWorkerPlacement::StealablePreferred => handle
+                .spawn_with_placement(spargio::TaskPlacement::StealablePreferred(1), worker_fut),
+            SpargioWorkerPlacement::Pinned => {
+                handle.spawn_with_placement(spargio::TaskPlacement::Pinned(1), worker_fut)
+            }
+        }
+        .ok()?;
 
         Some(Self {
             runtime,
@@ -2476,6 +2504,14 @@ fn bench_net_echo_rtt(c: &mut Criterion) {
     }
 
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioNetHarness::new_pinned() {
+        black_box(spargio.echo_rtt(32, RTT_PAYLOAD));
+        group.bench_function("spargio_pinned_tcp_echo_qd1", |b| {
+            b.iter(|| black_box(spargio.echo_rtt(RTT_ROUNDS, RTT_PAYLOAD)))
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
     if let Some(mut compio) = CompioNetHarness::new() {
         black_box(compio.echo_rtt(32, RTT_PAYLOAD));
         group.bench_function("compio_tcp_echo_qd1", |b| {
@@ -2509,6 +2545,20 @@ fn bench_net_stream_throughput(c: &mut Criterion) {
     if let Some(mut spargio) = SpargioNetHarness::new() {
         black_box(spargio.echo_windowed(128, THROUGHPUT_FRAME_BYTES, THROUGHPUT_WINDOW));
         group.bench_function("spargio_tcp_echo_window32", |b| {
+            b.iter(|| {
+                black_box(spargio.echo_windowed(
+                    THROUGHPUT_FRAMES,
+                    THROUGHPUT_FRAME_BYTES,
+                    THROUGHPUT_WINDOW,
+                ))
+            })
+        });
+    }
+
+    #[cfg(all(feature = "uring-native", target_os = "linux"))]
+    if let Some(mut spargio) = SpargioNetHarness::new_pinned() {
+        black_box(spargio.echo_windowed(128, THROUGHPUT_FRAME_BYTES, THROUGHPUT_WINDOW));
+        group.bench_function("spargio_pinned_tcp_echo_window32", |b| {
             b.iter(|| {
                 black_box(spargio.echo_windowed(
                     THROUGHPUT_FRAMES,
