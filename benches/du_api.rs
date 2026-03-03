@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use criterion::{Criterion, black_box};
+use criterion::{criterion_group, criterion_main};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use futures::executor::block_on;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
