@@ -5,10 +5,17 @@ use std::path::Path;
 fn scheduler_profile_scripts_exist_and_are_wired_in_ci() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    let calibration_script_path = root.join("scripts/bench_scheduler_calibration.sh");
     let profile_script_path = root.join("scripts/bench_scheduler_profile.sh");
     let guardrail_script_path = root.join("scripts/scheduler_profile_guardrail.sh");
-    let fixture_path =
+    let skew_fixture_path =
         root.join("tests/fixtures/scheduler_profile/fanout_fanin_skewed_spargio_io_uring.json");
+    let balanced_fixture_path =
+        root.join("tests/fixtures/scheduler_profile/fanout_fanin_balanced_spargio_io_uring.json");
+    assert!(
+        calibration_script_path.is_file(),
+        "missing scripts/bench_scheduler_calibration.sh"
+    );
     assert!(
         profile_script_path.is_file(),
         "missing scripts/bench_scheduler_profile.sh"
@@ -18,8 +25,12 @@ fn scheduler_profile_scripts_exist_and_are_wired_in_ci() {
         "missing scripts/scheduler_profile_guardrail.sh"
     );
     assert!(
-        fixture_path.is_file(),
-        "missing scheduler profiler baseline fixture"
+        skew_fixture_path.is_file(),
+        "missing scheduler skew profiler baseline fixture"
+    );
+    assert!(
+        balanced_fixture_path.is_file(),
+        "missing scheduler balanced profiler baseline fixture"
     );
 
     let profile_script =
@@ -42,5 +53,13 @@ fn scheduler_profile_scripts_exist_and_are_wired_in_ci() {
     assert!(
         workflow.contains("./scripts/bench_scheduler_profile.sh"),
         "expected CI workflow to run scheduler profiling lane"
+    );
+    assert!(
+        workflow.contains("fanout_fanin_skewed") && workflow.contains("fanout_fanin_balanced"),
+        "expected CI scheduler profiling lane to cover skewed and balanced fanout shapes"
+    );
+    assert!(
+        workflow.contains("MAX_CALLGRIND_IR_RATIO=1.35"),
+        "expected tightened scheduler profile guardrail thresholds in CI"
     );
 }

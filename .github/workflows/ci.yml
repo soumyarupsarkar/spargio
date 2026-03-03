@@ -94,12 +94,21 @@ jobs:
 
       - name: Scheduler profiler lane
         run: |
-          SUMMARY_JSON=target/scheduler_profiles/nightly_summary.json \
+          SUMMARY_JSON=target/scheduler_profiles/nightly_skew_summary.json \
           WARMUP=0.01 MEASURE=0.02 SAMPLES=10 \
           ./scripts/bench_scheduler_profile.sh fanout_fanin_skewed spargio_io_uring
-          MAX_CALLGRIND_IR_RATIO=2.5 \
-          MAX_CACHEGRIND_D1MR_RATIO=2.5 \
-          MAX_CACHEGRIND_D1MW_RATIO=2.5 \
+          MAX_CALLGRIND_IR_RATIO=1.35 \
+          MAX_CACHEGRIND_D1MR_RATIO=1.35 \
+          MAX_CACHEGRIND_D1MW_RATIO=1.35 \
           ./scripts/scheduler_profile_guardrail.sh \
             tests/fixtures/scheduler_profile/fanout_fanin_skewed_spargio_io_uring.json \
-            target/scheduler_profiles/nightly_summary.json
+            target/scheduler_profiles/nightly_skew_summary.json
+          SUMMARY_JSON=target/scheduler_profiles/nightly_balanced_summary.json \
+          WARMUP=0.01 MEASURE=0.02 SAMPLES=10 \
+          ./scripts/bench_scheduler_profile.sh fanout_fanin_balanced spargio_io_uring
+          MAX_CALLGRIND_IR_RATIO=1.35 \
+          MAX_CACHEGRIND_D1MR_RATIO=1.35 \
+          MAX_CACHEGRIND_D1MW_RATIO=1.35 \
+          ./scripts/scheduler_profile_guardrail.sh \
+            tests/fixtures/scheduler_profile/fanout_fanin_balanced_spargio_io_uring.json \
+            target/scheduler_profiles/nightly_balanced_summary.json

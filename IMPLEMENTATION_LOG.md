@@ -7895,3 +7895,96 @@ Post-implementation quality work items for scheduler policy stabilization:
   - keep/update scheduler baseline fixture(s).
   - tighten ratio thresholds once variance is well-characterized.
 - Validate on longer soak runs for sustained-skew tail-latency behavior.
+
+## Update: calibration + rollout quality execution (2026-03-03)
+
+Executed the post-WS calibration backlog end-to-end.
+
+### 1) Broader A/B matrix with fixed affinity and repeats
+
+Added `scripts/bench_scheduler_calibration.sh` and ran fixed-affinity (`taskset
+0-3`) repeated A/B (`REPEATS=3`) on the requested `net_api` shapes against
+pre-WS baseline (`43a0462`) vs current WS implementation:
+
+- `net_stream_hotspot_rotation_4k/spargio_tcp_8streams_rotating_hotspot`
+- `net_pipeline_hotspot_rotation_4k_window32/spargio_tcp_pipeline_hotspot`
+- `net_keyed_hotspot_rotation_4k/spargio_tcp_keyed_router_hotspot`
+
+Calibration summary (`target/scheduler_profiles/net_api_calibration_ws.json`):
+
+- stream hotspot rotation: `+0.095%` (flat)
+- pipeline hotspot rotation: `+0.043%` (flat)
+- keyed hotspot rotation: `-0.053%` (flat)
+
+Interpretation: scheduler changes are neutral on these skewed `net_api` shapes
+under the selected harness settings.
+
+### 2) Default tuning sweep and decision
+
+Tested an aggressive default profile candidate:
+
+- `steal_victim_probe_count=3`
+- `steal_batch_size=6`
+- `steal_locality_margin=0`
+- `steal_backoff_max=16`
+
+Against current defaults, this profile remained mixed/flat
+(`target/scheduler_profiles/net_api_tuning_profile_a.json`):
+
+- stream hotspot rotation: `-0.221%` (flat)
+- pipeline hotspot rotation: `+0.480%` (flat, slight regression)
+- keyed hotspot rotation: `-0.306%` (flat)
+
+Decision: keep runtime defaults unchanged (no clear all-shapes win).
+
+### 3) `SegQueueExperimental` promotion decision
+
+Used benchmark env override hooks (`SPARGIO_BENCH_*`) added to
+`benches/net_api.rs` and `benches/fanout_fanin.rs` to compare queue backend
+profiles without changing runtime defaults.
+
+`net_api` calibration with `SPARGIO_BENCH_STEALABLE_QUEUE_BACKEND=segqueue`
+(`target/scheduler_profiles/net_api_tuning_segqueue.json`) was mixed/flat:
+
+- stream hotspot rotation: `-0.266%`
+- pipeline hotspot rotation: `-0.686%`
+- keyed hotspot rotation: `+0.224%`
+
+Sequential `fanout_fanin_balanced/spargio_io_uring` sanity check (fixed
+affinity) showed slight regression for segqueue lane:
+
+- default (mutex): ~`1.2306 ms`
+- segqueue experimental: ~`1.2560 ms` (~`+2.1%` slower)
+
+Decision: keep `StealableQueueBackend::SegQueueExperimental` as experimental;
+do not promote to default.
+
+### 4) Guardrail hardening
+
+Refreshed scheduler profiler fixtures and tightened nightly guardrails:
+
+- fixtures:
+  - `tests/fixtures/scheduler_profile/fanout_fanin_skewed_spargio_io_uring.json`
+  - `tests/fixtures/scheduler_profile/fanout_fanin_balanced_spargio_io_uring.json`
+- nightly CI scheduler profiling now covers both skewed + balanced fanout
+  shapes.
+- thresholds tightened from permissive values to:
+  - `MAX_CALLGRIND_IR_RATIO=1.35`
+  - `MAX_CACHEGRIND_D1MR_RATIO=1.35`
+  - `MAX_CACHEGRIND_D1MW_RATIO=1.35`
+
+### 5) Soak validation
+
+Executed sustained-skew soak lane:
+
+- `cargo test --features uring-native --test stress_tdd -- --ignored`
+
+Result: both ignored soak tests passed.
+
+### 6) Rollout summary
+
+- Broader matrix executed with fixed affinity and repeat controls.
+- Runtime defaults intentionally kept stable based on measured neutrality.
+- Experimental queue backend remains non-default by measured outcome.
+- Profiling guardrails hardened and expanded in nightly CI.
+- Soak lane validated and passing.

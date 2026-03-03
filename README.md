@@ -173,6 +173,7 @@ Benchmark helpers:
 ./scripts/bench_fanout_guardrail.sh
 ./scripts/bench_kpi_guardrail.sh
 ./scripts/bench_scheduler_profile.sh
+./scripts/bench_scheduler_calibration.sh
 ./scripts/scheduler_profile_guardrail.sh
 ./scripts/companion_ci_smoke.sh
 ./scripts/quic_interop_matrix.sh

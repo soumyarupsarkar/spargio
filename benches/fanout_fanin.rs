@@ -2,7 +2,8 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use futures::executor::block_on;
-use spargio::{BackendKind, Runtime};
+use spargio::{BackendKind, Runtime, RuntimeBuilder, StealableQueueBackend};
+use std::str::FromStr;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -81,6 +82,66 @@ enum SpargioCmd {
     },
 }
 
+fn bench_env_parse<T: FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn bench_env_parse_affinity(name: &str) -> Option<Vec<usize>> {
+    let raw = std::env::var(name).ok()?;
+    let mut cpus = Vec::new();
+    for part in raw.split(',') {
+        let cpu = part.trim().parse::<usize>().ok()?;
+        cpus.push(cpu);
+    }
+    if cpus.is_empty() {
+        return None;
+    }
+    Some(cpus)
+}
+
+fn apply_spargio_bench_overrides(mut builder: RuntimeBuilder) -> RuntimeBuilder {
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_VICTIM_PROBE_COUNT") {
+        builder = builder.steal_victim_probe_count(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_BATCH_SIZE") {
+        builder = builder.steal_batch_size(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_LOCALITY_MARGIN") {
+        builder = builder.steal_locality_margin(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_FAIL_COST") {
+        builder = builder.steal_fail_cost(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_BACKOFF_MIN") {
+        builder = builder.steal_backoff_min(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_BACKOFF_MAX") {
+        builder = builder.steal_backoff_max(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_VICTIM_STRIDE") {
+        builder = builder.steal_victim_stride(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEAL_BUDGET") {
+        builder = builder.steal_budget(v);
+    }
+    if let Some(v) = bench_env_parse::<usize>("SPARGIO_BENCH_STEALABLE_QUEUE_CAPACITY") {
+        builder = builder.stealable_queue_capacity(v);
+    }
+    if let Some(cpus) = bench_env_parse_affinity("SPARGIO_BENCH_THREAD_AFFINITY") {
+        builder = builder.thread_affinity(cpus);
+    }
+    if let Ok(v) = std::env::var("SPARGIO_BENCH_STEALABLE_QUEUE_BACKEND") {
+        let backend = match v.to_ascii_lowercase().as_str() {
+            "segqueue" | "segqueueexperimental" | "seg_queue" => {
+                StealableQueueBackend::SegQueueExperimental
+            }
+            _ => StealableQueueBackend::Mutex,
+        };
+        builder = builder.stealable_queue_backend(backend);
+    }
+    builder
+}
+
 struct SpargioHarness {
     runtime: Runtime,
     cmd_tx: mpsc::UnboundedSender<SpargioCmd>,
@@ -89,11 +150,11 @@ struct SpargioHarness {
 
 impl SpargioHarness {
     fn new(backend: BackendKind) -> Option<Self> {
-        let runtime = Runtime::builder()
-            .backend(backend)
-            .shards(WORKER_THREADS)
-            .build()
-            .ok()?;
+        let runtime = apply_spargio_bench_overrides(
+            Runtime::builder().backend(backend).shards(WORKER_THREADS),
+        )
+        .build()
+        .ok()?;
         let handle = runtime.handle();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<SpargioCmd>();
 

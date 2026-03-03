@@ -1,0 +1,10 @@
+{
+  "group": "fanout_fanin_balanced",
+  "bench": "spargio_io_uring",
+  "callgrind_ir": 29291454,
+  "cachegrind_ir": 29083312,
+  "cachegrind_d1mr": 12591,
+  "cachegrind_d1mw": 12295,
+  "callgrind_out": "target/scheduler_profiles/fanout_fanin_balanced_spargio_io_uring.callgrind.out",
+  "cachegrind_out": "target/scheduler_profiles/fanout_fanin_balanced_spargio_io_uring.cachegrind.out"
+}
