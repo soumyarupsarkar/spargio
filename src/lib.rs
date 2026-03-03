@@ -2878,11 +2878,13 @@ pub struct UringCqe {
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 pub mod fs {
     use super::{RuntimeError, RuntimeHandle, UringNativeAny};
+    use std::collections::HashSet;
     use std::ffi::CString;
     use std::fs::{Metadata, Permissions};
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3258,6 +3260,133 @@ pub mod fs {
         super::extension::fs::statx_or_metadata(handle.clone(), path).await
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DirEntryType {
+        File,
+        Directory,
+        Symlink,
+        BlockDevice,
+        CharDevice,
+        Fifo,
+        Socket,
+        Unknown,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DirEntry {
+        pub file_name: String,
+        pub path: PathBuf,
+        pub inode: u64,
+        pub entry_type: DirEntryType,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum DuSizeMode {
+        #[default]
+        Allocated,
+        Apparent,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum DuSymlinkMode {
+        #[default]
+        NoFollow,
+        Follow,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum DuErrorMode {
+        #[default]
+        FailFast,
+        Skip,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DuOptions {
+        pub size_mode: DuSizeMode,
+        pub symlink_mode: DuSymlinkMode,
+        pub hardlink_dedupe: bool,
+        pub one_file_system: bool,
+        pub error_mode: DuErrorMode,
+    }
+
+    impl Default for DuOptions {
+        fn default() -> Self {
+            Self {
+                size_mode: DuSizeMode::Allocated,
+                symlink_mode: DuSymlinkMode::NoFollow,
+                hardlink_dedupe: true,
+                one_file_system: false,
+                error_mode: DuErrorMode::FailFast,
+            }
+        }
+    }
+
+    impl DuOptions {
+        pub fn size_mode(mut self, size_mode: DuSizeMode) -> Self {
+            self.size_mode = size_mode;
+            self
+        }
+
+        pub fn symlink_mode(mut self, symlink_mode: DuSymlinkMode) -> Self {
+            self.symlink_mode = symlink_mode;
+            self
+        }
+
+        pub fn hardlink_dedupe(mut self, hardlink_dedupe: bool) -> Self {
+            self.hardlink_dedupe = hardlink_dedupe;
+            self
+        }
+
+        pub fn one_file_system(mut self, one_file_system: bool) -> Self {
+            self.one_file_system = one_file_system;
+            self
+        }
+
+        pub fn error_mode(mut self, error_mode: DuErrorMode) -> Self {
+            self.error_mode = error_mode;
+            self
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DuSummary {
+        pub total_bytes: u64,
+        pub total_entries: u64,
+        pub files: u64,
+        pub directories: u64,
+        pub symlinks: u64,
+        pub skipped_errors: u64,
+        pub skipped_cross_device: u64,
+    }
+
+    pub async fn read_dir<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        path: P,
+    ) -> io::Result<Vec<DirEntry>> {
+        let path = path.as_ref().to_path_buf();
+        let mut entries = super::extension::fs::read_dir_entries(handle.clone(), &path).await?;
+        entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+        Ok(entries
+            .into_iter()
+            .map(|entry| DirEntry {
+                file_name: entry.file_name.clone(),
+                path: path.join(entry.file_name),
+                inode: entry.inode,
+                entry_type: dir_entry_type_from_extension(entry.entry_type),
+            })
+            .collect())
+    }
+
+    pub async fn du<P: AsRef<Path>>(
+        handle: &RuntimeHandle,
+        root: P,
+        options: DuOptions,
+    ) -> io::Result<DuSummary> {
+        let root = root.as_ref().to_path_buf();
+        run_blocking(handle, move || du_blocking(&root, options)).await
+    }
+
     pub async fn symlink_metadata<P: AsRef<Path>>(
         handle: &RuntimeHandle,
         path: P,
@@ -3325,6 +3454,151 @@ pub mod fs {
             err.raw_os_error(),
             Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
         )
+    }
+
+    fn dir_entry_type_from_extension(
+        entry_type: super::extension::fs::DirEntryType,
+    ) -> DirEntryType {
+        match entry_type {
+            super::extension::fs::DirEntryType::File => DirEntryType::File,
+            super::extension::fs::DirEntryType::Directory => DirEntryType::Directory,
+            super::extension::fs::DirEntryType::Symlink => DirEntryType::Symlink,
+            super::extension::fs::DirEntryType::BlockDevice => DirEntryType::BlockDevice,
+            super::extension::fs::DirEntryType::CharDevice => DirEntryType::CharDevice,
+            super::extension::fs::DirEntryType::Fifo => DirEntryType::Fifo,
+            super::extension::fs::DirEntryType::Socket => DirEntryType::Socket,
+            super::extension::fs::DirEntryType::Unknown => DirEntryType::Unknown,
+        }
+    }
+
+    fn du_blocking(root: &Path, options: DuOptions) -> io::Result<DuSummary> {
+        let mut summary = DuSummary::default();
+        let mut stack = vec![root.to_path_buf()];
+        let mut seen_dirs: HashSet<(u64, u64)> = HashSet::new();
+        let mut seen_hardlinks: HashSet<(u64, u64)> = HashSet::new();
+
+        let root_dev = if options.one_file_system {
+            Some(std::fs::symlink_metadata(root)?.dev())
+        } else {
+            None
+        };
+
+        while let Some(path) = stack.pop() {
+            let symlink_meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    if should_skip_du_error(options.error_mode, &mut summary, err)? {
+                        continue;
+                    }
+                    unreachable!();
+                }
+            };
+
+            let is_symlink = symlink_meta.file_type().is_symlink();
+            if is_symlink {
+                summary.symlinks = summary.symlinks.saturating_add(1);
+            }
+
+            if is_symlink && matches!(options.symlink_mode, DuSymlinkMode::NoFollow) {
+                summary.total_entries = summary.total_entries.saturating_add(1);
+                summary.total_bytes = summary
+                    .total_bytes
+                    .saturating_add(du_bytes_for(&symlink_meta, options.size_mode));
+                continue;
+            }
+
+            let meta = if is_symlink {
+                match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        if should_skip_du_error(options.error_mode, &mut summary, err)? {
+                            continue;
+                        }
+                        unreachable!();
+                    }
+                }
+            } else {
+                symlink_meta
+            };
+
+            let dev = meta.dev();
+            if let Some(root_dev) = root_dev {
+                if path != root && dev != root_dev {
+                    summary.skipped_cross_device = summary.skipped_cross_device.saturating_add(1);
+                    continue;
+                }
+            }
+
+            let ino = meta.ino();
+            let is_dir = meta.file_type().is_dir();
+            let is_file = meta.file_type().is_file();
+
+            if is_dir {
+                if !seen_dirs.insert((dev, ino)) {
+                    continue;
+                }
+                summary.directories = summary.directories.saturating_add(1);
+            } else if is_file {
+                summary.files = summary.files.saturating_add(1);
+            }
+
+            summary.total_entries = summary.total_entries.saturating_add(1);
+
+            if options.hardlink_dedupe && meta.nlink() > 1 {
+                if !seen_hardlinks.insert((dev, ino)) {
+                    continue;
+                }
+            }
+
+            summary.total_bytes = summary
+                .total_bytes
+                .saturating_add(du_bytes_for(&meta, options.size_mode));
+
+            if is_dir {
+                let iter = match std::fs::read_dir(&path) {
+                    Ok(iter) => iter,
+                    Err(err) => {
+                        if should_skip_du_error(options.error_mode, &mut summary, err)? {
+                            continue;
+                        }
+                        unreachable!();
+                    }
+                };
+
+                for entry in iter {
+                    match entry {
+                        Ok(entry) => stack.push(entry.path()),
+                        Err(err) => {
+                            if should_skip_du_error(options.error_mode, &mut summary, err)? {
+                                continue;
+                            }
+                            unreachable!();
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    fn should_skip_du_error(
+        mode: DuErrorMode,
+        summary: &mut DuSummary,
+        err: io::Error,
+    ) -> io::Result<bool> {
+        if matches!(mode, DuErrorMode::Skip) {
+            summary.skipped_errors = summary.skipped_errors.saturating_add(1);
+            return Ok(true);
+        }
+        Err(err)
+    }
+
+    fn du_bytes_for(meta: &Metadata, mode: DuSizeMode) -> u64 {
+        match mode {
+            DuSizeMode::Allocated => meta.blocks().saturating_mul(512),
+            DuSizeMode::Apparent => meta.len(),
+        }
     }
 
     async fn run_blocking<T, F>(handle: &RuntimeHandle, f: F) -> io::Result<T>
@@ -4637,17 +4911,27 @@ pub mod extension {
         use std::ffi::CString;
         use std::io;
         use std::mem::MaybeUninit;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{DirEntryExt, FileTypeExt};
         use std::path::Path;
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct StatxMetadata {
             pub mask: u32,
             pub mode: u16,
+            pub ino: u64,
             pub nlink: u32,
             pub uid: u32,
             pub gid: u32,
             pub size: u64,
+            pub blocks: u64,
+            pub blksize: u32,
+            pub dev: u64,
+            pub rdev: u64,
+            pub attributes: u64,
+            pub attributes_mask: u64,
             pub atime_sec: i64,
             pub mtime_sec: i64,
             pub ctime_sec: i64,
@@ -4659,10 +4943,17 @@ pub mod extension {
                 Self {
                     mask: raw.stx_mask,
                     mode: raw.stx_mode,
+                    ino: raw.stx_ino,
                     nlink: raw.stx_nlink,
                     uid: raw.stx_uid,
                     gid: raw.stx_gid,
                     size: raw.stx_size,
+                    blocks: raw.stx_blocks,
+                    blksize: raw.stx_blksize,
+                    dev: pack_statx_dev(raw.stx_dev_major, raw.stx_dev_minor),
+                    rdev: pack_statx_dev(raw.stx_rdev_major, raw.stx_rdev_minor),
+                    attributes: raw.stx_attributes,
+                    attributes_mask: raw.stx_attributes_mask,
                     atime_sec: raw.stx_atime.tv_sec,
                     mtime_sec: raw.stx_mtime.tv_sec,
                     ctime_sec: raw.stx_ctime.tv_sec,
@@ -4674,16 +4965,55 @@ pub mod extension {
                 Self {
                     mask: 0,
                     mode: (meta.mode() & 0o7777) as u16,
+                    ino: meta.ino(),
                     nlink: u32::try_from(meta.nlink()).unwrap_or(u32::MAX),
                     uid: meta.uid(),
                     gid: meta.gid(),
                     size: meta.len(),
+                    blocks: meta.blocks(),
+                    blksize: u32::try_from(meta.blksize()).unwrap_or(u32::MAX),
+                    dev: meta.dev(),
+                    rdev: meta.rdev(),
+                    attributes: 0,
+                    attributes_mask: 0,
                     atime_sec: meta.atime(),
                     mtime_sec: meta.mtime(),
                     ctime_sec: meta.ctime(),
                     btime_sec: 0,
                 }
             }
+
+            pub fn is_dir(&self) -> bool {
+                (self.mode & libc::S_IFMT as u16) == libc::S_IFDIR as u16
+            }
+
+            pub fn is_file(&self) -> bool {
+                (self.mode & libc::S_IFMT as u16) == libc::S_IFREG as u16
+            }
+
+            pub fn is_symlink(&self) -> bool {
+                (self.mode & libc::S_IFMT as u16) == libc::S_IFLNK as u16
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DirEntryType {
+            File,
+            Directory,
+            Symlink,
+            BlockDevice,
+            CharDevice,
+            Fifo,
+            Socket,
+            Unknown,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct DirEntry {
+            pub file_name: String,
+            pub inode: u64,
+            pub offset: i64,
+            pub entry_type: DirEntryType,
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4788,11 +5118,194 @@ pub mod extension {
             }
         }
 
+        pub async fn read_dir_entries(
+            handle: RuntimeHandle,
+            path: impl AsRef<Path>,
+        ) -> io::Result<Vec<DirEntry>> {
+            let path = path.as_ref().to_path_buf();
+            let join = handle
+                .spawn_blocking(move || read_dir_entries_blocking(&path))
+                .map_err(runtime_error_to_io)?;
+            join.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "blocking directory enumeration task canceled",
+                )
+            })?
+        }
+
         #[derive(Debug)]
         struct StatxState {
             path: CString,
             statx: MaybeUninit<libc::statx>,
             options: StatxOptions,
+        }
+
+        fn read_dir_entries_blocking(path: &Path) -> io::Result<Vec<DirEntry>> {
+            match getdents64(path) {
+                Ok(mut entries) => {
+                    entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+                    Ok(entries)
+                }
+                Err(err) if is_unsupported_native_getdents(&err) => std_read_dir(path),
+                Err(err) => Err(err),
+            }
+        }
+
+        fn getdents64(path: &Path) -> io::Result<Vec<DirEntry>> {
+            const DIRENT64_HEADER_LEN: usize = 19;
+            let c_path = super::super::path_to_cstring_for_native_ops(path)?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+            if raw_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            let mut entries = Vec::new();
+            let mut buffer = vec![0u8; 32 * 1024];
+
+            loop {
+                let read = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64 as libc::c_long,
+                        fd.as_raw_fd(),
+                        buffer.as_mut_ptr().cast::<libc::c_void>(),
+                        buffer.len(),
+                    )
+                };
+
+                if read < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let read = usize::try_from(read).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "negative getdents result")
+                })?;
+                if read == 0 {
+                    break;
+                }
+
+                let mut pos = 0usize;
+                while pos < read {
+                    if read - pos < DIRENT64_HEADER_LEN {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "truncated linux_dirent64 header",
+                        ));
+                    }
+
+                    let record = &buffer[pos..read];
+                    let reclen = u16::from_ne_bytes([record[16], record[17]]) as usize;
+                    if reclen < DIRENT64_HEADER_LEN || pos + reclen > read {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid linux_dirent64 record length",
+                        ));
+                    }
+
+                    let inode = u64::from_ne_bytes([
+                        record[0], record[1], record[2], record[3], record[4], record[5],
+                        record[6], record[7],
+                    ]);
+                    let offset = i64::from_ne_bytes([
+                        record[8], record[9], record[10], record[11], record[12], record[13],
+                        record[14], record[15],
+                    ]);
+                    let entry_type = dirent_type_from_raw(record[18]);
+
+                    let name_slice = &record[DIRENT64_HEADER_LEN..reclen];
+                    let nul_pos = name_slice
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(name_slice.len());
+                    let name_slice = &name_slice[..nul_pos];
+                    if !name_slice.is_empty() && name_slice != b"." && name_slice != b".." {
+                        let file_name = std::ffi::OsStr::from_bytes(name_slice)
+                            .to_string_lossy()
+                            .into_owned();
+                        entries.push(DirEntry {
+                            file_name,
+                            inode,
+                            offset,
+                            entry_type,
+                        });
+                    }
+
+                    pos += reclen;
+                }
+            }
+
+            Ok(entries)
+        }
+
+        fn std_read_dir(path: &Path) -> io::Result<Vec<DirEntry>> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.as_os_str().to_string_lossy().into_owned();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let file_type = entry.file_type()?;
+                entries.push(DirEntry {
+                    file_name: name,
+                    inode: entry.ino(),
+                    offset: 0,
+                    entry_type: dirent_type_from_file_type(file_type),
+                });
+            }
+            entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+            Ok(entries)
+        }
+
+        fn dirent_type_from_raw(raw_type: u8) -> DirEntryType {
+            match raw_type {
+                libc::DT_REG => DirEntryType::File,
+                libc::DT_DIR => DirEntryType::Directory,
+                libc::DT_LNK => DirEntryType::Symlink,
+                libc::DT_BLK => DirEntryType::BlockDevice,
+                libc::DT_CHR => DirEntryType::CharDevice,
+                libc::DT_FIFO => DirEntryType::Fifo,
+                libc::DT_SOCK => DirEntryType::Socket,
+                _ => DirEntryType::Unknown,
+            }
+        }
+
+        fn dirent_type_from_file_type(file_type: std::fs::FileType) -> DirEntryType {
+            if file_type.is_file() {
+                return DirEntryType::File;
+            }
+            if file_type.is_dir() {
+                return DirEntryType::Directory;
+            }
+            if file_type.is_symlink() {
+                return DirEntryType::Symlink;
+            }
+            if file_type.is_block_device() {
+                return DirEntryType::BlockDevice;
+            }
+            if file_type.is_char_device() {
+                return DirEntryType::CharDevice;
+            }
+            if file_type.is_fifo() {
+                return DirEntryType::Fifo;
+            }
+            if file_type.is_socket() {
+                return DirEntryType::Socket;
+            }
+            DirEntryType::Unknown
+        }
+
+        fn is_unsupported_native_getdents(err: &io::Error) -> bool {
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            )
+        }
+
+        fn pack_statx_dev(major: u32, minor: u32) -> u64 {
+            (u64::from(major) << 32) | u64::from(minor)
         }
 
         fn cqe_to_io_result(cqe: UringCqe) -> io::Result<()> {

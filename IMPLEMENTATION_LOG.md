@@ -7988,3 +7988,229 @@ Result: both ignored soak tests passed.
 - Experimental queue backend remains non-default by measured outcome.
 - Profiling guardrails hardened and expanded in nightly CI.
 - Soak lane validated and passing.
+
+## Roadmap: full `du` metadata parity (2026-03-03)
+
+Objective: close the `README` "not done" gap for native directory traversal and
+metadata completeness needed for a production-grade `du`-style implementation.
+
+### Target parity outcomes
+
+- Native async directory traversal API (no blocking traversal in hot path).
+- Metadata surface sufficient for `du` semantics:
+  - allocated-size accounting (`stx_blocks`-based).
+  - hardlink dedupe keys (`dev` + `ino`).
+  - mode/file-type and symlink policy decisions.
+- Stable policy surface for:
+  - apparent size vs allocated size.
+  - follow vs no-follow symlinks.
+  - one-filesystem boundary behavior.
+  - error-policy behavior (`skip` / `fail-fast` style).
+- Correctness coverage for sparse files, hardlinks, symlink cycles, mount
+  boundaries, and permission-denied paths.
+
+### Milestones
+
+#### DU0: contract freeze + API sketch
+
+- Define public API contracts for traversal and metadata fields:
+  - low-level native wrappers.
+  - high-level `fs` traversal helpers.
+  - optional `du` helper API.
+- Lock behavior for edge policies (links, mounts, errors).
+- Add red tests that assert planned API symbols/docs references.
+
+#### DU1: metadata parity extension (`statx` field completion)
+
+- Extend `StatxMetadata` beyond current lite subset to include fields required
+  for `du` correctness:
+  - inode, device ids, allocated blocks, block size, file type bits, and
+    relevant attribute masks/flags.
+- Add explicit mask/options controls and typed fallbacks.
+- Red/green tests:
+  - field population on supported kernels.
+  - deterministic fallback behavior when native support is unavailable.
+
+#### DU2: native directory enumeration wrapper (`getdents64`)
+
+- Add low-level unsafe-op wrapper and safe boundary for directory entry fetch.
+- Return typed entries with name + inode + file type (+ cookie/offset where
+  useful).
+- Red/green tests for:
+  - normal traversal batches.
+  - end-of-directory semantics.
+  - invalid/unsupported kernel behavior.
+
+#### DU3: high-level async `read_dir` surface
+
+- Build ergonomic `spargio::fs` traversal API on top of DU2.
+- Add iterator/stream-style consumption suitable for recursive walkers.
+- Red/green tests for:
+  - complete enumeration.
+  - stable error propagation behavior.
+  - symlink handling mode toggles.
+
+#### DU4: `du` accounting engine core
+
+- Implement recursive walker that consumes DU3 + DU1 metadata.
+- Add accounting modes:
+  - `allocated` (default, `blocks * 512`-style semantics).
+  - `apparent` (`size`-style semantics).
+- Add hardlink dedupe set keyed by `(dev, ino)`.
+- Red/green tests for sparse files and hardlink counting correctness.
+
+#### DU5: filesystem-boundary + symlink policy completion
+
+- Add root-device capture and one-filesystem boundary filtering.
+- Add explicit symlink-follow mode with cycle protection.
+- Red/green tests for:
+  - cross-device skip behavior.
+  - symlink loops and bounded traversal.
+  - mixed trees (file/dir/link/device-boundary).
+
+#### DU6: fallback and capability model hardening
+
+- Define capability gates for kernels lacking full native opcode support.
+- Ensure graceful degraded path behavior remains correct (even if slower).
+- Add red/green tests validating identical semantics across native and fallback
+  paths for representative fixtures.
+
+#### DU7: correctness corpus + differential checks
+
+- Build reusable filesystem fixture corpus:
+  - sparse, hardlink fanout, symlink chains/loops, deep trees, permission
+    barriers.
+- Add differential checks versus a reference implementation (`du`-style expected
+  outputs) for deterministic fixture trees.
+- Add long-running traversal stability tests.
+
+#### DU8: performance, profiling, and guardrails
+
+- Add targeted traversal/metadata benchmarks.
+- Add profiler lanes (`callgrind`/`cachegrind`) and guardrail thresholds for new
+  traversal paths.
+- Track hotspot regressions before enabling "default recommended" guidance.
+
+#### DU9: docs + rollout
+
+- Update README/book with:
+  - API usage.
+  - semantics matrix (`allocated` vs `apparent`, links, mounts, errors).
+  - kernel capability notes.
+- Add migration guidance for existing users currently doing blocking traversal.
+- Final "done/not done" sync and acceptance checklist closeout.
+
+### Parallel execution plan (multi-agent)
+
+- Lane A (Metadata): DU1 + DU6 metadata capability pieces.
+- Lane B (Traversal primitives): DU2.
+- Lane C (High-level API): DU3 (starts once DU2 API shape is stable).
+- Lane D (Accounting semantics): DU4 + DU5 (starts once DU1+DU3 land).
+- Lane E (Quality): DU7 fixture corpus and differential tests (can start early,
+  final assertions after DU4/DU5).
+- Lane F (Perf/docs): DU8 + DU9 (starts once DU4 baseline is functional).
+
+### Dependency graph (for scheduling)
+
+- DU0 first.
+- DU1 and DU2 can run in parallel after DU0.
+- DU3 depends on DU2.
+- DU4 depends on DU1 + DU3.
+- DU5 depends on DU4.
+- DU6 depends on DU1 + DU2 (and can continue while DU4/DU5 progress).
+- DU7 can start fixture scaffolding early; full differential checks depend on
+  DU4 + DU5 + DU6.
+- DU8 depends on DU4 minimum functionality.
+- DU9 finalizes after DU7 + DU8.
+
+## Update: DU roadmap execution (2026-03-03)
+
+Implemented DU0–DU9 execution slices with parallel lane scheduling (metadata,
+dirent primitives, high-level API, accounting semantics, and quality/docs).
+
+### DU0: contract freeze + red tests
+
+- Added red contract coverage in:
+  - `tests/du_parity_tdd.rs`
+- Initial failures validated missing APIs/fields before implementation.
+
+### DU1: metadata parity extension
+
+- Expanded `StatxMetadata` in `src/lib.rs` with du-relevant fields:
+  - `ino`, `blocks`, `blksize`, `dev`, `rdev`, `attributes`,
+    `attributes_mask`.
+- Added file-type helpers:
+  - `StatxMetadata::{is_dir,is_file,is_symlink}`.
+- `metadata_lite` parity assertions now verify inode/block population.
+
+### DU2: low-level directory enumeration wrapper
+
+- Added low-level extension surface:
+  - `spargio::extension::fs::{DirEntryType, DirEntry, read_dir_entries(...)}`.
+- Implementation uses `getdents64` parsing (`SYS_getdents64`) with compatibility
+  fallback to `std::fs::read_dir` when unsupported.
+- Added dedicated coverage:
+  - `extension_read_dir_entries_exposes_low_level_dirent_surface`.
+
+### DU3: high-level async `read_dir`
+
+- Added high-level API:
+  - `spargio::fs::{DirEntryType, DirEntry, read_dir(...)}`.
+- Wires to extension lane and returns typed entry data (name/path/inode/type).
+
+### DU4: `du` accounting core
+
+- Added API and policies:
+  - `spargio::fs::{du(...), DuOptions, DuSummary, DuSizeMode}`.
+- Implemented accounting modes:
+  - `Allocated` (`blocks * 512`) and `Apparent` (`size`).
+- Implemented hardlink dedupe keyed by `(dev, ino)` (configurable via
+  `hardlink_dedupe(bool)`).
+
+### DU5: symlink + filesystem-boundary policy
+
+- Added `DuSymlinkMode::{NoFollow, Follow}` with loop-safe traversal behavior.
+- Added `one_file_system(bool)` policy and cross-device skip tracking in
+  `DuSummary::skipped_cross_device`.
+- Added tests for looped symlink traversal and one-filesystem behavior.
+
+### DU6: fallback and capability hardening
+
+- Directory enumeration path now degrades deterministically:
+  - `getdents64` -> `std::fs::read_dir` fallback on unsupported kernels.
+- Added `DuErrorMode::{FailFast, Skip}` and skip counters
+  (`DuSummary::skipped_errors`).
+- Added tests covering fail-fast vs skip behavior on broken symlink targets.
+
+### DU7: fixture/correctness corpus expansion
+
+- Expanded DU correctness tests to include:
+  - sparse files
+  - hardlink dedupe
+  - symlink loops
+  - broken symlink error-policy behavior
+  - cross-device skip behavior
+- Current corpus lives in `tests/du_parity_tdd.rs` and executes in CI test lane.
+
+### DU8: traversal benchmark lane
+
+- Added benchmark target:
+  - `benches/du_api.rs`
+- Added Cargo bench registration:
+  - `Cargo.toml` -> `[[bench]] name = "du_api"`.
+- Bench covers:
+  - `fs_du_allocated`
+  - `fs_du_apparent`
+  - `fs_read_dir_root`
+
+### DU9: docs/rollout sync
+
+- Updated README done/not-done sections:
+  - done: built-in `read_dir`/`du` APIs and low-level extension dirent surface.
+  - not-done: clarified remaining gap is full in-ring traversal submission path.
+
+### Validation run set
+
+- `cargo test --features uring-native --test du_parity_tdd`
+- `cargo test --features uring-native`
+- `cargo bench --features uring-native --bench du_api --no-run`

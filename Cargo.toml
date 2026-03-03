@@ -63,3 +63,7 @@ harness = false
 [[bench]]
 name = "net_experiments"
 harness = false
+
+[[bench]]
+name = "du_api"
+harness = false
