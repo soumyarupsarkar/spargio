@@ -110,6 +110,37 @@ async fn quic_client() -> std::io::Result<()> {
 
 What this does: creates a QUIC endpoint, applies connect/operation budgets, opens a bidirectional stream, writes a request, and reads the full reply.
 
+For long-lived framed protocols, prefer incremental stream reads and owned-byte writes:
+
+```rust
+use bytes::Bytes;
+
+async fn stream_loop(mut conn: spargio_quic::QuicConnection) -> std::io::Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let mut out = Bytes::from_static(b"frame-1frame-2");
+    while !out.is_empty() {
+        let wrote = send.write_bytes(out.clone()).await?;
+        if wrote == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "quic write_bytes returned zero",
+            ));
+        }
+        out = out.slice(wrote.min(out.len())..);
+    }
+    send.finish()?;
+
+    while let Some(chunk) = recv.read_chunk(16 * 1024).await? {
+        println!("received {} bytes", chunk.len());
+        // decode frames incrementally here instead of waiting for read_to_end
+    }
+    Ok(())
+}
+```
+
+What this does: writes owned byte chunks without rebuilding `Vec<u8>` payloads and consumes incoming data incrementally with `read_chunk`, which is a better fit for long-lived framed control/data streams.
+
 ## `spargio-process` Example
 
 ```rust

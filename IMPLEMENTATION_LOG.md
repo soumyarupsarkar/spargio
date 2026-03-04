@@ -8601,3 +8601,35 @@ Interpretation:
 - These internal optimizations are stable and keep strong warm/churn performance.
 - They do not materially close the daemon first-sync gap by themselves.
 - Next high-impact lever remains deeper encrypted transport/runtime tuning (buffer reuse/zero-copy direction, pacing/ACK behavior, scheduler handoff overhead).
+
+## Update: Closed review findings on QUIC docs + API test coverage (2026-03-04)
+
+Addressed two medium-severity review findings for unpushed `spargio-quic` changes.
+
+### 1) User-facing docs for new QUIC stream APIs
+
+- Updated user docs:
+  - `book/src/09_protocol_crates.md`
+    - added incremental/owned-bytes stream usage section with practical code for:
+      - `QuicRecvStream::read_chunk(...)`
+      - `QuicSendStream::write_bytes(...)`
+    - clarified why this pattern fits long-lived framed protocols better than `read_to_end`.
+  - `README.md`
+    - added done-item callout for incremental reads + owned-byte writes in QUIC stream APIs.
+
+### 2) Explicit tests for new hot-path bytes APIs
+
+`crates/spargio-quic/tests/quic_tdd.rs`:
+
+- Added stream API tests:
+  - `quic_send_stream_write_bytes_roundtrips_native`
+  - `quic_send_stream_write_bytes_roundtrips_bridge`
+  - validates forward progress semantics and full payload roundtrip via `write_bytes`.
+- Added driver ingress API test:
+  - `native_proto_driver_ingests_datagram_bytes_and_supports_bounded_drain`
+  - explicitly exercises `submit_datagram_bytes(...)` and bounded drain behavior.
+
+### Validation
+
+- `cargo test -p spargio-quic`
+- `cargo test --workspace`

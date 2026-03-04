@@ -105,6 +105,16 @@ fn quic_recv_stream_read_chunk_supports_incremental_reads_bridge() {
 }
 
 #[test]
+fn quic_send_stream_write_bytes_roundtrips_native() {
+    run_write_bytes_stream_test(QuicEndpointOptions::default());
+}
+
+#[test]
+fn quic_send_stream_write_bytes_roundtrips_bridge() {
+    run_write_bytes_stream_test(QuicEndpointOptions::default().with_backend(QuicBackend::Bridge));
+}
+
+#[test]
 fn quic_endpoint_datagram_roundtrip_updates_metrics() {
     let (server_config, client_config) = test_server_and_client_configs();
     let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
@@ -509,6 +519,29 @@ fn native_proto_driver_ingests_datagrams_and_supports_bounded_drain() {
             .submit_datagram(localhost_addr(4444), vec![0u8; 64])
             .await
             .expect("submit datagram");
+        assert!(ingested.generated_transmits <= 1);
+
+        let drained = driver.drain_transmits(4).await.expect("drain");
+        assert!(drained.len() <= 4);
+    });
+}
+
+#[test]
+fn native_proto_driver_ingests_datagram_bytes_and_supports_bounded_drain() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+
+    block_on(async {
+        let driver = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start native driver");
+
+        let ingested = driver
+            .submit_datagram_bytes(localhost_addr(4444), bytes::BytesMut::from(&[0u8; 64][..]))
+            .await
+            .expect("submit datagram bytes");
         assert!(ingested.generated_transmits <= 1);
 
         let drained = driver.drain_transmits(4).await.expect("drain");
@@ -1750,6 +1783,53 @@ fn run_incremental_chunk_read_test(options: QuicEndpointOptions) {
             let (mut send, _recv) = conn.open_bi().await.expect("open bi");
             send.write_all(&payload).await.expect("write payload");
             send.finish().expect("finish payload");
+            let _ = done_rx.await;
+        };
+
+        futures::join!(server_task, client_task);
+    });
+}
+
+fn run_write_bytes_stream_test(options: QuicEndpointOptions) {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server_with_options(server_config, localhost_addr(0), options)
+        .expect("server endpoint");
+    let mut client =
+        QuicEndpoint::client_with_options(localhost_addr(0), options).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let payload = bytes::Bytes::from_static(b"write-bytes-payload-over-quic");
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server_task = async {
+            let conn = server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection");
+            let (_send, mut recv) = conn.accept_bi().await.expect("accept bi");
+            let got = recv.read_to_end(1024).await.expect("read to end");
+            assert_eq!(got, payload.as_ref());
+            let _ = done_tx.send(());
+        };
+
+        let client_task = async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect");
+            let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+            let mut pending = payload.clone();
+            while !pending.is_empty() {
+                let written = send
+                    .write_bytes(pending.clone())
+                    .await
+                    .expect("write bytes");
+                assert!(written > 0, "write_bytes should make forward progress");
+                pending = pending.slice(written.min(pending.len())..);
+            }
+            send.finish().expect("finish");
             let _ = done_rx.await;
         };
 

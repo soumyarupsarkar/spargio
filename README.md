@@ -179,6 +179,7 @@ paths.
 - Companion crate suite: `spargio-process`, `spargio-signal`, `spargio-protocols` (legacy blocking bridge helpers), `spargio-tls` (rustls/futures-rustls adapter), `spargio-ws` (async-tungstenite adapter), and `spargio-quic` with selectable backend mode (`QuicBackend::Native` default dispatch and explicit `QuicBackend::Bridge` compatibility fallback).
 - Native-vs-bridge QUIC cutover guardrails: native data path is validated to avoid bridge task spawning, while bridge mode remains explicit compatibility fallback.
 - QUIC native default backend now runs on `quinn-proto` driver path (`NativeProtoDriver` + native UDP pump/timers) with stream/datagram operations routed through the driver; bridge mode remains explicit compatibility fallback.
+- QUIC stream APIs support incremental reads (`QuicRecvStream::read_chunk`) and owned-byte writes (`QuicSendStream::write_bytes`) for long-lived framed protocols.
 - Companion hardening lane: `scripts/companion_ci_smoke.sh` plus CI `companion-matrix` job.
 - QUIC qualification lanes: interop matrix (`scripts/quic_interop_matrix.sh`), soak/fault lane (`scripts/quic_soak_fault.sh`, nightly), and native-vs-bridge perf gate (`scripts/quic_perf_gate.sh`).
 - In-repo user-facing `book/` (`mdBook`) covering quick start, task placement (`!Send` + stealable locality-first defaults), I/O API selection, protocol crates, native extensions, performance tuning, operations, migration, and status.
