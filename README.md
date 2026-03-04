@@ -70,15 +70,19 @@ In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a
 
 ## Benchmark Results
 
+All benchmark tables below report Criterion `mean` wall-clock iteration latency
+(point estimates from `estimates.json`). Speedup columns use
+`baseline_mean / spargio_mean` (higher is better for Spargio).
+
 ### Coordination-focused workloads (Tokio vs Spargio)
 
 | Benchmark | Description | Tokio | Spargio | Speedup |
 | --- | --- | --- | --- | --- |
-| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.5306-1.5553 ms` | `370.15-371.56 us` | `4.2x` |
-| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `64.342-65.891 us` | `46.913-47.108 us` | `1.4x` |
-| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `440.24-446.64 us` | `230.40-239.74 us` | `1.9x` |
-| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.7615-2.0255 ms` | `1.2121-1.2220 ms` | `1.6x` |
-| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.4438-2.5203 ms` | `1.9872-1.9994 ms` | `1.2x` |
+| `steady_ping_pong_rtt` | Two-worker request/ack round-trip loop | `1.409 ms` | `367.09 us` | `3.8x` |
+| `steady_one_way_send_drain` | One-way sends, then explicit drain barrier | `64.97 us` | `47.27 us` | `1.4x` |
+| `cold_start_ping_pong` | Includes runtime/harness startup and teardown | `467.35 us` | `238.07 us` | `2.0x` |
+| `fanout_fanin_balanced` | Even fanout/fanin across shards | `1.421 ms` | `1.185 ms` | `1.2x` |
+| `fanout_fanin_skewed` | Skewed fanout/fanin with hotspot pressure | `2.354 ms` | `1.938 ms` | `1.2x` |
 
 Compio is not listed in this coordination-only table because it is share-nothing (thread-per-core), while these cases are focused on cross-shard coordination behavior.
 
@@ -86,19 +90,19 @@ Compio is not listed in this coordination-only table because it is share-nothing
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.5439-1.6181 ms` | `1.2135-1.2231 ms` | `1.5285-1.5615 ms` | `1.3x` | `1.3x` |
-| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `14.535-14.967 ms` | `6.6040-6.7887 ms` | `5.1460-5.4356 ms` | `2.2x` | `0.8x` |
-| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.3259-7.4036 ms` | `5.9017-6.0314 ms` | `6.5355-6.6399 ms` | `1.2x` | `1.1x` |
-| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `12.794-14.002 ms` | `12.089-12.133 ms` | `6.9627-7.0208 ms` | `1.1x` | `0.6x` |
+| `fs_read_rtt_4k` (`qd=1`) | 4 KiB file read latency, depth 1 | `1.582 ms` | `1.218 ms` | `1.543 ms` | `1.3x` | `1.3x` |
+| `fs_read_throughput_4k_qd32` | 4 KiB file reads, queue depth 32 | `14.751 ms` | `6.689 ms` | `5.281 ms` | `2.2x` | `0.8x` |
+| `net_echo_rtt_256b` (`qd=1`) | 256-byte TCP echo latency, depth 1 | `7.365 ms` | `5.967 ms` | `6.578 ms` | `1.2x` | `1.1x` |
+| `net_stream_throughput_4k_window32` | 4 KiB stream throughput, window 32 | `13.429 ms` | `12.110 ms` | `6.991 ms` | `1.1x` | `0.6x` |
 
 ### Imbalanced Native API workloads (Tokio vs Spargio vs Compio)
 
 | Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
 | --- | --- | --- | --- | --- | --- | --- |
-| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `15.025-16.108 ms` | `13.814-14.547 ms` | `13.575-13.976 ms` | `1.1x` | `1.0x` |
-| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `10.041-10.153 ms` | `10.952-11.059 ms` | `18.667-18.901 ms` | `0.9x` | `1.7x` |
-| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `29.946-30.260 ms` | `33.616-33.781 ms` | `57.532-58.111 ms` | `0.9x` | `1.7x` |
-| `net_keyed_hotspot_rotation_4k` | 8 streams, rotating hotspot with keyed ownership routing | `10.556-10.642 ms` | `11.080-11.219 ms` | `18.402-18.592 ms` | `1.0x` | `1.7x` |
+| `net_stream_imbalanced_4k_hot1_light7` | 8 streams, 1 static hot + 7 light, 4 KiB frames | `15.558 ms` | `14.192 ms` | `13.772 ms` | `1.1x` | `1.0x` |
+| `net_stream_hotspot_rotation_4k` | 8 streams, rotating hotspot each step, I/O-only | `10.093 ms` | `11.004 ms` | `18.784 ms` | `0.9x` | `1.7x` |
+| `net_pipeline_hotspot_rotation_4k_window32` | 8 streams, rotating hotspot with recv/CPU/send pipeline | `30.103 ms` | `33.698 ms` | `57.827 ms` | `0.9x` | `1.7x` |
+| `net_keyed_hotspot_rotation_4k` | 8 streams, rotating hotspot with keyed ownership routing | `10.598 ms` | `11.148 ms` | `18.499 ms` | `1.0x` | `1.7x` |
 
 ## Benchmark Interpretation
 
@@ -110,6 +114,42 @@ TL;DR: As expected, Spargio is strongest on coordination-heavy and low-depth lat
 - Tokio and Spargio are near parity in rotating-hotspot stream/pipeline cases and keyed routing (`net_stream_hotspot_rotation_4k`, `net_pipeline_hotspot_rotation_4k_window32`, `net_keyed_hotspot_rotation_4k`).
 
 For performance, different workload shapes favor different runtimes.
+
+### Exploratory Benchmarks (Subject to Change, May Be Removed)
+
+These workloads focus on mixed coordination/dispatch shapes,
+queue-depth-insensitive patterns, and fs+net deadline-churn microservice
+paths.
+
+| Benchmark | Description | Tokio | Spargio | Compio | Spargio vs Tokio | Spargio vs Compio |
+| --- | --- | --- | --- | --- | --- | --- |
+| `net_keyed_hotspot_rotation_4k_window64_cpu` | Keyed rotating hotspot with larger window + CPU tail | `12.958 ms` | `14.280 ms` | `24.636 ms` | `0.9x` | `1.7x` |
+| `ingress_dispatch_to_workers_rr_256b_ack` | Ingress dispatch loop with 256B ACK-shaped payloads | `48.631 ms` | `44.360 ms` | `76.128 ms` | `1.1x` | `1.7x` |
+| `fs_net_microservice_4k_read_then_256b_reply_qd1` | 4KiB read then 256B reply per request (qd=1) | `15.906 ms` | `11.275 ms` | `13.342 ms` | `1.4x` | `1.2x` |
+| `fanout_fanin_rotating_hot_partition_4k_window32` | Rotating hot partition with recv/CPU/send pipeline | `29.807 ms` | `31.997 ms` | `57.288 ms` | `0.9x` | `1.8x` |
+| `session_owner_with_spillover_4k` | Session-owned streams under spillover pressure | `39.773 ms` | `41.490 ms` | `75.135 ms` | `1.0x` | `1.8x` |
+| `net_burst_flip_imbalance_4k` | Burst-heavy hotspot that flips owner periodically | `92.295 ms` | `91.988 ms` | `72.799 ms` | `1.0x` | `0.8x` |
+| `fanin_barrier_micro_batches_1k` | Fan-in barrier with micro-batches | `53.850 ms` | `51.174 ms` | `87.086 ms` | `1.1x` | `1.7x` |
+| `serial_dep_chain_rpc_256b` | Serial dependency chain of RPCs (qd=1) | `29.779 ms` | `20.838 ms` | `25.075 ms` | `1.4x` | `1.2x` |
+| `keyed_hotspot_flip_p99_4k` | Keyed hotspot ownership flips each phase | `73.335 ms` | `74.969 ms` | `56.894 ms` | `1.0x` | `0.8x` |
+| `fanin_barrier_rounds_1k` | Cross-shard fan-in barrier rounds | `54.253 ms` | `48.981 ms` | `77.533 ms` | `1.1x` | `1.6x` |
+| `wakeup_sparse_event_rtt_64b` | Sparse wakeups with idle gaps between tiny events | `16.836 ms` | `15.289 ms` | `16.244 ms` | `1.1x` | `1.1x` |
+| `timer_cancel_reschedule_storm` | Timer cancel/reschedule churn | `1.097 s` | `14.953 ms` | `14.458 ms` | `73.4x` | `1.0x` |
+| `mixed_control_data_plane_4k_plus_64b` | Mixed 4KiB data-plane with 64B control RPCs | `26.742 ms` | `24.522 ms` | `18.396 ms` | `1.1x` | `0.8x` |
+| `bounded_pipeline_backpressure_4k_window2` | Bounded pipeline under backpressure (window=2) | `21.725 ms` | `19.725 ms` | `33.063 ms` | `1.1x` | `1.7x` |
+| `post_io_cpu_locality_4k_window1` | Post-I/O CPU locality-sensitive pipeline (window=1) | `17.837 ms` | `16.611 ms` | `29.331 ms` | `1.1x` | `1.8x` |
+| `fs_net_microservice_deadline_dispatch_4k_read_256b_reply` | 4KiB read + 256B reply with deadline churn and ingress dispatch | `604.230 ms` | `53.017 ms` | `83.323 ms` | `11.4x` | `1.6x` |
+| `net_echo_rtt_deadline_routing_256b` | RPC gateway shape: RTT + routing + deadline churn | `481.742 ms` | `56.117 ms` | `80.623 ms` | `8.6x` | `1.4x` |
+| `net_stream_multitenant_4k_window8` | Multi-tenant keyed stream with smaller in-flight window | `27.898 ms` | `26.968 ms` | `45.805 ms` | `1.0x` | `1.7x` |
+| `net_stream_hotflip_4k` | Hot owner flips quickly across streams | `99.604 ms` | `98.086 ms` | `76.627 ms` | `1.0x` | `0.8x` |
+| `net_pipeline_barrier_4k_window4` | Pipeline with explicit barrier rounds (window=4) | `35.477 ms` | `33.237 ms` | `53.151 ms` | `1.1x` | `1.6x` |
+| `keyed_router_with_session_owner_spillover_4k` | Keyed owner routing plus spillover pressure | `49.198 ms` | `48.075 ms` | `86.503 ms` | `1.0x` | `1.8x` |
+| `fs_metadata_then_reply_qd1` | fstat+read+small reply with deadline churn (qd=1) | `238.254 ms` | `20.541 ms` | `24.149 ms` | `11.6x` | `1.2x` |
+| `high_depth_fanout_first_k_cancel_256b_window64` | High-depth fanout with first-K style cancellation pressure | `202.849 ms` | `119.585 ms` | `204.941 ms` | `1.7x` | `1.7x` |
+| `high_depth_multitenant_keyed_router_4k_window64` | High-depth multi-tenant keyed router with rotating hotspots | `91.931 ms` | `95.681 ms` | `173.001 ms` | `1.0x` | `1.8x` |
+| `high_depth_barriered_pipeline_4k_window64` | High-depth pipeline with barrier synchronization rounds | `63.167 ms` | `68.530 ms` | `117.868 ms` | `0.9x` | `1.7x` |
+| `high_depth_deadline_gateway_256b_window64` | High-depth gateway with routing, RPC, and deadline churn | `249.920 ms` | `68.963 ms` | `72.443 ms` | `3.6x` | `1.1x` |
+| `high_depth_fs_net_admission_control_4k_read_256b_reply_window64` | High-depth fs+net admission-control path with timer churn | `131.842 ms` | `32.336 ms` | `54.807 ms` | `4.1x` | `1.7x` |
 
 ## What's Done
 

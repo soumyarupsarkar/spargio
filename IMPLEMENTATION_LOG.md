@@ -8214,3 +8214,205 @@ dirent primitives, high-level API, accounting semantics, and quality/docs).
 - `cargo test --features uring-native --test du_parity_tdd`
 - `cargo test --features uring-native`
 - `cargo bench --features uring-native --bench du_api --no-run`
+
+## Update: exploratory benchmark expansion (2026-03-03)
+
+Expanded and documented exploratory `net_api` workloads to cover queue-depth-
+insensitive coordination shapes and mixed fs/net deadline-churn shapes where
+dispatch/runtime behavior is often the bottleneck.
+
+### Benchmarks added (documented + implemented)
+
+Previously added in this benchmark lane and now documented in one place:
+
+- `net_keyed_hotspot_rotation_4k_window64_cpu`
+- `ingress_dispatch_to_workers_rr_256b_ack`
+- `fs_net_microservice_4k_read_then_256b_reply_qd1`
+- `fanout_fanin_rotating_hot_partition_4k_window32`
+- `session_owner_with_spillover_4k`
+- `net_burst_flip_imbalance_4k`
+- `fanin_barrier_micro_batches_1k`
+- `serial_dep_chain_rpc_256b`
+- `keyed_hotspot_flip_p99_4k`
+- `fanin_barrier_rounds_1k`
+- `wakeup_sparse_event_rtt_64b`
+- `timer_cancel_reschedule_storm`
+- `mixed_control_data_plane_4k_plus_64b`
+- `bounded_pipeline_backpressure_4k_window2`
+- `post_io_cpu_locality_4k_window1`
+- `fs_net_microservice_deadline_dispatch_4k_read_256b_reply`
+
+Newly implemented variant set from the follow-up request:
+
+- `net_echo_rtt_deadline_routing_256b`
+- `net_stream_multitenant_4k_window8`
+- `net_stream_hotflip_4k`
+- `net_pipeline_barrier_4k_window4`
+- `keyed_router_with_session_owner_spillover_4k`
+- `fs_metadata_then_reply_qd1`
+
+### Harness updates
+
+`benches/net_api.rs`:
+
+- Added benchmark constants and groups for the 6 new variants above.
+- Added `FsBenchFixture::metadata_qd1(...)` for metadata-heavy request-path
+  shapes.
+- Added/kept deadline-churn mixed loops using existing timer-storm command path
+  across Tokio/Spargio/Compio harnesses.
+- Registered all new groups in `criterion_group!(benches, ...)`.
+
+`Cargo.toml`:
+
+- Enabled Compio `time` feature for timer-storm workloads:
+  - `compio` features now include `"time"`.
+
+### Run commands
+
+- Build verification:
+  - `cargo fmt --all`
+  - `cargo bench --bench net_api --features uring-native --no-run`
+- Exploratory benchmark runs:
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 fs_net_microservice_deadline_dispatch_4k_read_256b_reply`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 net_echo_rtt_deadline_routing_256b`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 net_stream_multitenant_4k_window8`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 net_stream_hotflip_4k`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 net_pipeline_barrier_4k_window4`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 keyed_router_with_session_owner_spillover_4k`
+  - `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 fs_metadata_then_reply_qd1`
+
+### Notable outcomes (p99 speedup: baseline/spargio)
+
+- Strong Spargio wins on deadline-churn microservice variants:
+  - `fs_net_microservice_deadline_dispatch_4k_read_256b_reply`:
+    - vs Tokio: `10.9x`
+    - vs Compio: `1.6x`
+  - `net_echo_rtt_deadline_routing_256b`:
+    - vs Tokio: `8.4x`
+    - vs Compio: `1.5x`
+  - `fs_metadata_then_reply_qd1`:
+    - vs Tokio: `11.6x`
+    - vs Compio: `1.2x`
+- Moderate/near-parity outcomes on several other variants:
+  - `net_stream_multitenant_4k_window8`: ~parity vs Tokio, better than Compio.
+  - `net_pipeline_barrier_4k_window4`: slight win vs Tokio, clear win vs
+    Compio.
+- Some hotspot-flip shapes still favor Compio:
+  - `net_stream_hotflip_4k`.
+
+README was updated to consolidate exploratory workload results into one table
+covering all entries above.
+
+## Update: high-depth exploratory suite + p99-only format shift (2026-03-03)
+
+Implemented the requested high-depth workload set and refreshed the consolidated
+exploratory benchmark table format.
+
+### New high-depth workloads
+
+Added to `benches/net_api.rs`:
+
+- `high_depth_fanout_first_k_cancel_256b_window64`
+- `high_depth_multitenant_keyed_router_4k_window64`
+- `high_depth_barriered_pipeline_4k_window64`
+- `high_depth_deadline_gateway_256b_window64`
+- `high_depth_fs_net_admission_control_4k_read_256b_reply_window64`
+
+Supporting harness updates:
+
+- Added high-depth constants for fanout, keyed routing, barrier pipeline,
+  deadline gateway, and fs+net admission-control scenarios.
+- Generalized `run_fs_net_deadline_loop(...)` with `reads_per_epoch` parameter
+  so the same helper can serve multiple fs+net workload shapes.
+- Registered all new groups in `criterion_group!(benches, ...)`.
+
+### Validation and run set
+
+- `cargo fmt --all`
+- `cargo bench --bench net_api --features uring-native --no-run`
+- `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 high_depth_fanout_first_k_cancel_256b_window64`
+- `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 high_depth_multitenant_keyed_router_4k_window64`
+- `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 high_depth_barriered_pipeline_4k_window64`
+- `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 high_depth_deadline_gateway_256b_window64`
+- `cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 high_depth_fs_net_admission_control_4k_read_256b_reply_window64`
+
+### README format change
+
+Benchmark result tables in `README.md` now report:
+
+- runtime latencies as `p99`.
+- speedups as `baseline_p99 / spargio_p99`.
+
+Exploratory benchmark section is now located under benchmark interpretation in
+README with title:
+
+- `Exploratory Benchmarks (Subject to Change, May Be Removed)`.
+
+### Notable high-depth outcomes (p99)
+
+- `high_depth_fanout_first_k_cancel_256b_window64`:
+  - vs Tokio: `1.7x`
+  - vs Compio: `1.7x`
+- `high_depth_deadline_gateway_256b_window64`:
+  - vs Tokio: `3.6x`
+  - vs Compio: `1.1x`
+- `high_depth_fs_net_admission_control_4k_read_256b_reply_window64`:
+  - vs Tokio: `4.0x`
+  - vs Compio: `1.7x`
+
+### Consolidated exploratory run command (moved from README)
+
+```bash
+for bench in \
+  net_keyed_hotspot_rotation_4k_window64_cpu \
+  ingress_dispatch_to_workers_rr_256b_ack \
+  fs_net_microservice_4k_read_then_256b_reply_qd1 \
+  fanout_fanin_rotating_hot_partition_4k_window32 \
+  session_owner_with_spillover_4k \
+  net_burst_flip_imbalance_4k \
+  fanin_barrier_micro_batches_1k \
+  serial_dep_chain_rpc_256b \
+  keyed_hotspot_flip_p99_4k \
+  fanin_barrier_rounds_1k \
+  wakeup_sparse_event_rtt_64b \
+  timer_cancel_reschedule_storm \
+  mixed_control_data_plane_4k_plus_64b \
+  bounded_pipeline_backpressure_4k_window2 \
+  post_io_cpu_locality_4k_window1 \
+  fs_net_microservice_deadline_dispatch_4k_read_256b_reply \
+  net_echo_rtt_deadline_routing_256b \
+  net_stream_multitenant_4k_window8 \
+  net_stream_hotflip_4k \
+  net_pipeline_barrier_4k_window4 \
+  keyed_router_with_session_owner_spillover_4k \
+  fs_metadata_then_reply_qd1 \
+  high_depth_fanout_first_k_cancel_256b_window64 \
+  high_depth_multitenant_keyed_router_4k_window64 \
+  high_depth_barriered_pipeline_4k_window64 \
+  high_depth_deadline_gateway_256b_window64 \
+  high_depth_fs_net_admission_control_4k_read_256b_reply_window64; do
+  cargo bench --bench net_api --features uring-native -- --noplot --sample-size 20 "$bench"
+done
+```
+
+## Update: README benchmark reporting switched to mean iteration latency (2026-03-04)
+
+Rationale:
+
+- The previous README table format used p99 over Criterion sample iterations.
+- Those p99 values are not request-level tails; they are distribution tails of
+  per-iteration benchmark samples (`sample.json`), which can be misleading for
+  readers expecting request-level percentile semantics.
+
+What changed:
+
+- Benchmark tables in `README.md` now report Criterion `mean` wall-clock
+  iteration latency (`estimates.json` point estimates).
+- Speedup columns now use `baseline_mean / spargio_mean`.
+- Existing benchmark table values were refreshed from local Criterion artifacts
+  under `target/criterion/*/new/estimates.json`.
+
+Notes:
+
+- This keeps comparisons stable and easier to interpret until/if we add
+  explicit request-level latency histograms inside the benchmark harnesses.
