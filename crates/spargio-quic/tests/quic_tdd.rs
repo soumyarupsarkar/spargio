@@ -93,6 +93,18 @@ fn quic_endpoint_connects_and_exchanges_uni_stream_data() {
 }
 
 #[test]
+fn quic_recv_stream_read_chunk_supports_incremental_reads_native() {
+    run_incremental_chunk_read_test(QuicEndpointOptions::default());
+}
+
+#[test]
+fn quic_recv_stream_read_chunk_supports_incremental_reads_bridge() {
+    run_incremental_chunk_read_test(
+        QuicEndpointOptions::default().with_backend(QuicBackend::Bridge),
+    );
+}
+
+#[test]
 fn quic_endpoint_datagram_roundtrip_updates_metrics() {
     let (server_config, client_config) = test_server_and_client_configs();
     let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
@@ -1700,6 +1712,49 @@ fn native_proto_rollout_stage_is_experimental_for_now() {
 
 fn localhost_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn run_incremental_chunk_read_test(options: QuicEndpointOptions) {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server_with_options(server_config, localhost_addr(0), options)
+        .expect("server endpoint");
+    let mut client =
+        QuicEndpoint::client_with_options(localhost_addr(0), options).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let payload = b"chunked-payload-over-quic".to_vec();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server_task = async {
+            let conn = server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection");
+            let (_send, mut recv) = conn.accept_bi().await.expect("accept bi");
+
+            let mut got = Vec::new();
+            while let Some(chunk) = recv.read_chunk(5).await.expect("read chunk") {
+                got.extend_from_slice(&chunk);
+            }
+            assert_eq!(got, payload);
+            let _ = done_tx.send(());
+        };
+
+        let client_task = async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect");
+            let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+            send.write_all(&payload).await.expect("write payload");
+            send.finish().expect("finish payload");
+            let _ = done_rx.await;
+        };
+
+        futures::join!(server_task, client_task);
+    });
 }
 
 async fn exchange_driver_transmits(

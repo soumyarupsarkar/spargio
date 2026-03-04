@@ -660,6 +660,16 @@ impl NativeProtoDriver {
         remote: SocketAddr,
         payload: Vec<u8>,
     ) -> io::Result<NativeProtoIngressReport> {
+        self.submit_datagram_bytes(remote, bytes::BytesMut::from(payload.as_slice()))
+            .await
+    }
+
+    /// Performs `submit_datagram_bytes`.
+    pub async fn submit_datagram_bytes(
+        &self,
+        remote: SocketAddr,
+        payload: bytes::BytesMut,
+    ) -> io::Result<NativeProtoIngressReport> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::SubmitDatagram {
             remote,
@@ -976,6 +986,17 @@ impl NativeProtoDriver {
         stream_id: u64,
         payload: Vec<u8>,
     ) -> io::Result<usize> {
+        self.write_stream_bytes_on_connection(connection_id, stream_id, bytes::Bytes::from(payload))
+            .await
+    }
+
+    /// Writes stream bytes on connection.
+    pub async fn write_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: bytes::Bytes,
+    ) -> io::Result<usize> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::WriteStreamOnConnection {
             connection_id,
@@ -995,6 +1016,19 @@ impl NativeProtoDriver {
         stream_id: u64,
         max_bytes: usize,
     ) -> io::Result<Option<Vec<u8>>> {
+        Ok(self
+            .read_stream_bytes_on_connection(connection_id, stream_id, max_bytes)
+            .await?
+            .map(|chunk| chunk.to_vec()))
+    }
+
+    /// Reads stream bytes on connection.
+    pub async fn read_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<bytes::Bytes>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::ReadStreamOnConnection {
             connection_id,
@@ -1226,6 +1260,18 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Writes stream bytes on connection.
+    pub async fn write_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: bytes::Bytes,
+    ) -> io::Result<usize> {
+        self.inner
+            .write_stream_bytes_on_connection(connection_id, stream_id, payload)
+            .await
+    }
+
     /// Reads stream on connection.
     pub async fn read_stream_on_connection(
         &self,
@@ -1235,6 +1281,18 @@ impl NativeProtoDriverSend {
     ) -> io::Result<Option<Vec<u8>>> {
         self.inner
             .read_stream_on_connection(connection_id, stream_id, max_bytes)
+            .await
+    }
+
+    /// Reads stream bytes on connection.
+    pub async fn read_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<bytes::Bytes>> {
+        self.inner
+            .read_stream_bytes_on_connection(connection_id, stream_id, max_bytes)
             .await
     }
 
@@ -1406,6 +1464,54 @@ impl NativeProtoDriverLocal {
         self.inner.stream_state(connection_id, stream_id).await
     }
 
+    /// Writes stream on connection.
+    pub async fn write_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: Vec<u8>,
+    ) -> io::Result<usize> {
+        self.inner
+            .write_stream_on_connection(connection_id, stream_id, payload)
+            .await
+    }
+
+    /// Writes stream bytes on connection.
+    pub async fn write_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        payload: bytes::Bytes,
+    ) -> io::Result<usize> {
+        self.inner
+            .write_stream_bytes_on_connection(connection_id, stream_id, payload)
+            .await
+    }
+
+    /// Reads stream on connection.
+    pub async fn read_stream_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        self.inner
+            .read_stream_on_connection(connection_id, stream_id, max_bytes)
+            .await
+    }
+
+    /// Reads stream bytes on connection.
+    pub async fn read_stream_bytes_on_connection(
+        &self,
+        connection_id: u64,
+        stream_id: u64,
+        max_bytes: usize,
+    ) -> io::Result<Option<bytes::Bytes>> {
+        self.inner
+            .read_stream_bytes_on_connection(connection_id, stream_id, max_bytes)
+            .await
+    }
+
     /// Sets transport tuning.
     pub async fn set_transport_tuning(&self, tuning: NativeProtoTransportTuning) -> io::Result<()> {
         self.inner.set_transport_tuning(tuning).await
@@ -1449,7 +1555,7 @@ enum NativeProtoCommand {
     },
     SubmitDatagram {
         remote: SocketAddr,
-        payload: Vec<u8>,
+        payload: bytes::BytesMut,
         reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoIngressReport>>,
     },
     DrainTransmits {
@@ -1531,14 +1637,14 @@ enum NativeProtoCommand {
     WriteStreamOnConnection {
         connection_id: u64,
         stream_id: u64,
-        payload: Vec<u8>,
+        payload: bytes::Bytes,
         reply: tokio::sync::oneshot::Sender<io::Result<usize>>,
     },
     ReadStreamOnConnection {
         connection_id: u64,
         stream_id: u64,
         max_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<io::Result<Option<Vec<u8>>>>,
+        reply: tokio::sync::oneshot::Sender<io::Result<Option<bytes::Bytes>>>,
     },
     SetTransportTuning {
         tuning: NativeProtoTransportTuning,
@@ -1572,7 +1678,7 @@ struct NativeProtoConnectionPump {
     pending_uni_accept: VecDeque<u64>,
     pending_bi_accept: VecDeque<(u64, u64)>,
     pending_datagrams: VecDeque<Vec<u8>>,
-    pending_stream_data: HashMap<u64, VecDeque<Vec<u8>>>,
+    pending_stream_data: HashMap<u64, VecDeque<bytes::Bytes>>,
     streams: HashMap<u64, NativeProtoStreamState>,
     state: NativeProtoConnectionState,
 }
@@ -1660,14 +1766,7 @@ async fn native_proto_driver_loop(
                 }
                 stats.datagrams_ingested = stats.datagrams_ingested.saturating_add(1);
                 let now_std = native_proto_now(epoch, now);
-                let event = endpoint.handle(
-                    now_std,
-                    remote,
-                    None,
-                    None,
-                    bytes::BytesMut::from(payload.as_slice()),
-                    &mut scratch,
-                );
+                let event = endpoint.handle(now_std, remote, None, None, payload, &mut scratch);
                 let initial = match event {
                     Some(quinn_proto::DatagramEvent::Response(tx)) => {
                         generated_transmits = 1;
@@ -2720,15 +2819,12 @@ async fn native_proto_driver_loop(
                             ))
                         }
                     } else if conn.streams.contains_key(&stream_id) {
+                        let len = payload.len();
                         conn.pending_stream_data
                             .entry(stream_id)
                             .or_default()
                             .push_back(payload);
-                        Ok(conn
-                            .pending_stream_data
-                            .get(&stream_id)
-                            .and_then(|items| items.back())
-                            .map_or(0, Vec::len))
+                        Ok(len)
                     } else {
                         Err(io::Error::new(
                             io::ErrorKind::NotFound,
@@ -2773,7 +2869,7 @@ async fn native_proto_driver_loop(
                 commands_processed = commands_processed.saturating_add(1);
                 let mut should_drive = false;
                 let mut result = if max_bytes == 0 {
-                    Ok(Some(Vec::new()))
+                    Ok(Some(bytes::Bytes::new()))
                 } else if let Some(conn) = connections.get_mut(&connection_id) {
                     if conn.state.closed {
                         Err(io::Error::new(
@@ -2798,7 +2894,7 @@ async fn native_proto_driver_loop(
                                     let finalize = chunks.finalize();
                                     should_drive = finalize.should_transmit();
                                     match next {
-                                        Ok(Some(chunk)) => Ok(Some(chunk.bytes.to_vec())),
+                                        Ok(Some(chunk)) => Ok(Some(chunk.bytes)),
                                         Ok(None) => Ok(None),
                                         Err(err) => Err(err),
                                     }
@@ -2814,7 +2910,7 @@ async fn native_proto_driver_loop(
                             ))
                         }
                     } else if conn.streams.contains_key(&stream_id) {
-                        if let Some(buf) = conn
+                        if let Some(mut buf) = conn
                             .pending_stream_data
                             .entry(stream_id)
                             .or_default()
@@ -2823,13 +2919,11 @@ async fn native_proto_driver_loop(
                             if buf.len() <= max_bytes {
                                 Ok(Some(buf))
                             } else {
-                                let split = max_bytes;
-                                let head = buf[..split].to_vec();
-                                let tail = buf[split..].to_vec();
+                                let head = buf.split_to(max_bytes);
                                 conn.pending_stream_data
                                     .entry(stream_id)
                                     .or_default()
-                                    .push_front(tail);
+                                    .push_front(buf);
                                 Ok(Some(head))
                             }
                         } else if conn
@@ -2987,11 +3081,7 @@ fn drive_native_proto_connections(
     loop {
         let mut endpoint_events = Vec::new();
         let mut retired_handles = Vec::new();
-        let handles = proto_connections.keys().copied().collect::<Vec<_>>();
-        for handle in handles {
-            let Some(connection) = proto_connections.get_mut(&handle) else {
-                continue;
-            };
+        for (&handle, connection) in proto_connections.iter_mut() {
             if let Some(queue) = proto_connection_events.get_mut(&handle) {
                 while let Some(event) = queue.pop_front() {
                     connection.handle_event(event);
@@ -3504,6 +3594,7 @@ struct QuicMetricsInner {
 const NATIVE_PROTO_PUMP_READ_SIZE: usize = 64 * 1024;
 const NATIVE_PROTO_PUMP_BATCH: usize = 64;
 const NATIVE_PROTO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const NATIVE_PROTO_STREAM_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 struct NativeProtoEndpointRuntime {
     runtime: Mutex<Option<spargio::Runtime>>,
@@ -3752,7 +3843,11 @@ impl NativeProtoEndpointBackend {
                         break;
                     }
                     let (payload, remote) = match ingress_backend.socket.recv_from(&mut buf) {
-                        Ok((received, remote)) => (buf[..received].to_vec(), remote),
+                        Ok((received, remote)) => {
+                            let mut payload = bytes::BytesMut::with_capacity(received);
+                            payload.extend_from_slice(&buf[..received]);
+                            (payload, remote)
+                        }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
                             continue;
@@ -3764,7 +3859,7 @@ impl NativeProtoEndpointBackend {
                     };
                     match ingress_backend
                         .driver
-                        .submit_datagram(remote, payload)
+                        .submit_datagram_bytes(remote, payload)
                         .await
                     {
                         Ok(_) => {}
@@ -3839,7 +3934,7 @@ pub struct QuicSendStream {
 
 impl QuicSendStream {
     /// Writes all.
-    pub async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
+    pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         match &mut self.kind {
             QuicSendStreamKind::Quinn(stream) => {
                 stream.write_all(data).await.map_err(io::Error::other)
@@ -3850,14 +3945,15 @@ impl QuicSendStream {
                 timeout,
             } => {
                 let started = std::time::Instant::now();
-                while !data.is_empty() {
-                    match connection
-                        .backend
-                        .driver()
-                        .write_stream_on_connection(
+                let driver = connection.backend.driver();
+                let payload = bytes::Bytes::copy_from_slice(data);
+                let mut offset = 0usize;
+                while offset < payload.len() {
+                    match driver
+                        .write_stream_bytes_on_connection(
                             connection.connection_id,
                             *stream_id,
-                            data.to_vec(),
+                            payload.slice(offset..),
                         )
                         .await
                     {
@@ -3868,8 +3964,8 @@ impl QuicSendStream {
                             ));
                         }
                         Ok(written) => {
-                            let consumed = written.min(data.len());
-                            data = &data[consumed..];
+                            let consumed = written.min(payload.len().saturating_sub(offset));
+                            offset = offset.saturating_add(consumed);
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             if let Some(limit) = timeout {
@@ -3880,12 +3976,53 @@ impl QuicSendStream {
                                     ));
                                 }
                             }
-                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
                         }
                         Err(err) => return Err(err),
                     }
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Writes one owned bytes chunk and returns consumed bytes.
+    pub async fn write_bytes(&mut self, data: bytes::Bytes) -> io::Result<usize> {
+        match &mut self.kind {
+            QuicSendStreamKind::Quinn(stream) => {
+                stream.write(&data).await.map_err(io::Error::other)
+            }
+            QuicSendStreamKind::Native {
+                connection,
+                stream_id,
+                timeout,
+            } => {
+                let started = std::time::Instant::now();
+                let driver = connection.backend.driver();
+                loop {
+                    match driver
+                        .write_stream_bytes_on_connection(
+                            connection.connection_id,
+                            *stream_id,
+                            data.clone(),
+                        )
+                        .await
+                    {
+                        Ok(written) => return Ok(written),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if let Some(limit) = timeout {
+                                if started.elapsed() >= *limit {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "quic stream write timed out",
+                                    ));
+                                }
+                            }
+                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
             }
         }
     }
@@ -3938,48 +4075,34 @@ pub struct QuicRecvStream {
 }
 
 impl QuicRecvStream {
-    /// Reads to end.
-    pub async fn read_to_end(&mut self, size_limit: usize) -> io::Result<Vec<u8>> {
+    /// Reads up to `max_bytes` and returns `None` on EOF.
+    pub async fn read_chunk(&mut self, max_bytes: usize) -> io::Result<Option<bytes::Bytes>> {
+        if max_bytes == 0 {
+            return Ok(Some(bytes::Bytes::new()));
+        }
         match &mut self.kind {
             QuicRecvStreamKind::Quinn(stream) => stream
-                .read_to_end(size_limit)
+                .read_chunk(max_bytes, true)
                 .await
+                .map(|chunk| chunk.map(|chunk| chunk.bytes))
                 .map_err(io::Error::other),
             QuicRecvStreamKind::Native {
                 connection,
                 stream_id,
                 timeout,
             } => {
-                let mut out = Vec::new();
                 let started = std::time::Instant::now();
+                let driver = connection.backend.driver();
                 loop {
-                    let remaining = size_limit.saturating_sub(out.len());
-                    if remaining == 0 && size_limit != 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "native proto stream exceeded read_to_end limit",
-                        ));
-                    }
-                    match connection
-                        .backend
-                        .driver()
-                        .read_stream_on_connection(
+                    match driver
+                        .read_stream_bytes_on_connection(
                             connection.connection_id,
                             *stream_id,
-                            remaining.max(1),
+                            max_bytes,
                         )
                         .await
                     {
-                        Ok(Some(chunk)) => {
-                            if out.len().saturating_add(chunk.len()) > size_limit {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "native proto stream exceeded read_to_end limit",
-                                ));
-                            }
-                            out.extend_from_slice(&chunk);
-                        }
-                        Ok(None) => return Ok(out),
+                        Ok(chunk) => return Ok(chunk),
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             if let Some(limit) = timeout {
                                 if started.elapsed() >= *limit {
@@ -3989,11 +4112,37 @@ impl QuicRecvStream {
                                     ));
                                 }
                             }
-                            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
                         }
                         Err(err) => return Err(err),
                     }
                 }
+            }
+        }
+    }
+
+    /// Reads to end.
+    pub async fn read_to_end(&mut self, size_limit: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let remaining = size_limit.saturating_sub(out.len());
+            if remaining == 0 && size_limit != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "quic stream exceeded read_to_end limit",
+                ));
+            }
+            match self.read_chunk(remaining.max(1)).await? {
+                Some(chunk) => {
+                    if out.len().saturating_add(chunk.len()) > size_limit {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "quic stream exceeded read_to_end limit",
+                        ));
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+                None => return Ok(out),
             }
         }
     }

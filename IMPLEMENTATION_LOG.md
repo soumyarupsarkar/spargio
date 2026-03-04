@@ -8449,3 +8449,155 @@ API and verified docs coverage at 100% for the default docs.rs feature set.
   - Result: `src/lib.rs` documented `218/218` (`100.0%`)
 - `cargo test`
 - `cargo test --features uring-native`
+
+## Update: Planned QUIC stream-continuity + copy-reduction wave from sparsync findings (2026-03-04)
+
+Context from sparsync profiling:
+
+- First-sync overhead remains dominated by encrypted transport and stream/control churn.
+- `sparsync` currently benefits from control-frame batching but still needs lower-overhead long-lived framed streams to reduce stream setup and buffering overhead further.
+
+Planned scope in `spargio-quic` (this wave):
+
+1. Add incremental receive APIs to wrapper streams.
+   - Introduce `QuicRecvStream::read_chunk(max_bytes)` returning incremental bytes (EOF-aware) instead of forcing `read_to_end` framing.
+   - Keep `read_to_end` as a compatibility helper built on incremental reads.
+2. Add owned-bytes stream I/O methods in native driver to reduce copy churn.
+   - Add `NativeProtoDriver::{write_stream_bytes_on_connection, read_stream_bytes_on_connection}`.
+   - Keep existing `Vec<u8>` APIs as compatibility wrappers.
+3. Reduce native stream write copy amplification in `QuicSendStream::write_all`.
+   - Use a single owned buffer and sliced `Bytes` views across partial writes, rather than allocating a new `Vec<u8>` on each retry/write attempt.
+4. Add integration tests for incremental stream reads.
+   - Validate incremental chunk behavior in endpoint client/server bi-stream exchange.
+
+Out-of-scope for this wave (tracked next):
+
+- Full long-lived framed control/data protocol in sparsync (multi-frame per stream loop).
+- Deeper transport internals (pacing/ACK/scheduler tuning) beyond stream wrapper + driver payload-path changes.
+- Non-crypto transport mode.
+
+Execution note:
+
+- Implement these upstream APIs first, then sparsync can adopt long-lived stream protocol without requiring `read_to_end`-bounded request framing.
+
+## Update: Completed QUIC stream-continuity + copy-reduction implementation (2026-03-04)
+
+Implemented against `crates/spargio-quic` following the plan above.
+
+### 1) Incremental stream receive API added
+
+- Added:
+  - `QuicRecvStream::read_chunk(max_bytes) -> io::Result<Option<bytes::Bytes>>`
+- Updated:
+  - `QuicRecvStream::read_to_end(...)` now composes on top of `read_chunk(...)`.
+- Result:
+  - callers no longer need `read_to_end`-bounded framing to consume stream payloads.
+  - enables long-lived framed protocols (e.g. sparsync control stream loops) with incremental decode.
+
+### 2) Owned-bytes native stream I/O in driver
+
+Added new compatibility-preserving APIs:
+
+- `NativeProtoDriver::write_stream_bytes_on_connection(...)`
+- `NativeProtoDriver::read_stream_bytes_on_connection(...)`
+- mirrored on `NativeProtoDriverSend` and `NativeProtoDriverLocal`.
+
+Existing `Vec<u8>` methods remain and now delegate to the bytes-based methods.
+
+Internal driver changes:
+
+- `NativeProtoCommand::WriteStreamOnConnection` now carries `bytes::Bytes`.
+- `NativeProtoCommand::ReadStreamOnConnection` now replies with `Option<bytes::Bytes>`.
+- native fallback stream queues now store `bytes::Bytes` instead of `Vec<u8>`.
+
+### 3) Native write path copy amplification reduced
+
+- `QuicSendStream::write_all(...)` native branch now:
+  - allocates one owned `Bytes` buffer from input,
+  - retries using zero-copy `Bytes` slicing across partial writes,
+  - avoids repeated `data.to_vec()` allocation/copy per retry loop.
+- Added:
+  - `QuicSendStream::write_bytes(bytes::Bytes)` for owned-chunk writes.
+
+### 4) Tests for incremental stream reads
+
+`crates/spargio-quic/tests/quic_tdd.rs`:
+
+- `quic_recv_stream_read_chunk_supports_incremental_reads_native`
+- `quic_recv_stream_read_chunk_supports_incremental_reads_bridge`
+
+Both validate incremental chunk consumption over bi-stream exchange.
+
+### Validation
+
+Executed successfully:
+
+- `cargo fmt --all`
+- `cargo test -p spargio-quic`
+
+Notes:
+
+- Existing non-fatal warnings about unused internal bridge helper types/functions remain unchanged from prior baseline.
+
+### Follow-on integration target
+
+- sparsync can now adopt a long-lived framed stream protocol using `read_chunk(...)` instead of per-request `read_to_end(...)`/new stream pairs, which is the next step to directly reduce first-sync stream/control churn.
+
+## Update: Additional transport hot-path pass after sparsync long-lived stream adoption (2026-03-04)
+
+Context:
+
+- After switching sparsync to long-lived framed streams, first-sync in daemon mode remained above `rsync://` and profiling continued to point at transport/runtime overhead and memory movement.
+- This pass targeted low-risk `spargio-quic` internals that reduce copies and command-loop overhead without protocol changes.
+
+### Plan for this pass
+
+1. Reduce ingress datagram copy count in native backend command path.
+2. Trim per-op overhead in stream read/write loops.
+3. Remove avoidable allocation in connection drive loop iteration.
+4. Re-validate with `spargio-quic` tests and sparsync benchmark harness.
+
+### Implemented
+
+1. Ingress datagram command path now accepts `BytesMut` payloads directly
+   - Added `NativeProtoDriver::submit_datagram_bytes(remote, payload: bytes::BytesMut)`.
+   - Kept existing `submit_datagram(remote, Vec<u8>)` API as compatibility wrapper.
+   - Updated `NativeProtoCommand::SubmitDatagram` payload type to `bytes::BytesMut`.
+   - Native endpoint ingress pump now forwards `BytesMut` payloads directly into driver.
+   - Driver loop now passes payload directly to `endpoint.handle(...)` instead of reconstructing a new `BytesMut` from a slice.
+
+2. Stream I/O retry loops now avoid repeated driver-handle reconstruction
+   - In `QuicSendStream::write_all`, `QuicSendStream::write_bytes`, and `QuicRecvStream::read_chunk`, native branch now clones driver once per operation and reuses it across retry loops.
+
+3. Minor queue + loop overhead reductions
+   - `WriteStreamOnConnection` fallback path now returns `payload.len()` directly instead of map re-lookup after enqueue.
+   - `drive_native_proto_connections` now iterates `proto_connections.iter_mut()` directly instead of collecting a temporary handles `Vec` each pass.
+
+4. Safety/stability note
+   - Trialed sub-millisecond stream retry sleep; reverted to `1ms` after instability under benchmark load.
+   - Current stream retry interval remains `1ms`.
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -p spargio-quic`
+  - all tests passed
+
+### Downstream benchmark check (sparsync harness, patched to this workspace)
+
+- `RUNS=5 TRANSPORTS=daemon ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+  - `sparsync_first_ms_median=405`
+  - `sparsync_second_ms_median=28`
+  - `sparsync_changed_ms_median=55`
+  - `rsync_remote_first_ms_median=228`
+- `RUNS=5 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+  - `sparsync_first_ms_median=408`
+  - `sparsync_second_ms_median=32`
+  - `sparsync_changed_ms_median=59`
+  - `rsync_ssh_first_ms_median=548`
+
+Interpretation:
+
+- These internal optimizations are stable and keep strong warm/churn performance.
+- They do not materially close the daemon first-sync gap by themselves.
+- Next high-impact lever remains deeper encrypted transport/runtime tuning (buffer reuse/zero-copy direction, pacing/ACK behavior, scheduler handoff overhead).
