@@ -7,11 +7,19 @@ use spargio::net::TcpListener;
 use spargio_tls::{HandshakeOptions, TlsAcceptor, TlsConnector};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+fn ensure_rustls_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[test]
 fn tls_connector_connect_socket_addr_timeout_is_enforced() {
+    ensure_rustls_provider();
     let rt = spargio::Runtime::builder()
         .shards(1)
         .build()
@@ -60,6 +68,7 @@ fn tls_connector_connect_socket_addr_timeout_is_enforced() {
 
 #[test]
 fn tls_connector_and_acceptor_interop_roundtrip() {
+    ensure_rustls_provider();
     let rt = spargio::Runtime::builder()
         .shards(1)
         .build()
@@ -135,6 +144,7 @@ fn tls_connector_and_acceptor_interop_roundtrip() {
 
 #[test]
 fn tls_connector_rejects_server_name_mismatch() {
+    ensure_rustls_provider();
     let rt = spargio::Runtime::builder()
         .shards(1)
         .build()

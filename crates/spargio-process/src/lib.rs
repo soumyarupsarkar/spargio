@@ -2,6 +2,7 @@
 //!
 //! These helpers expose async process status/output through spargio's
 //! `spawn_blocking` bridge.
+#![deny(missing_docs)]
 
 use spargio::{RuntimeError, RuntimeHandle};
 use std::ffi::OsStr;
@@ -10,10 +11,12 @@ use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Runs `command` and resolves with its exit status.
 pub async fn status(handle: &RuntimeHandle, command: Command) -> io::Result<ExitStatus> {
     status_with_options(handle, command, CommandOptions::default()).await
 }
 
+/// Runs `command` and resolves with its exit status using custom options.
 pub async fn status_with_options(
     handle: &RuntimeHandle,
     mut command: Command,
@@ -29,10 +32,12 @@ pub async fn status_with_options(
     .await
 }
 
+/// Runs `command` and resolves with captured output.
 pub async fn output(handle: &RuntimeHandle, command: Command) -> io::Result<Output> {
     output_with_options(handle, command, CommandOptions::default()).await
 }
 
+/// Runs `command` and resolves with captured output using custom options.
 pub async fn output_with_options(
     handle: &RuntimeHandle,
     mut command: Command,
@@ -48,10 +53,12 @@ pub async fn output_with_options(
     .await
 }
 
+/// Spawns `command` and returns a handle for further interaction.
 pub async fn spawn(handle: &RuntimeHandle, command: Command) -> io::Result<ChildHandle> {
     spawn_with_options(handle, command, CommandOptions::default()).await
 }
 
+/// Spawns `command` and returns a handle for further interaction using options.
 pub async fn spawn_with_options(
     handle: &RuntimeHandle,
     mut command: Command,
@@ -72,11 +79,13 @@ pub async fn spawn_with_options(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Options applied to blocking process operations.
 pub struct CommandOptions {
     timeout: Option<Duration>,
 }
 
 impl CommandOptions {
+    /// Sets an operation timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -87,22 +96,26 @@ impl CommandOptions {
     }
 }
 
+/// Fluent builder for process commands.
 pub struct CommandBuilder {
     command: Command,
 }
 
 impl CommandBuilder {
+    /// Creates a new command builder with `program`.
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
             command: Command::new(program),
         }
     }
 
+    /// Appends one argument.
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.command.arg(arg);
         self
     }
 
+    /// Appends multiple arguments.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -112,10 +125,12 @@ impl CommandBuilder {
         self
     }
 
+    /// Runs the built command and returns its exit status.
     pub async fn status(self, handle: &RuntimeHandle) -> io::Result<ExitStatus> {
         status(handle, self.command).await
     }
 
+    /// Runs the built command and returns its exit status using options.
     pub async fn status_with_options(
         self,
         handle: &RuntimeHandle,
@@ -124,10 +139,12 @@ impl CommandBuilder {
         status_with_options(handle, self.command, options).await
     }
 
+    /// Runs the built command and returns captured output.
     pub async fn output(self, handle: &RuntimeHandle) -> io::Result<Output> {
         output(handle, self.command).await
     }
 
+    /// Runs the built command and returns captured output using options.
     pub async fn output_with_options(
         self,
         handle: &RuntimeHandle,
@@ -136,10 +153,12 @@ impl CommandBuilder {
         output_with_options(handle, self.command, options).await
     }
 
+    /// Spawns the built command and returns a child handle.
     pub async fn spawn(self, handle: &RuntimeHandle) -> io::Result<ChildHandle> {
         spawn(handle, self.command).await
     }
 
+    /// Spawns the built command and returns a child handle using options.
     pub async fn spawn_with_options(
         self,
         handle: &RuntimeHandle,
@@ -150,21 +169,25 @@ impl CommandBuilder {
 }
 
 #[derive(Clone)]
+/// Async wrapper around a spawned child process.
 pub struct ChildHandle {
     handle: RuntimeHandle,
     child: Arc<Mutex<Option<Child>>>,
 }
 
 impl ChildHandle {
+    /// Returns the process id if the child is still present.
     pub fn id(&self) -> Option<u32> {
         let guard = self.child.lock().expect("child lock poisoned");
         guard.as_ref().map(Child::id)
     }
 
+    /// Waits for child termination.
     pub async fn wait(&self) -> io::Result<ExitStatus> {
         self.wait_with_options(CommandOptions::default()).await
     }
 
+    /// Waits for child termination using options.
     pub async fn wait_with_options(&self, options: CommandOptions) -> io::Result<ExitStatus> {
         self.run_with_child(
             options,
@@ -175,6 +198,7 @@ impl ChildHandle {
         .await
     }
 
+    /// Non-blocking check for child termination.
     pub async fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         self.run_with_child(
             CommandOptions::default(),
@@ -185,6 +209,7 @@ impl ChildHandle {
         .await
     }
 
+    /// Sends a kill signal to the child process.
     pub async fn kill(&self) -> io::Result<()> {
         self.run_with_child(
             CommandOptions::default(),
@@ -195,10 +220,12 @@ impl ChildHandle {
         .await
     }
 
+    /// Waits for child termination and captures output.
     pub async fn output(&self) -> io::Result<Output> {
         self.output_with_options(CommandOptions::default()).await
     }
 
+    /// Waits for child termination and captures output using options.
     pub async fn output_with_options(&self, options: CommandOptions) -> io::Result<Output> {
         let child = self.take_child()?;
         let handle = self.handle.clone();

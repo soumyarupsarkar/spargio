@@ -8,6 +8,7 @@
 //!   bridge executor (no per-call runtime creation),
 //! - per-endpoint metrics snapshots and in-flight backpressure limits,
 //! - explicit local (`!Send`) and send-handoff connection wrappers.
+#![deny(missing_docs)]
 
 use spargio::{RuntimeError, RuntimeHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -31,57 +32,69 @@ static NEXT_NATIVE_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
 static BRIDGE_RUNTIME_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_RUNTIME_CONTEXT_ENTER_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Performs `bridge_runtime_spawn_count`.
 pub fn bridge_runtime_spawn_count() -> u64 {
     BRIDGE_RUNTIME_SPAWN_COUNT.load(Ordering::Relaxed)
 }
 
+/// Resets bridge runtime spawn count.
 pub fn reset_bridge_runtime_spawn_count() {
     BRIDGE_RUNTIME_SPAWN_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// Performs `bridge_runtime_context_enter_count`.
 pub fn bridge_runtime_context_enter_count() -> u64 {
     BRIDGE_RUNTIME_CONTEXT_ENTER_COUNT.load(Ordering::Relaxed)
 }
 
+/// Resets bridge runtime context enter count.
 pub fn reset_bridge_runtime_context_enter_count() {
     BRIDGE_RUNTIME_CONTEXT_ENTER_COUNT.store(0, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// `QuicOptions` public API type.
 pub struct QuicOptions {
     timeout: Option<Duration>,
 }
 
 impl QuicOptions {
+    /// Returns an updated value with timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Performs `timeout`.
     pub fn timeout(self) -> Option<Duration> {
         self.timeout
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// `QuicBridge` public API type.
 pub struct QuicBridge {
     options: QuicOptions,
 }
 
 impl QuicBridge {
+    /// Creates a new value.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns an updated value with options.
     pub fn with_options(mut self, options: QuicOptions) -> Self {
         self.options = options;
         self
     }
 
+    /// Performs `options`.
     pub fn options(self) -> QuicOptions {
         self.options
     }
 
+    /// Performs `run`.
     pub async fn run<T, F, Fut>(&self, handle: &RuntimeHandle, f: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -91,6 +104,7 @@ impl QuicBridge {
         run_with_options(handle, self.options, f).await
     }
 
+    /// Returns an updated value with endpoint.
     pub async fn with_endpoint<T, B, F, Fut>(
         &self,
         handle: &RuntimeHandle,
@@ -111,6 +125,7 @@ impl QuicBridge {
     }
 }
 
+/// Performs `run`.
 pub async fn run<T, F, Fut>(handle: &RuntimeHandle, f: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -120,6 +135,7 @@ where
     run_with_options(handle, QuicOptions::default(), f).await
 }
 
+/// Performs `run_with_options`.
 pub async fn run_with_options<T, F, Fut>(
     _handle: &RuntimeHandle,
     options: QuicOptions,
@@ -134,6 +150,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// `NativeProtoDriverOptions` public API type.
 pub struct NativeProtoDriverOptions {
     owner_shard: spargio::ShardId,
     max_pending_transmits: usize,
@@ -151,88 +168,130 @@ impl Default for NativeProtoDriverOptions {
 }
 
 impl NativeProtoDriverOptions {
+    /// Returns an updated value with owner shard.
     pub fn with_owner_shard(mut self, owner_shard: spargio::ShardId) -> Self {
         self.owner_shard = owner_shard;
         self
     }
 
+    /// Performs `owner_shard`.
     pub fn owner_shard(&self) -> spargio::ShardId {
         self.owner_shard
     }
 
+    /// Returns an updated value with max pending transmits.
     pub fn with_max_pending_transmits(mut self, max_pending_transmits: usize) -> Self {
         self.max_pending_transmits = max_pending_transmits;
         self
     }
 
+    /// Performs `max_pending_transmits`.
     pub fn max_pending_transmits(&self) -> usize {
         self.max_pending_transmits
     }
 
+    /// Returns an updated value with server config.
     pub fn with_server_config(mut self, server_config: quinn::ServerConfig) -> Self {
         self.server_config = Some(server_config);
         self
     }
 
+    /// Performs `server_config`.
     pub fn server_config(&self) -> Option<quinn::ServerConfig> {
         self.server_config.clone()
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `NativeProtoDriverProbe` public API type.
 pub struct NativeProtoDriverProbe {
+    /// `endpoint_id` field.
     pub endpoint_id: u64,
+    /// `owner_shard` field.
     pub owner_shard: spargio::ShardId,
+    /// `executing_shard` field.
     pub executing_shard: spargio::ShardId,
+    /// `commands_processed` field.
     pub commands_processed: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+/// `NativeProtoTransmit` public API type.
 pub struct NativeProtoTransmit {
+    /// `destination` field.
     pub destination: SocketAddr,
+    /// `ecn` field.
     pub ecn: Option<quinn::EcnCodepoint>,
+    /// `size` field.
     pub size: usize,
+    /// `segment_size` field.
     pub segment_size: Option<usize>,
+    /// `src_ip` field.
     pub src_ip: Option<IpAddr>,
+    /// `payload` field.
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `NativeProtoIngressReport` public API type.
 pub struct NativeProtoIngressReport {
+    /// `generated_transmits` field.
     pub generated_transmits: usize,
+    /// `queued_transmits` field.
     pub queued_transmits: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `NativeProtoTimerState` public API type.
 pub struct NativeProtoTimerState {
+    /// `now` field.
     pub now: Duration,
+    /// `next_deadline` field.
     pub next_deadline: Option<Duration>,
+    /// `timeout_fires` field.
     pub timeout_fires: u64,
+    /// `last_fired_generation` field.
     pub last_fired_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `NativeProtoStreamState` public API type.
 pub struct NativeProtoStreamState {
+    /// `finished` field.
     pub finished: bool,
+    /// `reset` field.
     pub reset: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `NativeProtoConnectionState` public API type.
 pub struct NativeProtoConnectionState {
+    /// `established` field.
     pub established: bool,
+    /// `closed` field.
     pub closed: bool,
+    /// `streams_opened_uni` field.
     pub streams_opened_uni: u64,
+    /// `streams_opened_bi` field.
     pub streams_opened_bi: u64,
+    /// `datagrams_sent` field.
     pub datagrams_sent: u64,
+    /// `datagrams_received` field.
     pub datagrams_received: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `NativeProtoTransportTuning` public API type.
 pub struct NativeProtoTransportTuning {
+    /// `max_datagram_size` field.
     pub max_datagram_size: usize,
+    /// `send_window` field.
     pub send_window: u64,
+    /// `receive_window` field.
     pub receive_window: u64,
+    /// `keep_alive_interval` field.
     pub keep_alive_interval: Option<Duration>,
+    /// `mtu_discovery_enabled` field.
     pub mtu_discovery_enabled: bool,
 }
 
@@ -249,26 +308,31 @@ impl Default for NativeProtoTransportTuning {
 }
 
 impl NativeProtoTransportTuning {
+    /// Returns an updated value with max datagram size.
     pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
         self.max_datagram_size = max_datagram_size;
         self
     }
 
+    /// Returns an updated value with send window.
     pub fn with_send_window(mut self, send_window: u64) -> Self {
         self.send_window = send_window;
         self
     }
 
+    /// Returns an updated value with receive window.
     pub fn with_receive_window(mut self, receive_window: u64) -> Self {
         self.receive_window = receive_window;
         self
     }
 
+    /// Returns an updated value with keep alive interval.
     pub fn with_keep_alive_interval(mut self, keep_alive_interval: Option<Duration>) -> Self {
         self.keep_alive_interval = keep_alive_interval;
         self
     }
 
+    /// Returns an updated value with mtu discovery enabled.
     pub fn with_mtu_discovery_enabled(mut self, mtu_discovery_enabled: bool) -> Self {
         self.mtu_discovery_enabled = mtu_discovery_enabled;
         self
@@ -276,46 +340,90 @@ impl NativeProtoTransportTuning {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `NativeProtoStats` public API type.
 pub struct NativeProtoStats {
+    /// `operations_total` field.
     pub operations_total: u64,
+    /// `connections_registered` field.
     pub connections_registered: u64,
+    /// `connections_closed` field.
     pub connections_closed: u64,
+    /// `streams_opened_uni` field.
     pub streams_opened_uni: u64,
+    /// `streams_opened_bi` field.
     pub streams_opened_bi: u64,
+    /// `datagrams_ingested` field.
     pub datagrams_ingested: u64,
+    /// `datagrams_oversized` field.
     pub datagrams_oversized: u64,
+    /// `backpressure_hits` field.
     pub backpressure_hits: u64,
+    /// `timeouts_fired` field.
     pub timeouts_fired: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+/// `NativeProtoEvent` enum.
 pub enum NativeProtoEvent {
-    ConnectionRegistered { connection_id: u64 },
-    ConnectionEstablished { connection_id: u64 },
-    ConnectionClosed { connection_id: u64 },
-    TimeoutFired { generation: u64 },
-    OversizedDatagram { size: usize, max_size: usize },
-    Backpressure { scope: &'static str },
+    /// A connection id was registered with the native driver.
+    ConnectionRegistered {
+        /// Driver-assigned connection identifier.
+        connection_id: u64,
+    },
+    /// A connection reached established state.
+    ConnectionEstablished {
+        /// Driver-assigned connection identifier.
+        connection_id: u64,
+    },
+    /// A connection closed.
+    ConnectionClosed {
+        /// Driver-assigned connection identifier.
+        connection_id: u64,
+    },
+    /// A scheduled timer fired.
+    TimeoutFired {
+        /// Timer generation that fired.
+        generation: u64,
+    },
+    /// An inbound datagram exceeded configured limits.
+    OversizedDatagram {
+        /// Observed datagram size in bytes.
+        size: usize,
+        /// Maximum allowed datagram size in bytes.
+        max_size: usize,
+    },
+    /// Backpressure was encountered in a driver scope.
+    Backpressure {
+        /// Scope that reported backpressure.
+        scope: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `NativeProtoFaultSpec` public API type.
 pub struct NativeProtoFaultSpec {
+    /// `drop_inbound` field.
     pub drop_inbound: bool,
+    /// `drop_egress` field.
     pub drop_egress: bool,
+    /// `reorder_egress` field.
     pub reorder_egress: bool,
 }
 
 impl NativeProtoFaultSpec {
+    /// Returns an updated value with drop inbound.
     pub fn with_drop_inbound(mut self, drop_inbound: bool) -> Self {
         self.drop_inbound = drop_inbound;
         self
     }
 
+    /// Returns an updated value with drop egress.
     pub fn with_drop_egress(mut self, drop_egress: bool) -> Self {
         self.drop_egress = drop_egress;
         self
     }
 
+    /// Returns an updated value with reorder egress.
     pub fn with_reorder_egress(mut self, reorder_egress: bool) -> Self {
         self.reorder_egress = reorder_egress;
         self
@@ -323,22 +431,33 @@ impl NativeProtoFaultSpec {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `NativeProtoFaultStats` public API type.
 pub struct NativeProtoFaultStats {
+    /// `inbound_dropped` field.
     pub inbound_dropped: u64,
+    /// `egress_dropped` field.
     pub egress_dropped: u64,
+    /// `egress_reorders` field.
     pub egress_reorders: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `NativeProtoRolloutStage` enum.
 pub enum NativeProtoRolloutStage {
+    /// `Experimental` variant.
     Experimental,
+    /// `Candidate` variant.
     Candidate,
+    /// `Default` variant.
     Default,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// `NativeProtoPerfGate` public API type.
 pub struct NativeProtoPerfGate {
+    /// `max_p95_regression_pct` field.
     pub max_p95_regression_pct: f64,
+    /// `max_p99_regression_pct` field.
     pub max_p99_regression_pct: f64,
 }
 
@@ -352,16 +471,19 @@ impl Default for NativeProtoPerfGate {
 }
 
 impl NativeProtoPerfGate {
+    /// Returns an updated value with max p95 regression pct.
     pub fn with_max_p95_regression_pct(mut self, value: f64) -> Self {
         self.max_p95_regression_pct = value;
         self
     }
 
+    /// Returns an updated value with max p99 regression pct.
     pub fn with_max_p99_regression_pct(mut self, value: f64) -> Self {
         self.max_p99_regression_pct = value;
         self
     }
 
+    /// Performs `evaluate`.
     pub fn evaluate(
         self,
         baseline_p95: f64,
@@ -390,13 +512,18 @@ impl NativeProtoPerfGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// `NativeProtoPerfVerdict` public API type.
 pub struct NativeProtoPerfVerdict {
+    /// `pass` field.
     pub pass: bool,
+    /// `p95_regression_pct` field.
     pub p95_regression_pct: f64,
+    /// `p99_regression_pct` field.
     pub p99_regression_pct: f64,
 }
 
 #[derive(Clone)]
+/// `NativeProtoDriver` public API type.
 pub struct NativeProtoDriver {
     endpoint_id: u64,
     owner_shard: spargio::ShardId,
@@ -405,10 +532,12 @@ pub struct NativeProtoDriver {
 }
 
 impl NativeProtoDriver {
+    /// Performs `rollout_stage`.
     pub fn rollout_stage() -> NativeProtoRolloutStage {
         NativeProtoRolloutStage::Experimental
     }
 
+    /// Performs `start_sync`.
     pub fn start_sync(
         handle: &RuntimeHandle,
         options: NativeProtoDriverOptions,
@@ -416,6 +545,7 @@ impl NativeProtoDriver {
         Self::start_impl(handle, options)
     }
 
+    /// Performs `start`.
     pub async fn start(
         handle: &RuntimeHandle,
         options: NativeProtoDriverOptions,
@@ -468,30 +598,36 @@ impl NativeProtoDriver {
         })
     }
 
+    /// Performs `endpoint_id`.
     pub fn endpoint_id(&self) -> u64 {
         self.endpoint_id
     }
 
+    /// Performs `owner_shard`.
     pub fn owner_shard(&self) -> spargio::ShardId {
         self.owner_shard
     }
 
+    /// Returns whether closed.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// Converts this value to local.
     pub fn to_local(&self) -> NativeProtoDriverLocal {
         NativeProtoDriverLocal {
             inner: Rc::new(self.clone()),
         }
     }
 
+    /// Converts this value to send handle.
     pub fn to_send_handle(&self) -> NativeProtoDriverSend {
         NativeProtoDriverSend {
             inner: self.clone(),
         }
     }
 
+    /// Performs `probe`.
     pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::Probe { reply: reply_tx })?;
@@ -500,6 +636,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `allocate_connection_id`.
     pub async fn allocate_connection_id(&self) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::AllocateConnectionId { reply: reply_tx })?;
@@ -508,6 +645,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `allocate_stream_id`.
     pub async fn allocate_stream_id(&self) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::AllocateStreamId { reply: reply_tx })?;
@@ -516,6 +654,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `submit_datagram`.
     pub async fn submit_datagram(
         &self,
         remote: SocketAddr,
@@ -532,6 +671,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Drains transmits.
     pub async fn drain_transmits(&self, max: usize) -> io::Result<Vec<NativeProtoTransmit>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::DrainTransmits {
@@ -543,6 +683,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `enqueue_transmit_for_test`.
     pub async fn enqueue_transmit_for_test(&self, transmit: NativeProtoTransmit) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::EnqueueTransmitForTest {
@@ -554,6 +695,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `schedule_timeout`.
     pub async fn schedule_timeout(&self, after: Duration) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::ScheduleTimeout {
@@ -565,6 +707,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `advance_clock_for_test`.
     pub async fn advance_clock_for_test(&self, by: Duration) -> io::Result<NativeProtoTimerState> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::AdvanceClockForTest {
@@ -576,6 +719,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `timer_state`.
     pub async fn timer_state(&self) -> io::Result<NativeProtoTimerState> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::TimerState { reply: reply_tx })?;
@@ -584,6 +728,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Sets transport tuning.
     pub async fn set_transport_tuning(&self, tuning: NativeProtoTransportTuning) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::SetTransportTuning {
@@ -595,6 +740,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `transport_tuning`.
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::TransportTuning { reply: reply_tx })?;
@@ -603,6 +749,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `stats`.
     pub async fn stats(&self) -> io::Result<NativeProtoStats> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::Stats { reply: reply_tx })?;
@@ -611,6 +758,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Drains events.
     pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::DrainEvents {
@@ -622,6 +770,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Sets fault spec.
     pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::SetFaultSpec {
@@ -633,6 +782,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `fault_stats`.
     pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::FaultStats { reply: reply_tx })?;
@@ -641,6 +791,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Performs `register_connection_for_test`.
     pub async fn register_connection_for_test(&self) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::RegisterConnectionForTest { reply: reply_tx })?;
@@ -649,6 +800,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))
     }
 
+    /// Connects for test.
     pub async fn connect_for_test(
         &self,
         config: quinn::ClientConfig,
@@ -667,6 +819,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Closes connection for test.
     pub async fn close_connection_for_test(&self, connection_id: u64) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::CloseConnectionForTest {
@@ -678,6 +831,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Connects ion state.
     pub async fn connection_state(
         &self,
         connection_id: u64,
@@ -692,6 +846,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -708,6 +863,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `recv_datagram_on_connection_for_test`.
     pub async fn recv_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -722,6 +878,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Opens uni on connection.
     pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::OpenUniOnConnection {
@@ -733,6 +890,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Accepts uni on connection.
     pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::AcceptUniOnConnection {
@@ -744,6 +902,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Opens bi on connection.
     pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::OpenBiOnConnection {
@@ -755,6 +914,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Accepts bi on connection.
     pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::AcceptBiOnConnection {
@@ -766,6 +926,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `finish_stream`.
     pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::FinishStream {
@@ -778,6 +939,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Resets stream.
     pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::ResetStream {
@@ -790,6 +952,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `stream_state`.
     pub async fn stream_state(
         &self,
         connection_id: u64,
@@ -806,6 +969,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Writes stream on connection.
     pub async fn write_stream_on_connection(
         &self,
         connection_id: u64,
@@ -824,6 +988,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Reads stream on connection.
     pub async fn read_stream_on_connection(
         &self,
         connection_id: u64,
@@ -842,6 +1007,7 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Shuts this value down.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -856,6 +1022,7 @@ impl NativeProtoDriver {
         Ok(())
     }
 
+    /// Shuts this value down.
     pub fn shutdown_nowait(&self) {
         if self.is_closed() {
             return;
@@ -864,6 +1031,7 @@ impl NativeProtoDriver {
         self.tx.send(NativeProtoCommand::Closed).ok();
     }
 
+    /// Closes connection for test nowait.
     pub fn close_connection_for_test_nowait(&self, connection_id: u64) -> io::Result<()> {
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::CloseConnectionForTest {
@@ -872,6 +1040,7 @@ impl NativeProtoDriver {
         })
     }
 
+    /// Performs `send_datagram_on_connection_for_test_nowait`.
     pub fn send_datagram_on_connection_for_test_nowait(
         &self,
         connection_id: u64,
@@ -885,6 +1054,7 @@ impl NativeProtoDriver {
         })
     }
 
+    /// Performs `finish_stream_nowait`.
     pub fn finish_stream_nowait(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::FinishStream {
@@ -894,6 +1064,7 @@ impl NativeProtoDriver {
         })
     }
 
+    /// Resets stream nowait.
     pub fn reset_stream_nowait(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         self.send_command(NativeProtoCommand::ResetStream {
@@ -917,39 +1088,48 @@ impl NativeProtoDriver {
 }
 
 #[derive(Clone)]
+/// `NativeProtoDriverSend` public API type.
 pub struct NativeProtoDriverSend {
     inner: NativeProtoDriver,
 }
 
 impl NativeProtoDriverSend {
+    /// Performs `endpoint_id`.
     pub fn endpoint_id(&self) -> u64 {
         self.inner.endpoint_id()
     }
 
+    /// Performs `owner_shard`.
     pub fn owner_shard(&self) -> spargio::ShardId {
         self.inner.owner_shard()
     }
 
+    /// Returns whether closed.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
+    /// Performs `probe`.
     pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
         self.inner.probe().await
     }
 
+    /// Drains transmits.
     pub async fn drain_transmits(&self, max: usize) -> io::Result<Vec<NativeProtoTransmit>> {
         self.inner.drain_transmits(max).await
     }
 
+    /// Shuts this value down.
     pub async fn shutdown(&self) -> io::Result<()> {
         self.inner.shutdown().await
     }
 
+    /// Performs `register_connection_for_test`.
     pub async fn register_connection_for_test(&self) -> io::Result<u64> {
         self.inner.register_connection_for_test().await
     }
 
+    /// Connects for test.
     pub async fn connect_for_test(
         &self,
         config: quinn::ClientConfig,
@@ -961,10 +1141,12 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Closes connection for test.
     pub async fn close_connection_for_test(&self, connection_id: u64) -> io::Result<()> {
         self.inner.close_connection_for_test(connection_id).await
     }
 
+    /// Connects ion state.
     pub async fn connection_state(
         &self,
         connection_id: u64,
@@ -972,6 +1154,7 @@ impl NativeProtoDriverSend {
         self.inner.connection_state(connection_id).await
     }
 
+    /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -982,6 +1165,7 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Performs `recv_datagram_on_connection_for_test`.
     pub async fn recv_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -991,30 +1175,37 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Opens uni on connection.
     pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         self.inner.open_uni_on_connection(connection_id).await
     }
 
+    /// Accepts uni on connection.
     pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         self.inner.accept_uni_on_connection(connection_id).await
     }
 
+    /// Opens bi on connection.
     pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         self.inner.open_bi_on_connection(connection_id).await
     }
 
+    /// Accepts bi on connection.
     pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         self.inner.accept_bi_on_connection(connection_id).await
     }
 
+    /// Performs `finish_stream`.
     pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         self.inner.finish_stream(connection_id, stream_id).await
     }
 
+    /// Resets stream.
     pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         self.inner.reset_stream(connection_id, stream_id).await
     }
 
+    /// Performs `stream_state`.
     pub async fn stream_state(
         &self,
         connection_id: u64,
@@ -1023,6 +1214,7 @@ impl NativeProtoDriverSend {
         self.inner.stream_state(connection_id, stream_id).await
     }
 
+    /// Writes stream on connection.
     pub async fn write_stream_on_connection(
         &self,
         connection_id: u64,
@@ -1034,6 +1226,7 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Reads stream on connection.
     pub async fn read_stream_on_connection(
         &self,
         connection_id: u64,
@@ -1045,73 +1238,90 @@ impl NativeProtoDriverSend {
             .await
     }
 
+    /// Sets transport tuning.
     pub async fn set_transport_tuning(&self, tuning: NativeProtoTransportTuning) -> io::Result<()> {
         self.inner.set_transport_tuning(tuning).await
     }
 
+    /// Performs `transport_tuning`.
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         self.inner.transport_tuning().await
     }
 
+    /// Performs `stats`.
     pub async fn stats(&self) -> io::Result<NativeProtoStats> {
         self.inner.stats().await
     }
 
+    /// Drains events.
     pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
         self.inner.drain_events(max).await
     }
 
+    /// Sets fault spec.
     pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
         self.inner.set_fault_spec(spec).await
     }
 
+    /// Performs `fault_stats`.
     pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
         self.inner.fault_stats().await
     }
 }
 
 #[derive(Clone)]
+/// `NativeProtoDriverLocal` public API type.
 pub struct NativeProtoDriverLocal {
     inner: Rc<NativeProtoDriver>,
 }
 
 impl NativeProtoDriverLocal {
+    /// Performs `endpoint_id`.
     pub fn endpoint_id(&self) -> u64 {
         self.inner.endpoint_id()
     }
 
+    /// Performs `owner_shard`.
     pub fn owner_shard(&self) -> spargio::ShardId {
         self.inner.owner_shard()
     }
 
+    /// Returns whether closed.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
+    /// Converts this value to send handle.
     pub fn to_send_handle(&self) -> NativeProtoDriverSend {
         self.inner.to_send_handle()
     }
 
+    /// Performs `driver`.
     pub fn driver(&self) -> NativeProtoDriver {
         (*self.inner).clone()
     }
 
+    /// Performs `probe`.
     pub async fn probe(&self) -> io::Result<NativeProtoDriverProbe> {
         self.inner.probe().await
     }
 
+    /// Drains transmits.
     pub async fn drain_transmits(&self, max: usize) -> io::Result<Vec<NativeProtoTransmit>> {
         self.inner.drain_transmits(max).await
     }
 
+    /// Shuts this value down.
     pub async fn shutdown(&self) -> io::Result<()> {
         self.inner.shutdown().await
     }
 
+    /// Performs `register_connection_for_test`.
     pub async fn register_connection_for_test(&self) -> io::Result<u64> {
         self.inner.register_connection_for_test().await
     }
 
+    /// Connects for test.
     pub async fn connect_for_test(
         &self,
         config: quinn::ClientConfig,
@@ -1123,10 +1333,12 @@ impl NativeProtoDriverLocal {
             .await
     }
 
+    /// Closes connection for test.
     pub async fn close_connection_for_test(&self, connection_id: u64) -> io::Result<()> {
         self.inner.close_connection_for_test(connection_id).await
     }
 
+    /// Connects ion state.
     pub async fn connection_state(
         &self,
         connection_id: u64,
@@ -1134,6 +1346,7 @@ impl NativeProtoDriverLocal {
         self.inner.connection_state(connection_id).await
     }
 
+    /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -1144,6 +1357,7 @@ impl NativeProtoDriverLocal {
             .await
     }
 
+    /// Performs `recv_datagram_on_connection_for_test`.
     pub async fn recv_datagram_on_connection_for_test(
         &self,
         connection_id: u64,
@@ -1153,30 +1367,37 @@ impl NativeProtoDriverLocal {
             .await
     }
 
+    /// Opens uni on connection.
     pub async fn open_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         self.inner.open_uni_on_connection(connection_id).await
     }
 
+    /// Accepts uni on connection.
     pub async fn accept_uni_on_connection(&self, connection_id: u64) -> io::Result<u64> {
         self.inner.accept_uni_on_connection(connection_id).await
     }
 
+    /// Opens bi on connection.
     pub async fn open_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         self.inner.open_bi_on_connection(connection_id).await
     }
 
+    /// Accepts bi on connection.
     pub async fn accept_bi_on_connection(&self, connection_id: u64) -> io::Result<(u64, u64)> {
         self.inner.accept_bi_on_connection(connection_id).await
     }
 
+    /// Performs `finish_stream`.
     pub async fn finish_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         self.inner.finish_stream(connection_id, stream_id).await
     }
 
+    /// Resets stream.
     pub async fn reset_stream(&self, connection_id: u64, stream_id: u64) -> io::Result<()> {
         self.inner.reset_stream(connection_id, stream_id).await
     }
 
+    /// Performs `stream_state`.
     pub async fn stream_state(
         &self,
         connection_id: u64,
@@ -1185,26 +1406,32 @@ impl NativeProtoDriverLocal {
         self.inner.stream_state(connection_id, stream_id).await
     }
 
+    /// Sets transport tuning.
     pub async fn set_transport_tuning(&self, tuning: NativeProtoTransportTuning) -> io::Result<()> {
         self.inner.set_transport_tuning(tuning).await
     }
 
+    /// Performs `transport_tuning`.
     pub async fn transport_tuning(&self) -> io::Result<NativeProtoTransportTuning> {
         self.inner.transport_tuning().await
     }
 
+    /// Performs `stats`.
     pub async fn stats(&self) -> io::Result<NativeProtoStats> {
         self.inner.stats().await
     }
 
+    /// Drains events.
     pub async fn drain_events(&self, max: usize) -> io::Result<Vec<NativeProtoEvent>> {
         self.inner.drain_events(max).await
     }
 
+    /// Sets fault spec.
     pub async fn set_fault_spec(&self, spec: NativeProtoFaultSpec) -> io::Result<()> {
         self.inner.set_fault_spec(spec).await
     }
 
+    /// Performs `fault_stats`.
     pub async fn fault_stats(&self) -> io::Result<NativeProtoFaultStats> {
         self.inner.fault_stats().await
     }
@@ -2962,6 +3189,7 @@ fn push_native_event(events: &mut VecDeque<NativeProtoEvent>, event: NativeProto
 }
 
 #[derive(Debug, Clone, Copy)]
+/// `QuicEndpointOptions` public API type.
 pub struct QuicEndpointOptions {
     connect_timeout: Option<Duration>,
     accept_timeout: Option<Duration>,
@@ -2971,8 +3199,11 @@ pub struct QuicEndpointOptions {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `QuicBackend` enum.
 pub enum QuicBackend {
+    /// `Native` variant.
     Native,
+    /// `Bridge` variant.
     Bridge,
 }
 
@@ -2995,84 +3226,119 @@ impl Default for QuicEndpointOptions {
 }
 
 impl QuicEndpointOptions {
+    /// Returns an updated value with connect timeout.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
     }
 
+    /// Returns an updated value with accept timeout.
     pub fn with_accept_timeout(mut self, timeout: Duration) -> Self {
         self.accept_timeout = Some(timeout);
         self
     }
 
+    /// Returns an updated value with operation timeout.
     pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
         self.operation_timeout = Some(timeout);
         self
     }
 
+    /// Returns an updated value with max inflight ops.
     pub fn with_max_inflight_ops(mut self, max_inflight_ops: usize) -> Self {
         self.max_inflight_ops = max_inflight_ops;
         self
     }
 
+    /// Returns an updated value with backend.
     pub fn with_backend(mut self, backend: QuicBackend) -> Self {
         self.backend = backend;
         self
     }
 
+    /// Connects timeout.
     pub fn connect_timeout(self) -> Option<Duration> {
         self.connect_timeout
     }
 
+    /// Accepts timeout.
     pub fn accept_timeout(self) -> Option<Duration> {
         self.accept_timeout
     }
 
+    /// Performs `operation_timeout`.
     pub fn operation_timeout(self) -> Option<Duration> {
         self.operation_timeout
     }
 
+    /// Performs `max_inflight_ops`.
     pub fn max_inflight_ops(self) -> usize {
         self.max_inflight_ops
     }
 
+    /// Performs `backend`.
     pub fn backend(self) -> QuicBackend {
         self.backend
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// `QuicMetricsSnapshot` public API type.
 pub struct QuicMetricsSnapshot {
+    /// `endpoints_created` field.
     pub endpoints_created: u64,
+    /// `connects_started` field.
     pub connects_started: u64,
+    /// `connects_succeeded` field.
     pub connects_succeeded: u64,
+    /// `connects_failed` field.
     pub connects_failed: u64,
+    /// `connect_timeouts` field.
     pub connect_timeouts: u64,
+    /// `accepts_started` field.
     pub accepts_started: u64,
+    /// `accepts_succeeded` field.
     pub accepts_succeeded: u64,
+    /// `accepts_failed` field.
     pub accepts_failed: u64,
+    /// `accept_timeouts` field.
     pub accept_timeouts: u64,
+    /// `backpressure_rejections` field.
     pub backpressure_rejections: u64,
+    /// `connections_opened` field.
     pub connections_opened: u64,
+    /// `streams_opened_uni` field.
     pub streams_opened_uni: u64,
+    /// `streams_opened_bi` field.
     pub streams_opened_bi: u64,
+    /// `streams_accepted_uni` field.
     pub streams_accepted_uni: u64,
+    /// `streams_accepted_bi` field.
     pub streams_accepted_bi: u64,
+    /// `datagrams_sent` field.
     pub datagrams_sent: u64,
+    /// `datagrams_received` field.
     pub datagrams_received: u64,
+    /// `endpoint_closes` field.
     pub endpoint_closes: u64,
+    /// `connection_closes` field.
     pub connection_closes: u64,
+    /// `operation_timeouts` field.
     pub operation_timeouts: u64,
+    /// `native_ops_dispatched` field.
     pub native_ops_dispatched: u64,
+    /// `bridge_ops_dispatched` field.
     pub bridge_ops_dispatched: u64,
 }
 
 #[derive(Debug, Clone, Default)]
+/// `QuicMetrics` public API type.
 pub struct QuicMetrics {
     inner: Arc<QuicMetricsInner>,
 }
 
 impl QuicMetrics {
+    /// Performs `snapshot`.
     pub fn snapshot(&self) -> QuicMetricsSnapshot {
         QuicMetricsSnapshot {
             endpoints_created: self.inner.endpoints_created.load(Ordering::Relaxed),
@@ -3566,11 +3832,13 @@ enum QuicSendStreamKind {
     },
 }
 
+/// `QuicSendStream` public API type.
 pub struct QuicSendStream {
     kind: QuicSendStreamKind,
 }
 
 impl QuicSendStream {
+    /// Writes all.
     pub async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
         match &mut self.kind {
             QuicSendStreamKind::Quinn(stream) => {
@@ -3622,6 +3890,7 @@ impl QuicSendStream {
         }
     }
 
+    /// Performs `finish`.
     pub fn finish(&mut self) -> io::Result<()> {
         match &mut self.kind {
             QuicSendStreamKind::Quinn(stream) => stream.finish().map_err(io::Error::other),
@@ -3636,6 +3905,7 @@ impl QuicSendStream {
         }
     }
 
+    /// Resets.
     pub fn reset(&mut self, code: u32) -> io::Result<()> {
         match &mut self.kind {
             QuicSendStreamKind::Quinn(stream) => {
@@ -3662,11 +3932,13 @@ enum QuicRecvStreamKind {
     },
 }
 
+/// `QuicRecvStream` public API type.
 pub struct QuicRecvStream {
     kind: QuicRecvStreamKind,
 }
 
 impl QuicRecvStream {
+    /// Reads to end.
     pub async fn read_to_end(&mut self, size_limit: usize) -> io::Result<Vec<u8>> {
         match &mut self.kind {
             QuicRecvStreamKind::Quinn(stream) => stream
@@ -4217,6 +4489,7 @@ async fn native_connection_dispatch_loop(
 }
 
 #[derive(Clone)]
+/// `QuicEndpoint` public API type.
 pub struct QuicEndpoint {
     endpoint: Option<quinn::Endpoint>,
     native_dispatch: Option<NativeEndpointDispatch>,
@@ -4228,10 +4501,12 @@ pub struct QuicEndpoint {
 }
 
 impl QuicEndpoint {
+    /// Performs `server`.
     pub fn server(server_config: quinn::ServerConfig, bind_addr: SocketAddr) -> io::Result<Self> {
         Self::server_with_options(server_config, bind_addr, QuicEndpointOptions::default())
     }
 
+    /// Performs `server_with_options`.
     pub fn server_with_options(
         server_config: quinn::ServerConfig,
         bind_addr: SocketAddr,
@@ -4251,10 +4526,12 @@ impl QuicEndpoint {
         Self::from_endpoint_with_options(endpoint, options)
     }
 
+    /// Performs `client`.
     pub fn client(bind_addr: SocketAddr) -> io::Result<Self> {
         Self::client_with_options(bind_addr, QuicEndpointOptions::default())
     }
 
+    /// Performs `client_with_options`.
     pub fn client_with_options(
         bind_addr: SocketAddr,
         options: QuicEndpointOptions,
@@ -4269,10 +4546,12 @@ impl QuicEndpoint {
         Self::from_endpoint_with_options(endpoint, options)
     }
 
+    /// Builds a value from endpoint.
     pub fn from_endpoint(endpoint: quinn::Endpoint) -> io::Result<Self> {
         Self::from_endpoint_with_options(endpoint, QuicEndpointOptions::default())
     }
 
+    /// Builds a value from endpoint with options.
     pub fn from_endpoint_with_options(
         endpoint: quinn::Endpoint,
         options: QuicEndpointOptions,
@@ -4320,10 +4599,12 @@ impl QuicEndpoint {
         })
     }
 
+    /// Performs `options`.
     pub fn options(&self) -> QuicEndpointOptions {
         self.options
     }
 
+    /// Performs `local_addr`.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         if let Some(backend) = &self.native_proto_backend {
             return Ok(backend.local_addr());
@@ -4331,6 +4612,7 @@ impl QuicEndpoint {
         self.endpoint_ref().local_addr()
     }
 
+    /// Sets default client config.
     pub fn set_default_client_config(&mut self, config: quinn::ClientConfig) {
         {
             let mut default_client_config = self
@@ -4344,20 +4626,24 @@ impl QuicEndpoint {
         }
     }
 
+    /// Sets server config.
     pub fn set_server_config(&mut self, config: Option<quinn::ServerConfig>) {
         if let Some(endpoint) = self.endpoint.as_mut() {
             endpoint.set_server_config(config);
         }
     }
 
+    /// Performs `metrics_snapshot`.
     pub fn metrics_snapshot(&self) -> QuicMetricsSnapshot {
         self.metrics.snapshot()
     }
 
+    /// Performs `metrics`.
     pub fn metrics(&self) -> QuicMetrics {
         self.metrics.clone()
     }
 
+    /// Connects.
     pub async fn connect(&self, addr: SocketAddr, server_name: &str) -> io::Result<QuicConnection> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         self.metrics.inc_connects_started();
@@ -4441,6 +4727,7 @@ impl QuicEndpoint {
         }
     }
 
+    /// Connects with.
     pub async fn connect_with(
         &self,
         config: quinn::ClientConfig,
@@ -4508,6 +4795,7 @@ impl QuicEndpoint {
         }
     }
 
+    /// Accepts.
     pub async fn accept(&self) -> io::Result<Option<QuicConnection>> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         self.metrics.inc_accepts_started();
@@ -4588,6 +4876,7 @@ impl QuicEndpoint {
         }
     }
 
+    /// Closes.
     pub fn close(&self, code: u32, reason: &[u8]) {
         if let Some(endpoint) = self.endpoint.as_ref() {
             endpoint.close(code.into(), reason);
@@ -4608,6 +4897,7 @@ impl QuicEndpoint {
         self.metrics.inc_endpoint_closes();
     }
 
+    /// Performs `wait_idle`.
     pub async fn wait_idle(&self) -> io::Result<()> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let waited = match self.options.backend() {
@@ -4729,6 +5019,7 @@ impl Drop for QuicEndpoint {
 }
 
 #[derive(Clone)]
+/// `QuicConnection` public API type.
 pub struct QuicConnection {
     connection: Option<quinn::Connection>,
     native_dispatch: Option<NativeConnectionDispatch>,
@@ -4739,6 +5030,7 @@ pub struct QuicConnection {
 }
 
 impl QuicConnection {
+    /// Performs `stable_id`.
     pub fn stable_id(&self) -> usize {
         if let Some(native) = &self.native_proto {
             return native.connection_id as usize;
@@ -4749,6 +5041,7 @@ impl QuicConnection {
             .unwrap_or_default()
     }
 
+    /// Performs `stats`.
     pub fn stats(&self) -> quinn::ConnectionStats {
         self.connection
             .as_ref()
@@ -4756,12 +5049,14 @@ impl QuicConnection {
             .unwrap_or_default()
     }
 
+    /// Performs `max_datagram_size`.
     pub fn max_datagram_size(&self) -> Option<usize> {
         self.connection
             .as_ref()
             .and_then(quinn::Connection::max_datagram_size)
     }
 
+    /// Performs `datagram_send_buffer_space`.
     pub fn datagram_send_buffer_space(&self) -> usize {
         self.connection
             .as_ref()
@@ -4769,6 +5064,7 @@ impl QuicConnection {
             .unwrap_or(0)
     }
 
+    /// Closes.
     pub fn close(&self, code: u32, reason: &[u8]) {
         if let Some(native) = &self.native_proto {
             let _ = native
@@ -4783,6 +5079,7 @@ impl QuicConnection {
         self.metrics.inc_connection_closes();
     }
 
+    /// Closes d.
     pub async fn closed(&self) -> io::Result<()> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let out = match self.options.backend() {
@@ -4822,6 +5119,7 @@ impl QuicConnection {
         out
     }
 
+    /// Opens uni.
     pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let stream = match self.options.backend() {
@@ -4896,6 +5194,7 @@ impl QuicConnection {
         Ok(stream)
     }
 
+    /// Opens bi.
     pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let streams = match self.options.backend() {
@@ -4993,6 +5292,7 @@ impl QuicConnection {
         Ok(streams)
     }
 
+    /// Accepts uni.
     pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let stream = match self.options.backend() {
@@ -5067,6 +5367,7 @@ impl QuicConnection {
         Ok(stream)
     }
 
+    /// Accepts bi.
     pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let streams = match self.options.backend() {
@@ -5164,6 +5465,7 @@ impl QuicConnection {
         Ok(streams)
     }
 
+    /// Performs `send_datagram`.
     pub fn send_datagram<D>(&self, data: D) -> io::Result<()>
     where
         D: Into<Vec<u8>>,
@@ -5187,6 +5489,7 @@ impl QuicConnection {
         Ok(())
     }
 
+    /// Reads datagram.
     pub async fn read_datagram(&self) -> io::Result<Vec<u8>> {
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         let payload = match self.options.backend() {
@@ -5247,12 +5550,14 @@ impl QuicConnection {
         Ok(payload)
     }
 
+    /// Converts this value to local.
     pub fn to_local(&self) -> LocalQuicConnection {
         LocalQuicConnection {
             inner: Rc::new(self.clone()),
         }
     }
 
+    /// Converts this value to send handle.
     pub fn to_send_handle(&self) -> QuicSendConnection {
         QuicSendConnection {
             inner: self.clone(),
@@ -5279,35 +5584,43 @@ impl QuicConnection {
 }
 
 #[derive(Clone)]
+/// `QuicSendConnection` public API type.
 pub struct QuicSendConnection {
     inner: QuicConnection,
 }
 
 impl QuicSendConnection {
+    /// Performs `stable_id`.
     pub fn stable_id(&self) -> usize {
         self.inner.stable_id()
     }
 
+    /// Closes.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.inner.close(code, reason);
     }
 
+    /// Opens uni.
     pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         self.inner.open_uni().await
     }
 
+    /// Opens bi.
     pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.open_bi().await
     }
 
+    /// Accepts uni.
     pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         self.inner.accept_uni().await
     }
 
+    /// Accepts bi.
     pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.accept_bi().await
     }
 
+    /// Performs `send_datagram`.
     pub fn send_datagram<D>(&self, data: D) -> io::Result<()>
     where
         D: Into<Vec<u8>>,
@@ -5315,45 +5628,55 @@ impl QuicSendConnection {
         self.inner.send_datagram(data)
     }
 
+    /// Reads datagram.
     pub async fn read_datagram(&self) -> io::Result<Vec<u8>> {
         self.inner.read_datagram().await
     }
 
+    /// Connects ion.
     pub fn connection(&self) -> QuicConnection {
         self.inner.clone()
     }
 }
 
 #[derive(Clone)]
+/// `LocalQuicConnection` public API type.
 pub struct LocalQuicConnection {
     inner: Rc<QuicConnection>,
 }
 
 impl LocalQuicConnection {
+    /// Performs `stable_id`.
     pub fn stable_id(&self) -> usize {
         self.inner.stable_id()
     }
 
+    /// Closes.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.inner.close(code, reason);
     }
 
+    /// Opens uni.
     pub async fn open_uni(&self) -> io::Result<QuicSendStream> {
         self.inner.open_uni().await
     }
 
+    /// Opens bi.
     pub async fn open_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.open_bi().await
     }
 
+    /// Accepts uni.
     pub async fn accept_uni(&self) -> io::Result<QuicRecvStream> {
         self.inner.accept_uni().await
     }
 
+    /// Accepts bi.
     pub async fn accept_bi(&self) -> io::Result<(QuicSendStream, QuicRecvStream)> {
         self.inner.accept_bi().await
     }
 
+    /// Performs `send_datagram`.
     pub fn send_datagram<D>(&self, data: D) -> io::Result<()>
     where
         D: Into<Vec<u8>>,
@@ -5361,14 +5684,17 @@ impl LocalQuicConnection {
         self.inner.send_datagram(data)
     }
 
+    /// Reads datagram.
     pub async fn read_datagram(&self) -> io::Result<Vec<u8>> {
         self.inner.read_datagram().await
     }
 
+    /// Converts this value to send handle.
     pub fn to_send_handle(&self) -> QuicSendConnection {
         self.inner.to_send_handle()
     }
 
+    /// Connects ion.
     pub fn connection(&self) -> QuicConnection {
         (*self.inner).clone()
     }

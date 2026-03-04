@@ -2,6 +2,7 @@
 //!
 //! This crate provides async-facing signal streams and a small broadcast hub for
 //! multi-subscriber shutdown handling.
+#![deny(missing_docs)]
 
 use signal_hook::iterator::Signals;
 use std::io;
@@ -11,11 +12,16 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Clone)]
+/// Broadcast hub for process signals.
 pub struct SignalHub {
     subscribers: Arc<Mutex<Vec<Sender<i32>>>>,
 }
 
 impl SignalHub {
+    /// Creates a new signal hub for the provided signal numbers.
+    ///
+    /// A background listener thread is spawned and each received signal is
+    /// broadcast to all active subscribers.
     pub fn new<I>(signals: I) -> io::Result<Self>
     where
         I: IntoIterator<Item = i32>,
@@ -39,6 +45,7 @@ impl SignalHub {
         Ok(hub)
     }
 
+    /// Creates a new subscriber stream for this hub.
     pub fn subscribe(&self) -> SignalStream {
         let (tx, rx) = mpsc::channel::<i32>();
         let mut subscribers = self
@@ -53,11 +60,13 @@ impl SignalHub {
 }
 
 #[derive(Clone)]
+/// Async signal stream view over hub deliveries.
 pub struct SignalStream {
     rx: Arc<Mutex<Receiver<i32>>>,
 }
 
 impl SignalStream {
+    /// Waits for and returns the next signal.
     pub async fn recv(&self) -> io::Result<i32> {
         loop {
             match self.try_recv() {
@@ -68,6 +77,9 @@ impl SignalStream {
         }
     }
 
+    /// Waits for the next signal until `duration` elapses.
+    ///
+    /// Returns `Ok(None)` on timeout.
     pub async fn recv_timeout(&self, duration: Duration) -> io::Result<Option<i32>> {
         match spargio::timeout(duration, self.recv()).await {
             Ok(result) => result.map(Some),
@@ -75,6 +87,7 @@ impl SignalStream {
         }
     }
 
+    /// Waits until one of `accepted` signal numbers is received.
     pub async fn recv_matching(&self, accepted: &[i32]) -> io::Result<i32> {
         loop {
             let sig = self.recv().await?;
@@ -84,6 +97,7 @@ impl SignalStream {
         }
     }
 
+    /// Attempts to read one queued signal without waiting.
     pub fn try_recv(&self) -> io::Result<Option<i32>> {
         let rx = self.rx.lock().expect("signal stream lock poisoned");
         match rx.try_recv() {
@@ -97,6 +111,7 @@ impl SignalStream {
     }
 }
 
+/// Creates a signal stream listening for the specified signal numbers.
 pub fn signal<I>(signals: I) -> io::Result<SignalStream>
 where
     I: IntoIterator<Item = i32>,
@@ -105,6 +120,7 @@ where
     Ok(hub.subscribe())
 }
 
+/// Creates a signal stream for `SIGINT` (Ctrl-C).
 pub fn ctrl_c() -> io::Result<SignalStream> {
     signal([signal_hook::consts::SIGINT])
 }

@@ -1,3 +1,8 @@
+//! Procedural macros for `spargio`.
+//!
+//! This crate currently exposes the [`main`] attribute macro.
+#![deny(missing_docs)]
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::Parser;
@@ -81,6 +86,14 @@ impl MainArgs {
 }
 
 #[proc_macro_attribute]
+/// Attribute macro for defining a Spargio runtime entrypoint.
+///
+/// Supported options:
+/// - `shards = <expr>`: sets runtime shard count.
+/// - `backend = "io_uring"`: selects runtime backend.
+///
+/// The attributed function must be `async` and may take at most one parameter
+/// (a `spargio::RuntimeHandle` binding).
 pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = match MainArgs::parse(args) {
         Ok(args) => args,

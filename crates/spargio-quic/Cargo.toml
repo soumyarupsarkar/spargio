@@ -1,6 +1,6 @@
 [package]
 name = "spargio-quic"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 license = "MIT"
 description = "QUIC companion crate for spargio (quinn bridge)"
@@ -10,7 +10,7 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 bytes = "1"
 quinn = "0.11"
 quinn-proto = "0.11"
-spargio = { version = "0.5.7", path = "../.." }
+spargio = { version = "0.5.8", path = "../.." }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]

@@ -8416,3 +8416,36 @@ Notes:
 
 - This keeps comparisons stable and easier to interpret until/if we add
   explicit request-level latency histograms inside the benchmark harnesses.
+
+## Update: docs.rs coverage hardening for user-facing core API (2026-03-04)
+
+Implemented a focused documentation pass for the public runtime/boundary core
+API and verified docs coverage at 100% for the default docs.rs feature set.
+
+### What was added
+
+- User-focused rustdoc for:
+  - `ShardId`
+  - `boundary` module (`BoundaryClient`, `BoundaryServer`, tickets, errors,
+    stats, request envelope helpers)
+  - Time/cancellation primitives (`sleep`, `sleep_until`, `Sleep`, `timeout*`,
+    `Interval`, `CancellationToken`, `TaskGroup`)
+  - Core placement/message/runtime surface (`Event`, `RingMsg`,
+    `TaskPlacement`, `RuntimeBuilder`, `Runtime`, `RuntimeHandle`,
+    `RemoteShard`, `ShardCtx`, errors, join/ticket futures)
+  - `RuntimeStats` fields and helper ratios.
+
+### Guardrails
+
+- Added lint enforcement for the default (non-`uring-native`) API surface:
+  - `#![cfg_attr(not(feature = "uring-native"), deny(missing_docs))]`
+- This keeps docs.rs-default coverage strict without breaking current
+  `uring-native` CI/test lanes that still have broader undocumented surfaces.
+
+### Verification
+
+- `RUSTDOCFLAGS='-Dmissing-docs' cargo +nightly doc --no-deps`
+- `cargo +nightly rustdoc --lib -- -Zunstable-options --show-coverage`
+  - Result: `src/lib.rs` documented `218/218` (`100.0%`)
+- `cargo test`
+- `cargo test --features uring-native`

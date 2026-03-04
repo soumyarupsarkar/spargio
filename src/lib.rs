@@ -1,4 +1,5 @@
 //! Sharded async runtime API centered around `msg_ring`-style signaling.
+#![cfg_attr(not(feature = "uring-native"), deny(missing_docs))]
 
 use core::future::Future;
 use core::pin::Pin;
@@ -35,6 +36,9 @@ use std::os::fd::{AsRawFd, RawFd};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use std::os::fd::{FromRawFd, OwnedFd};
 
+/// Runtime shard identifier.
+///
+/// A shard is one runtime worker thread and its local queues/ring state.
 pub type ShardId = u16;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 pub type NativeOpId = u64;
@@ -277,6 +281,10 @@ fn path_to_cstring_for_native_ops(path: &std::path::Path) -> std::io::Result<CSt
     })
 }
 
+/// Async boundary channel for passing request/response work across runtime boundaries.
+///
+/// Use this when you want explicit backpressure, timeout-aware calls, and
+/// cancellation-safe response delivery between producers and consumers.
 pub mod boundary {
     use core::future::Future;
     use core::pin::Pin;
@@ -289,18 +297,28 @@ pub mod boundary {
     const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// Error type returned by boundary request/response operations.
     pub enum BoundaryError {
+        /// The boundary endpoint is closed.
         Closed,
+        /// The boundary queue is full.
         Overloaded,
+        /// The operation timed out.
         Timeout,
+        /// The caller or callee side canceled before completion.
         Canceled,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    /// Snapshot of aggregate boundary error counters.
     pub struct BoundaryStats {
+        /// Number of overload rejections.
         pub overloaded: u64,
+        /// Number of timeout outcomes.
         pub timed_out: u64,
+        /// Number of cancellations.
         pub canceled: u64,
+        /// Number of closed-channel outcomes.
         pub closed: u64,
     }
 
@@ -336,10 +354,14 @@ pub mod boundary {
         }
     }
 
+    /// Returns the current process-wide boundary stats snapshot.
     pub fn stats_snapshot() -> BoundaryStats {
         BOUNDARY_STATS.snapshot()
     }
 
+    /// Resets boundary stats counters.
+    ///
+    /// Intended for tests/benchmarks.
     pub fn reset_stats_for_tests() {
         BOUNDARY_STATS.clear();
     }
@@ -350,6 +372,7 @@ pub mod boundary {
         reply: oneshot::Sender<Result<Response, BoundaryError>>,
     }
 
+    /// Server-side request envelope that carries the request payload and reply path.
     pub struct BoundaryRequest<Request, Response> {
         request: Request,
         deadline: Option<Instant>,
@@ -357,18 +380,24 @@ pub mod boundary {
     }
 
     impl<Request, Response> BoundaryRequest<Request, Response> {
+        /// Returns a shared reference to the request payload.
         pub fn request(&self) -> &Request {
             &self.request
         }
 
+        /// Returns the call deadline, if one was set by the client.
         pub fn deadline(&self) -> Option<Instant> {
             self.deadline
         }
 
+        /// Consumes this envelope and returns the request payload.
         pub fn into_request(self) -> Request {
             self.request
         }
 
+        /// Sends the response back to the caller.
+        ///
+        /// Returns an error when the request already timed out or was canceled.
         pub fn respond(mut self, response: Response) -> Result<(), BoundaryError> {
             if let Some(deadline) = self.deadline {
                 if Instant::now() > deadline {
@@ -393,19 +422,23 @@ pub mod boundary {
     }
 
     #[derive(Clone)]
+    /// Client side of a boundary channel.
     pub struct BoundaryClient<Request, Response> {
         tx: Sender<BoundaryEnvelope<Request, Response>>,
     }
 
+    /// Server side of a boundary channel.
     pub struct BoundaryServer<Request, Response> {
         rx: Receiver<BoundaryEnvelope<Request, Response>>,
     }
 
+    /// Ticket/future returned by `BoundaryClient` calls.
     pub struct BoundaryTicket<Response> {
         rx: Option<oneshot::Receiver<Result<Response, BoundaryError>>>,
     }
 
     impl<Response> BoundaryTicket<Response> {
+        /// Waits for the response with an additional timeout.
         pub async fn wait_timeout(self, timeout: Duration) -> Result<Response, BoundaryError> {
             match super::timeout(timeout, self).await {
                 Ok(outcome) => outcome,
@@ -441,6 +474,7 @@ pub mod boundary {
     }
 
     impl<Request, Response> BoundaryClient<Request, Response> {
+        /// Enqueues a request and returns a response ticket.
         pub async fn call(
             &self,
             request: Request,
@@ -448,6 +482,7 @@ pub mod boundary {
             self.enqueue_async(request, None).await
         }
 
+        /// Enqueues a request with a per-call timeout deadline.
         pub async fn call_with_timeout(
             &self,
             request: Request,
@@ -457,6 +492,7 @@ pub mod boundary {
                 .await
         }
 
+        /// Attempts to enqueue immediately without waiting for queue space.
         pub fn try_call(
             &self,
             request: Request,
@@ -520,6 +556,7 @@ pub mod boundary {
     }
 
     impl<Request, Response> BoundaryServer<Request, Response> {
+        /// Receives the next request, waiting until one is available.
         pub async fn recv(&self) -> Result<BoundaryRequest<Request, Response>, BoundaryError> {
             loop {
                 match self.rx.try_recv() {
@@ -533,6 +570,7 @@ pub mod boundary {
             }
         }
 
+        /// Receives the next request, returning timeout if none arrives in time.
         pub async fn recv_timeout(
             &self,
             timeout: Duration,
@@ -569,6 +607,9 @@ pub mod boundary {
         }
     }
 
+    /// Creates a bounded boundary request/response channel pair.
+    ///
+    /// `capacity` is clamped to at least `1`.
     pub fn channel<Request, Response>(
         capacity: usize,
     ) -> (
@@ -581,8 +622,10 @@ pub mod boundary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Error returned by timeout helpers when the deadline expires.
 pub struct TimeoutError;
 
+/// Asynchronously sleeps for at least `duration`.
 pub async fn sleep(duration: Duration) {
     #[cfg(all(feature = "uring-native", target_os = "linux"))]
     if let Some(reply_rx) = ShardCtx::current().map(|ctx| ctx.enqueue_native_sleep(duration)) {
@@ -599,6 +642,7 @@ pub async fn sleep(duration: Duration) {
     let _ = rx.await;
 }
 
+/// Asynchronously sleeps until `deadline`.
 pub async fn sleep_until(deadline: Instant) {
     let now = Instant::now();
     if deadline <= now {
@@ -607,6 +651,7 @@ pub async fn sleep_until(deadline: Instant) {
     sleep(deadline.saturating_duration_since(now)).await;
 }
 
+/// A resettable sleep future.
 pub struct Sleep {
     deadline: Instant,
     fut: Pin<Box<dyn Future<Output = ()> + 'static>>,
@@ -614,10 +659,12 @@ pub struct Sleep {
 }
 
 impl Sleep {
+    /// Creates a sleep that fires after `duration`.
     pub fn new(duration: Duration) -> Self {
         Self::until(Instant::now() + duration)
     }
 
+    /// Creates a sleep that fires at an absolute `deadline`.
     pub fn until(deadline: Instant) -> Self {
         Self {
             deadline,
@@ -626,14 +673,17 @@ impl Sleep {
         }
     }
 
+    /// Returns the current deadline.
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
 
+    /// Returns `true` once the timer has elapsed.
     pub fn is_elapsed(&self) -> bool {
         self.elapsed || Instant::now() >= self.deadline
     }
 
+    /// Resets this timer to a new absolute `deadline`.
     pub fn reset(&mut self, deadline: Instant) {
         self.deadline = deadline;
         self.elapsed = false;
@@ -662,6 +712,7 @@ impl Future for Sleep {
     }
 }
 
+/// Runs `fut` and returns an error if it does not complete within `duration`.
 pub async fn timeout<F>(duration: Duration, fut: F) -> Result<F::Output, TimeoutError>
 where
     F: Future,
@@ -674,6 +725,7 @@ where
     }
 }
 
+/// Runs `fut` and returns an error if it does not complete by `deadline`.
 pub async fn timeout_at<F>(deadline: Instant, fut: F) -> Result<F::Output, TimeoutError>
 where
     F: Future,
@@ -682,9 +734,13 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Policy used by [`Interval`] when ticks are missed.
 pub enum MissedTickBehavior {
+    /// Deliver missed ticks as quickly as possible to catch up.
     Burst,
+    /// Shift schedule to `now + period` after each observed tick.
     Delay,
+    /// Skip directly to the next aligned future tick.
     Skip,
 }
 
@@ -695,6 +751,7 @@ impl Default for MissedTickBehavior {
 }
 
 #[derive(Debug, Clone)]
+/// Repeating timer that yields scheduled tick instants.
 pub struct Interval {
     period: Duration,
     next: Instant,
@@ -702,18 +759,22 @@ pub struct Interval {
 }
 
 impl Interval {
+    /// Returns the interval period.
     pub fn period(&self) -> Duration {
         self.period
     }
 
+    /// Returns the missed tick behavior policy.
     pub fn missed_tick_behavior(&self) -> MissedTickBehavior {
         self.missed_tick_behavior
     }
 
+    /// Sets the missed tick behavior policy.
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.missed_tick_behavior = behavior;
     }
 
+    /// Waits for the next tick and returns that tick's scheduled instant.
     pub async fn tick(&mut self) -> Instant {
         let scheduled = self.next;
         sleep_until(scheduled).await;
@@ -728,10 +789,12 @@ impl Interval {
     }
 }
 
+/// Creates an interval that starts immediately.
 pub fn interval(period: Duration) -> Interval {
     interval_at(Instant::now(), period)
 }
 
+/// Creates an interval starting at `start`.
 pub fn interval_at(start: Instant, period: Duration) -> Interval {
     assert!(period > Duration::ZERO, "`period` must be non-zero");
     Interval {
@@ -824,6 +887,7 @@ where
 }
 
 #[derive(Clone, Default)]
+/// Cooperative cancellation token shared between tasks.
 pub struct CancellationToken {
     inner: Arc<CancellationState>,
 }
@@ -835,10 +899,12 @@ struct CancellationState {
 }
 
 impl CancellationToken {
+    /// Creates a new uncanceled token.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Cancels this token and wakes all registered waiters.
     pub fn cancel(&self) {
         if self.inner.canceled.swap(true, Ordering::SeqCst) {
             return;
@@ -852,10 +918,12 @@ impl CancellationToken {
         }
     }
 
+    /// Returns `true` if this token has been canceled.
     pub fn is_canceled(&self) -> bool {
         self.inner.canceled.load(Ordering::SeqCst)
     }
 
+    /// Returns a future that resolves when this token is canceled.
     pub fn cancelled(&self) -> CancellationFuture {
         CancellationFuture {
             token: self.clone(),
@@ -863,6 +931,7 @@ impl CancellationToken {
     }
 }
 
+/// Future returned by [`CancellationToken::cancelled`].
 pub struct CancellationFuture {
     token: CancellationToken,
 }
@@ -891,12 +960,14 @@ impl Future for CancellationFuture {
     }
 }
 
+/// Group helper that couples task spawning with a shared cancellation token.
 pub struct TaskGroup {
     handle: RuntimeHandle,
     token: CancellationToken,
 }
 
 impl TaskGroup {
+    /// Creates a new task group bound to `handle`.
     pub fn new(handle: RuntimeHandle) -> Self {
         Self {
             handle,
@@ -904,14 +975,20 @@ impl TaskGroup {
         }
     }
 
+    /// Cancels the group token.
     pub fn cancel(&self) {
         self.token.cancel();
     }
 
+    /// Returns a clone of the group cancellation token.
     pub fn token(&self) -> CancellationToken {
         self.token.clone()
     }
 
+    /// Spawns a task under this group's cancellation token and placement policy.
+    ///
+    /// The returned join handle yields `Ok(Some(output))` on completion and
+    /// `Ok(None)` when canceled by the group token.
     pub fn spawn_with_placement<F, T>(
         &self,
         placement: TaskPlacement,
@@ -934,6 +1011,7 @@ impl TaskGroup {
     }
 }
 
+/// Join handle returned by [`TaskGroup::spawn_with_placement`].
 pub struct TaskGroupJoinHandle<T> {
     inner: JoinHandle<Option<T>>,
 }
@@ -947,80 +1025,139 @@ impl<T> Future for TaskGroupJoinHandle<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Runtime event stream item.
 pub enum Event {
-    RingMsg { from: ShardId, tag: u16, val: u32 },
+    /// A raw ring message event.
+    RingMsg {
+        /// Shard id that originated the message.
+        from: ShardId,
+        /// Message tag.
+        tag: u16,
+        /// Message value payload.
+        val: u32,
+    },
 }
 
+/// Trait for strongly-typed cross-shard message encoding/decoding.
 pub trait RingMsg: Copy + Send + 'static {
+    /// Encodes this message into `(tag, value)` wire form.
     fn encode(self) -> (u16, u32);
+    /// Decodes a `(tag, value)` pair into a typed message.
     fn decode(tag: u16, val: u32) -> Self;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Runtime backend selection.
 pub enum BackendKind {
+    /// Linux `io_uring` backend.
     IoUring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Task placement policy used when spawning.
 pub enum TaskPlacement {
+    /// Pin execution to a specific shard.
     Pinned(ShardId),
+    /// Place on the next shard in round-robin order.
     RoundRobin,
+    /// Place by hashing a sticky key to a shard.
     Sticky(u64),
+    /// Enqueue as stealable work with round-robin preferred shard.
     Stealable,
+    /// Enqueue as stealable work with explicit preferred shard.
     StealablePreferred(ShardId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Internal queue backend used for stealable task inboxes.
 pub enum StealableQueueBackend {
+    /// Mutex + `VecDeque` backend (default).
     Mutex,
+    /// Experimental lock-free queue backend.
     SegQueueExperimental,
 }
 
 #[derive(Debug, Clone)]
+/// Runtime statistics snapshot.
 pub struct RuntimeStats {
+    /// Per-shard command queue depth samples.
     pub shard_command_depths: Vec<usize>,
+    /// Per-shard in-flight native-op counts.
     pub pending_native_ops_by_shard: Vec<usize>,
+    /// Count of native unbound envelope submissions.
     pub native_any_envelope_submitted: u64,
+    /// Count of native local fast-path submissions.
     pub native_any_local_fastpath_submitted: u64,
+    /// Count of native local direct submissions.
     pub native_any_local_direct_submitted: u64,
+    /// Count of pinned spawns requested.
     pub spawn_pinned_submitted: u64,
+    /// Count of stealable spawns requested.
     pub spawn_stealable_submitted: u64,
+    /// Count of executed stealable tasks.
     pub stealable_executed: u64,
+    /// Count of stealable tasks executed on a non-preferred shard.
     pub stealable_stolen: u64,
+    /// Count of stealable enqueue backpressure hits.
     pub stealable_backpressure: u64,
+    /// Count of stealable tasks executed on preferred/local shard.
     pub stealable_local_hits: u64,
+    /// Count of steal attempts.
     pub steal_attempts: u64,
+    /// Count of victim queue scans performed while stealing.
     pub steal_scans: u64,
+    /// Count of successful steal operations.
     pub steal_success: u64,
+    /// Count of steals skipped due to backoff.
     pub steal_skipped_backoff: u64,
+    /// Count of steals skipped due to locality gate.
     pub steal_skipped_locality: u64,
+    /// Maximum observed consecutive failed steals.
     pub steal_failed_streak_max: u64,
+    /// Count of stealable wake notifications sent.
     pub stealable_wake_sent: u64,
+    /// Count of coalesced stealable wake notifications.
     pub stealable_wake_coalesced: u64,
+    /// Configured victim stride for stealing.
     pub steal_victim_stride: usize,
+    /// Configured victim probes per steal cycle.
     pub steal_victim_probe_count: usize,
+    /// Configured steal batch size.
     pub steal_batch_size: usize,
+    /// Configured locality margin for stealing decisions.
     pub steal_locality_margin: usize,
+    /// Configured fail-cost heuristic for stealing decisions.
     pub steal_fail_cost: usize,
+    /// Configured minimum backoff ticks after failed steals.
     pub steal_backoff_min: usize,
+    /// Configured maximum backoff ticks after failed steals.
     pub steal_backoff_max: usize,
+    /// Count of ring messages submitted.
     pub ring_msgs_submitted: u64,
+    /// Count of ring messages completed.
     pub ring_msgs_completed: u64,
+    /// Count of failed ring message submissions/completions.
     pub ring_msgs_failed: u64,
+    /// Count of ring message backpressure rejections.
     pub ring_msgs_backpressure: u64,
+    /// Count of native-op affinity routing violations observed.
     pub native_affinity_violations: u64,
+    /// Total in-flight native operations.
     pub pending_native_ops: u64,
 }
 
 impl RuntimeStats {
+    /// Returns the sum of `shard_command_depths`.
     pub fn total_command_depth(&self) -> usize {
         self.shard_command_depths.iter().sum()
     }
 
+    /// Returns the maximum observed command depth among shards.
     pub fn max_command_depth(&self) -> usize {
         self.shard_command_depths.iter().copied().max().unwrap_or(0)
     }
 
+    /// Returns the maximum in-flight native-op count across shards.
     pub fn max_pending_native_ops_by_shard(&self) -> usize {
         self.pending_native_ops_by_shard
             .iter()
@@ -1029,6 +1166,7 @@ impl RuntimeStats {
             .unwrap_or(0)
     }
 
+    /// Returns `steal_success / steal_attempts`, or `0.0` if no attempts.
     pub fn steal_success_rate(&self) -> f64 {
         if self.steal_attempts == 0 {
             return 0.0;
@@ -1036,6 +1174,7 @@ impl RuntimeStats {
         self.steal_success as f64 / self.steal_attempts as f64
     }
 
+    /// Returns `stealable_local_hits / stealable_executed`, or `0.0`.
     pub fn local_hit_ratio(&self) -> f64 {
         if self.stealable_executed == 0 {
             return 0.0;
@@ -1043,6 +1182,7 @@ impl RuntimeStats {
         self.stealable_local_hits as f64 / self.stealable_executed as f64
     }
 
+    /// Returns `steal_success / steal_scans`, or `0.0`.
     pub fn stolen_per_scan(&self) -> f64 {
         if self.steal_scans == 0 {
             return 0.0;
@@ -1073,6 +1213,10 @@ impl Default for IoUringBuildConfig {
 }
 
 #[derive(Debug, Clone)]
+/// Builder for constructing a [`Runtime`].
+///
+/// Defaults are tuned for general-purpose usage. Use the steal-policy and
+/// queue settings only when you have benchmark evidence for your workload.
 pub struct RuntimeBuilder {
     shards: usize,
     thread_prefix: String,
@@ -1126,20 +1270,26 @@ impl Default for RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    /// Creates a new builder with default settings.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the number of runtime shards (worker threads).
     pub fn shards(mut self, count: usize) -> Self {
         self.shards = count;
         self
     }
 
+    /// Sets the prefix used for worker thread names.
     pub fn thread_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.thread_prefix = prefix.into();
         self
     }
 
+    /// Sets an optional CPU affinity list used for worker threads.
+    ///
+    /// Duplicates are removed and values are sorted.
     pub fn thread_affinity<I>(mut self, cpus: I) -> Self
     where
         I: IntoIterator<Item = usize>,
@@ -1151,26 +1301,31 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Selects the runtime backend.
     pub fn backend(mut self, backend: BackendKind) -> Self {
         self.backend = backend;
         self
     }
 
+    /// Sets ring SQ/CQ entry count for each shard (minimum `1`).
     pub fn ring_entries(mut self, entries: u32) -> Self {
         self.ring_entries = entries.max(1);
         self
     }
 
+    /// Sets per-shard command queue capacity (minimum `1`).
     pub fn msg_ring_queue_capacity(mut self, capacity: usize) -> Self {
         self.msg_ring_queue_capacity = capacity.max(1);
         self
     }
 
+    /// Marks a message tag as "hot" for fast hot-lane polling.
     pub fn hot_msg_tag(mut self, tag: u16) -> Self {
         self.hot_msg_tags.push(tag);
         self
     }
 
+    /// Marks multiple message tags as "hot".
     pub fn hot_msg_tags<I>(mut self, tags: I) -> Self
     where
         I: IntoIterator<Item = u16>,
@@ -1179,11 +1334,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Marks a tag as coalesced-hot (counts are coalesced before wake).
     pub fn coalesced_hot_msg_tag(mut self, tag: u16) -> Self {
         self.coalesced_hot_msg_tags.push(tag);
         self
     }
 
+    /// Marks multiple tags as coalesced-hot.
     pub fn coalesced_hot_msg_tags<I>(mut self, tags: I) -> Self
     where
         I: IntoIterator<Item = u16>,
@@ -1192,51 +1349,61 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets wake threshold for coalesced hot-counter updates (minimum `1`).
     pub fn hot_counter_wake_threshold(mut self, threshold: u64) -> Self {
         self.hot_counter_wake_threshold = threshold.max(1);
         self
     }
 
+    /// Sets stealable task queue capacity per shard (minimum `1`).
     pub fn stealable_queue_capacity(mut self, capacity: usize) -> Self {
         self.stealable_queue_capacity = capacity.max(1);
         self
     }
 
+    /// Selects backend implementation for stealable task queues.
     pub fn stealable_queue_backend(mut self, backend: StealableQueueBackend) -> Self {
         self.stealable_queue_backend = backend;
         self
     }
 
+    /// Sets maximum local steal work budget per scheduler loop (minimum `1`).
     pub fn steal_budget(mut self, budget: usize) -> Self {
         self.steal_budget = budget.max(1);
         self
     }
 
+    /// Sets victim-shard stepping stride for steal probing (minimum `1`).
     pub fn steal_victim_stride(mut self, stride: usize) -> Self {
         self.steal_victim_stride = stride.max(1);
         self
     }
 
+    /// Sets number of victim queues to probe per steal cycle (minimum `1`).
     pub fn steal_victim_probe_count(mut self, probes: usize) -> Self {
         self.steal_victim_probe_count = probes.max(1);
         self
     }
 
+    /// Sets maximum batch size for a successful steal (minimum `1`).
     pub fn steal_batch_size(mut self, batch_size: usize) -> Self {
         self.steal_batch_size = batch_size.max(1);
         self
     }
 
+    /// Sets locality margin used by steal gating heuristics.
     pub fn steal_locality_margin(mut self, margin: usize) -> Self {
         self.steal_locality_margin = margin;
         self
     }
 
+    /// Sets fail-cost used by steal gating heuristics (minimum `1`).
     pub fn steal_fail_cost(mut self, cost: usize) -> Self {
         self.steal_fail_cost = cost.max(1);
         self
     }
 
+    /// Sets minimum backoff ticks after steal failures (minimum `1`).
     pub fn steal_backoff_min(mut self, min_ticks: usize) -> Self {
         self.steal_backoff_min = min_ticks.max(1);
         if self.steal_backoff_max < self.steal_backoff_min {
@@ -1245,6 +1412,7 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets maximum backoff ticks after steal failures (minimum `1`).
     pub fn steal_backoff_max(mut self, max_ticks: usize) -> Self {
         self.steal_backoff_max = max_ticks.max(1);
         if self.steal_backoff_max < self.steal_backoff_min {
@@ -1254,6 +1422,7 @@ impl RuntimeBuilder {
     }
 
     #[cfg(target_os = "linux")]
+    /// Enables/disables SQPOLL and optionally sets idle timeout in ms.
     pub fn io_uring_sqpoll(mut self, idle_ms: Option<u32>) -> Self {
         self.io_uring.sqpoll_idle_ms = idle_ms;
         if idle_ms.is_none() {
@@ -1263,6 +1432,7 @@ impl RuntimeBuilder {
     }
 
     #[cfg(target_os = "linux")]
+    /// Pins SQPOLL thread to a specific CPU (implies SQPOLL enabled).
     pub fn io_uring_sqpoll_cpu(mut self, cpu: Option<u32>) -> Self {
         self.io_uring.sqpoll_cpu = cpu;
         if cpu.is_some() && self.io_uring.sqpoll_idle_ms.is_none() {
@@ -1272,18 +1442,21 @@ impl RuntimeBuilder {
     }
 
     #[cfg(target_os = "linux")]
+    /// Enables/disables `IORING_SETUP_SINGLE_ISSUER`.
     pub fn io_uring_single_issuer(mut self, enable: bool) -> Self {
         self.io_uring.single_issuer = enable;
         self
     }
 
     #[cfg(target_os = "linux")]
+    /// Enables/disables `IORING_SETUP_COOP_TASKRUN`.
     pub fn io_uring_coop_taskrun(mut self, enable: bool) -> Self {
         self.io_uring.coop_taskrun = enable;
         self
     }
 
     #[cfg(target_os = "linux")]
+    /// Convenience profile for throughput-oriented io_uring settings.
     pub fn io_uring_throughput_mode(mut self, sqpoll_idle_ms: Option<u32>) -> Self {
         self.io_uring.coop_taskrun = true;
         self.io_uring.sqpoll_idle_ms = sqpoll_idle_ms;
@@ -1293,6 +1466,7 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Builds and starts a runtime from this configuration.
     pub fn build(self) -> Result<Runtime, RuntimeError> {
         if self.shards == 0 {
             return Err(RuntimeError::InvalidConfig("shards must be > 0"));
@@ -1500,6 +1674,10 @@ fn shutdown_spawned(
     }
 }
 
+/// Owned runtime instance.
+///
+/// Dropping this value shuts workers down (best effort). Prefer calling
+/// [`Runtime::shutdown`] to await a clean async shutdown.
 pub struct Runtime {
     shared: Arc<RuntimeShared>,
     remotes: Vec<RemoteShard>,
@@ -1508,22 +1686,27 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Returns a new [`RuntimeBuilder`].
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder::new()
     }
 
+    /// Returns the runtime backend kind.
     pub fn backend(&self) -> BackendKind {
         self.shared.backend
     }
 
+    /// Returns configured shard count.
     pub fn shard_count(&self) -> usize {
         self.remotes.len()
     }
 
+    /// Returns a handle for a specific shard.
     pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
         self.remotes.get(usize::from(shard)).cloned()
     }
 
+    /// Returns a clonable runtime handle for spawning and control operations.
     pub fn handle(&self) -> RuntimeHandle {
         RuntimeHandle {
             inner: Arc::new(RuntimeHandleInner {
@@ -1534,6 +1717,7 @@ impl Runtime {
         }
     }
 
+    /// Spawns a `Send` task pinned to `shard`.
     pub fn spawn_on<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: Future<Output = T> + Send + 'static,
@@ -1542,6 +1726,7 @@ impl Runtime {
         spawn_on_shared(&self.shared, shard, fut)
     }
 
+    /// Initiates and awaits full runtime shutdown.
     pub async fn shutdown(&mut self) {
         if self.is_shutdown {
             return;
@@ -1594,6 +1779,7 @@ impl Drop for Runtime {
 }
 
 #[derive(Clone)]
+/// Cheap, clonable runtime control handle.
 pub struct RuntimeHandle {
     inner: Arc<RuntimeHandleInner>,
 }
@@ -1605,18 +1791,25 @@ struct RuntimeHandleInner {
 }
 
 impl RuntimeHandle {
+    /// Returns the runtime backend kind.
     pub fn backend(&self) -> BackendKind {
         self.inner.shared.backend
     }
 
+    /// Returns configured shard count.
     pub fn shard_count(&self) -> usize {
         self.inner.remotes.len()
     }
 
+    /// Returns a handle for a specific shard.
     pub fn remote(&self, shard: ShardId) -> Option<RemoteShard> {
         self.inner.remotes.get(usize::from(shard)).cloned()
     }
 
+    /// Spawns a local (`!Send`) task initializer on `shard`.
+    ///
+    /// The `init` closure runs on the target shard and may return a `!Send`
+    /// future tied to that shard-local context.
     pub fn spawn_local_on<F, Fut, T>(
         &self,
         shard: ShardId,
@@ -1635,6 +1828,7 @@ impl RuntimeHandle {
         spawn_local_on_shared(&self.inner.shared, shard, init)
     }
 
+    /// Spawns a `Send` task pinned to `shard`.
     pub fn spawn_pinned<F, T>(&self, shard: ShardId, fut: F) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: Future<Output = T> + Send + 'static,
@@ -1648,6 +1842,7 @@ impl RuntimeHandle {
         spawn_on_shared(&self.inner.shared, shard, fut)
     }
 
+    /// Spawns a stealable task using round-robin preferred shard selection.
     pub fn spawn_stealable<F, T>(&self, fut: F) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: Future<Output = T> + Send + 'static,
@@ -1656,6 +1851,7 @@ impl RuntimeHandle {
         self.spawn_with_placement(TaskPlacement::Stealable, fut)
     }
 
+    /// Spawns a stealable task with explicit preferred shard.
     pub fn spawn_stealable_on<F, T>(
         &self,
         preferred_shard: ShardId,
@@ -1668,6 +1864,7 @@ impl RuntimeHandle {
         self.spawn_with_placement(TaskPlacement::StealablePreferred(preferred_shard), fut)
     }
 
+    /// Spawns a `Send` task with explicit placement policy.
     pub fn spawn_with_placement<F, T>(
         &self,
         placement: TaskPlacement,
@@ -1707,6 +1904,7 @@ impl RuntimeHandle {
         }
     }
 
+    /// Spawns blocking CPU/OS work on a dedicated helper thread.
     pub fn spawn_blocking<F, T>(&self, f: F) -> Result<JoinHandle<T>, RuntimeError>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -1723,6 +1921,7 @@ impl RuntimeHandle {
         Ok(JoinHandle { rx: Some(rx) })
     }
 
+    /// Returns a point-in-time runtime statistics snapshot.
     pub fn stats_snapshot(&self) -> RuntimeStats {
         self.inner.shared.stats.snapshot()
     }
@@ -5796,26 +5995,31 @@ impl RuntimeShared {
 }
 
 #[derive(Clone)]
+/// Handle to a specific target shard for message sending.
 pub struct RemoteShard {
     id: ShardId,
     shared: Arc<RuntimeShared>,
 }
 
 impl RemoteShard {
+    /// Returns the destination shard id.
     pub fn id(&self) -> ShardId {
         self.id
     }
 
+    /// Sends one raw `(tag, val)` message and returns an acknowledgement ticket.
     pub fn send_raw(&self, tag: u16, val: u32) -> Result<SendTicket, SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.send_raw_inner(tag, val, Some(ack_tx))?;
         Ok(SendTicket { rx: Some(ack_rx) })
     }
 
+    /// Sends one raw `(tag, val)` message without waiting for acknowledgement.
     pub fn send_raw_nowait(&self, tag: u16, val: u32) -> Result<(), SendError> {
         self.send_raw_inner(tag, val, None)
     }
 
+    /// Sends a batch of raw messages without acknowledgement tickets.
     pub fn send_many_raw_nowait<I>(&self, msgs: I) -> Result<(), SendError>
     where
         I: IntoIterator<Item = (u16, u32)>,
@@ -5841,10 +6045,16 @@ impl RemoteShard {
         Ok(())
     }
 
+    /// Attempts direct in-ring submission for one message when called on-shard.
+    ///
+    /// Falls back to queued path when called outside runtime worker context.
     pub fn send_raw_direct_nowait(&self, tag: u16, val: u32) -> Result<(), SendError> {
         self.send_many_raw_direct_nowait(std::iter::once((tag, val)))
     }
 
+    /// Attempts direct in-ring submission for a batch when called on-shard.
+    ///
+    /// Falls back to queued path when called outside runtime worker context.
     pub fn send_many_raw_direct_nowait<I>(&self, msgs: I) -> Result<(), SendError>
     where
         I: IntoIterator<Item = (u16, u32)>,
@@ -5882,16 +6092,19 @@ impl RemoteShard {
             .map_err(|_| SendError::Closed)
     }
 
+    /// Sends a typed message and returns an acknowledgement ticket.
     pub fn send<M: RingMsg>(&self, msg: M) -> Result<SendTicket, SendError> {
         let (tag, val) = msg.encode();
         self.send_raw(tag, val)
     }
 
+    /// Sends a typed message without waiting for acknowledgement.
     pub fn send_nowait<M: RingMsg>(&self, msg: M) -> Result<(), SendError> {
         let (tag, val) = msg.encode();
         self.send_raw_nowait(tag, val)
     }
 
+    /// Sends a batch of typed messages without acknowledgement.
     pub fn send_many_nowait<M, I>(&self, msgs: I) -> Result<(), SendError>
     where
         M: RingMsg,
@@ -5900,6 +6113,7 @@ impl RemoteShard {
         self.send_many_raw_nowait(msgs.into_iter().map(|msg| msg.encode()))
     }
 
+    /// Flushes pending local sends and returns a completion ticket.
     pub fn flush(&self) -> Result<SendTicket, SendError> {
         let current = ShardCtx::current().filter(|ctx| ctx.runtime_id() == self.shared.runtime_id);
         if let Some(ctx) = current {
@@ -5913,6 +6127,7 @@ impl RemoteShard {
 }
 
 #[derive(Clone)]
+/// Shard-local execution context available on worker threads.
 pub struct ShardCtx {
     inner: Rc<ShardCtxInner>,
 }
@@ -5933,10 +6148,12 @@ thread_local! {
 }
 
 impl ShardCtx {
+    /// Returns the current shard context when called from a runtime worker.
     pub fn current() -> Option<Self> {
         CURRENT_SHARD.with(|ctx| ctx.borrow().clone())
     }
 
+    /// Returns the current shard id.
     pub fn shard_id(&self) -> ShardId {
         self.inner.shard_id
     }
@@ -5945,14 +6162,17 @@ impl ShardCtx {
         self.inner.runtime_id
     }
 
+    /// Returns a remote handle for `target`.
     pub fn remote(&self, target: ShardId) -> Option<RemoteShard> {
         self.inner.remotes.get(usize::from(target)).cloned()
     }
 
+    /// Enqueues one raw message to `target` (no acknowledgement ticket).
     pub fn send_raw_nowait(&self, target: ShardId, tag: u16, val: u32) -> Result<(), SendError> {
         self.enqueue_local_send(target, tag, val, None)
     }
 
+    /// Enqueues a batch of raw messages to `target`.
     pub fn send_many_raw_nowait<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
     where
         I: IntoIterator<Item = (u16, u32)>,
@@ -5960,6 +6180,7 @@ impl ShardCtx {
         self.enqueue_local_send_many(target, msgs)
     }
 
+    /// Enqueues one raw message via direct in-ring path.
     pub fn send_raw_direct_nowait(
         &self,
         target: ShardId,
@@ -5969,6 +6190,7 @@ impl ShardCtx {
         self.enqueue_local_send_many_direct(target, std::iter::once((tag, val)))
     }
 
+    /// Enqueues a batch of raw messages via direct in-ring path.
     pub fn send_many_raw_direct_nowait<I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
     where
         I: IntoIterator<Item = (u16, u32)>,
@@ -5976,6 +6198,7 @@ impl ShardCtx {
         self.enqueue_local_send_many_direct(target, msgs)
     }
 
+    /// Enqueues a batch of typed messages to `target`.
     pub fn send_many_nowait<M, I>(&self, target: ShardId, msgs: I) -> Result<(), SendError>
     where
         M: RingMsg,
@@ -5984,6 +6207,7 @@ impl ShardCtx {
         self.enqueue_local_send_many(target, msgs.into_iter().map(|msg| msg.encode()))
     }
 
+    /// Sends one raw message to `target` and returns an acknowledgement ticket.
     pub fn send_raw(&self, target: ShardId, tag: u16, val: u32) -> Result<SendTicket, SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.enqueue_local_send(target, tag, val, Some(ack_tx))?;
@@ -6068,6 +6292,7 @@ impl ShardCtx {
         Ok(())
     }
 
+    /// Flushes queued local commands and returns a completion ticket.
     pub fn flush(&self) -> Result<SendTicket, SendError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner
@@ -6156,6 +6381,7 @@ impl ShardCtx {
         reply_rx
     }
 
+    /// Spawns a shard-local (`!Send`) task on this shard.
     pub fn spawn_local<F, T>(&self, fut: F) -> LocalJoinHandle<T>
     where
         F: Future<Output = T> + 'static,
@@ -6177,18 +6403,21 @@ impl ShardCtx {
         LocalJoinHandle { rx: Some(rx) }
     }
 
+    /// Returns a future for the next regular event.
     pub fn next_event(&self) -> NextEvent {
         NextEvent {
             state: self.inner.event_state.clone(),
         }
     }
 
+    /// Returns a future for the next hot-lane event.
     pub fn next_hot_event(&self) -> NextEvent {
         NextEvent {
             state: self.inner.hot_event_state.clone(),
         }
     }
 
+    /// Returns a future that resolves with accumulated hot count for `tag`.
     pub fn next_hot_count(&self, tag: u16) -> NextHotCount {
         NextHotCount {
             state: self.inner.hot_counter_state.clone(),
@@ -6196,34 +6425,49 @@ impl ShardCtx {
         }
     }
 
+    /// Tries to take the current hot counter value for `tag` without waiting.
     pub fn try_take_hot_count(&self, tag: u16) -> Option<u64> {
         self.inner.hot_counter_state.try_take(tag)
     }
 }
 
 #[derive(Debug)]
+/// Runtime construction/spawn/control error.
 pub enum RuntimeError {
+    /// Invalid builder configuration.
     InvalidConfig(&'static str),
+    /// Failed to spawn worker/helper thread.
     ThreadSpawn(std::io::Error),
+    /// Requested shard id does not exist.
     InvalidShard(ShardId),
+    /// Runtime/channel is closed.
     Closed,
+    /// Operation was rejected due to backpressure.
     Overloaded,
+    /// Requested operation is not supported by active backend.
     UnsupportedBackend(&'static str),
     #[cfg(target_os = "linux")]
+    /// Failed to initialize io_uring resources.
     IoUringInit(std::io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Message send failure.
 pub enum SendError {
+    /// Runtime/channel is closed.
     Closed,
+    /// Queue backpressure prevented enqueue.
     Backpressure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Join handle completion failure.
 pub enum JoinError {
+    /// Task was canceled or its completion channel was dropped.
     Canceled,
 }
 
+/// Future returned by runtime spawn APIs.
 pub struct JoinHandle<T> {
     rx: Option<oneshot::Receiver<T>>,
 }
@@ -6250,6 +6494,7 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
+/// Future returned by shard-local spawn APIs.
 pub struct LocalJoinHandle<T> {
     rx: Option<oneshot::Receiver<T>>,
 }
@@ -6276,6 +6521,7 @@ impl<T> Future for LocalJoinHandle<T> {
     }
 }
 
+/// Completion ticket for send/flush operations.
 pub struct SendTicket {
     rx: Option<oneshot::Receiver<Result<(), SendError>>>,
 }
@@ -6302,6 +6548,7 @@ impl Future for SendTicket {
     }
 }
 
+/// Future that yields the next event from a shard event queue.
 pub struct NextEvent {
     state: Arc<EventState>,
 }
@@ -6314,6 +6561,7 @@ impl Future for NextEvent {
     }
 }
 
+/// Future that yields the next coalesced hot-counter value for a tag.
 pub struct NextHotCount {
     state: Arc<HotCounterState>,
     tag: u16,

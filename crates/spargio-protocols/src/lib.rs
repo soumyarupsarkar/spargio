@@ -2,27 +2,32 @@
 //!
 //! These helpers provide explicit blocking bridges intended for TLS/WS/QUIC
 //! ecosystem integrations that do not natively target spargio executors.
+#![deny(missing_docs)]
 
 use spargio::{RuntimeError, RuntimeHandle};
 use std::io;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Shared options for protocol blocking bridge helpers.
 pub struct BlockingOptions {
     timeout: Option<Duration>,
 }
 
 impl BlockingOptions {
+    /// Sets a timeout for the blocking operation.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Returns the configured timeout.
     pub fn timeout(self) -> Option<Duration> {
         self.timeout
     }
 }
 
+/// Executes a TLS-related blocking closure on Spargio's blocking lane.
 pub async fn tls_blocking<T, F>(handle: &RuntimeHandle, f: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -31,6 +36,7 @@ where
     tls_blocking_with_options(handle, BlockingOptions::default(), f).await
 }
 
+/// Executes a TLS-related blocking closure with explicit options.
 pub async fn tls_blocking_with_options<T, F>(
     handle: &RuntimeHandle,
     options: BlockingOptions,
@@ -50,6 +56,7 @@ where
     .await
 }
 
+/// Executes a WebSocket-related blocking closure on Spargio's blocking lane.
 pub async fn ws_blocking<T, F>(handle: &RuntimeHandle, f: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -58,6 +65,7 @@ where
     ws_blocking_with_options(handle, BlockingOptions::default(), f).await
 }
 
+/// Executes a WebSocket-related blocking closure with explicit options.
 pub async fn ws_blocking_with_options<T, F>(
     handle: &RuntimeHandle,
     options: BlockingOptions,
@@ -77,6 +85,7 @@ where
     .await
 }
 
+/// Executes a QUIC-related blocking closure on Spargio's blocking lane.
 pub async fn quic_blocking<T, F>(handle: &RuntimeHandle, f: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -85,6 +94,7 @@ where
     quic_blocking_with_options(handle, BlockingOptions::default(), f).await
 }
 
+/// Executes a QUIC-related blocking closure with explicit options.
 pub async fn quic_blocking_with_options<T, F>(
     handle: &RuntimeHandle,
     options: BlockingOptions,
@@ -143,6 +153,7 @@ fn runtime_error_to_io_for_blocking(err: RuntimeError) -> io::Error {
 }
 
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
+/// Compatibility adapters between Spargio sockets and `futures::io` traits.
 pub mod io_compat {
     use futures::io::{AsyncRead, AsyncWrite};
     use spargio::net::TcpStream;
@@ -154,6 +165,7 @@ pub mod io_compat {
     type ReadOp = Pin<Box<dyn Future<Output = io::Result<(usize, Vec<u8>)>> + Send + 'static>>;
     type WriteOp = Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'static>>;
 
+    /// `futures::io` compatible wrapper over [`spargio::net::TcpStream`].
     pub struct FuturesTcpStream {
         inner: TcpStream,
         read_op: Option<ReadOp>,
@@ -170,6 +182,7 @@ pub mod io_compat {
     }
 
     impl FuturesTcpStream {
+        /// Wraps a Spargio TCP stream.
         pub fn new(inner: TcpStream) -> Self {
             Self {
                 inner,
@@ -178,10 +191,12 @@ pub mod io_compat {
             }
         }
 
+        /// Returns a shared reference to the underlying Spargio stream.
         pub fn get_ref(&self) -> &TcpStream {
             &self.inner
         }
 
+        /// Unwraps this adapter into the underlying Spargio stream.
         pub fn into_inner(self) -> TcpStream {
             self.inner
         }
