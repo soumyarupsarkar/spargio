@@ -8601,3 +8601,52 @@ Interpretation:
 - These internal optimizations are stable and keep strong warm/churn performance.
 - They do not materially close the daemon first-sync gap by themselves.
 - Next high-impact lever remains deeper encrypted transport/runtime tuning (buffer reuse/zero-copy direction, pacing/ACK behavior, scheduler handoff overhead).
+
+## Update: Transport profile tuning experiment (opt-in) + scheduler probe (2026-03-04)
+
+Context:
+
+- Follow-up from sparsync benchmark wave after long-lived stream adoption.
+- Goal: test whether larger QUIC transport windows + stream/datagram buffer tuning can improve first-sync without destabilizing warm/churn performance.
+
+### Implemented
+
+1. Added opt-in transport profile tuning hooks in `spargio-quic` config path.
+   - New internal transport profile applies (when enabled):
+     - send/receive window sizing,
+     - stream receive window sizing,
+     - max concurrent stream limits,
+     - datagram send/receive buffer sizing,
+     - keepalive interval,
+     - MTU discovery toggle.
+   - Applied in:
+     - `QuicEndpoint::server_with_options(...)`
+     - `QuicEndpoint::set_default_client_config(...)`
+     - `QuicEndpoint::set_server_config(...)`
+     - `QuicEndpoint::connect_with(...)`
+
+2. Added env knobs for profile experiments:
+   - `SPARGIO_QUIC_TUNE`
+   - `SPARGIO_QUIC_SEND_WINDOW_BYTES`
+   - `SPARGIO_QUIC_STREAM_RECEIVE_WINDOW_BYTES`
+   - `SPARGIO_QUIC_RECEIVE_WINDOW_BYTES`
+   - `SPARGIO_QUIC_MAX_CONCURRENT_BIDI_STREAMS`
+   - `SPARGIO_QUIC_MAX_CONCURRENT_UNI_STREAMS`
+   - `SPARGIO_QUIC_DATAGRAM_SEND_BUFFER_BYTES`
+   - `SPARGIO_QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES`
+   - `SPARGIO_QUIC_KEEP_ALIVE_MS` (`0` disables keepalive)
+   - `SPARGIO_QUIC_MTU_DISCOVERY`
+
+3. Safety/default behavior:
+   - Profile is **disabled by default** (`SPARGIO_QUIC_TUNE=0` baseline behavior).
+   - Rationale: in current sparsync harness on this host/dataset, enabling the new profile did not produce a consistent first-sync win.
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo test -p spargio-quic` (pass)
+
+### Benchmark takeaway from this experiment
+
+- No consistent first-sync gain observed in current benchmark profile with profile enabled.
+- Kept the capability as opt-in for targeted lab tuning; baseline remains unchanged by default.

@@ -28,9 +28,18 @@ pub use quinn_proto;
 const DEFAULT_MAX_INFLIGHT_OPS: usize = 1024;
 const BRIDGE_WORKER_THREADS: usize = 2;
 const NATIVE_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_TRANSPORT_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+const DEFAULT_TRANSPORT_STREAM_RECEIVE_WINDOW: u64 = 4 * 1024 * 1024;
+const DEFAULT_TRANSPORT_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+const DEFAULT_TRANSPORT_MAX_BIDI_STREAMS: u64 = 4096;
+const DEFAULT_TRANSPORT_MAX_UNI_STREAMS: u64 = 4096;
+const DEFAULT_TRANSPORT_DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
+const DEFAULT_TRANSPORT_DATAGRAM_RECEIVE_BUFFER: usize = 4 * 1024 * 1024;
+const DEFAULT_TRANSPORT_KEEP_ALIVE_MS: u64 = 5_000;
 static NEXT_NATIVE_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
 static BRIDGE_RUNTIME_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 static BRIDGE_RUNTIME_CONTEXT_ENTER_COUNT: AtomicU64 = AtomicU64::new(0);
+static TRANSPORT_KNOBS: OnceLock<QuicTransportKnobs> = OnceLock::new();
 
 /// Performs `bridge_runtime_spawn_count`.
 pub fn bridge_runtime_spawn_count() -> u64 {
@@ -50,6 +59,165 @@ pub fn bridge_runtime_context_enter_count() -> u64 {
 /// Resets bridge runtime context enter count.
 pub fn reset_bridge_runtime_context_enter_count() {
     BRIDGE_RUNTIME_CONTEXT_ENTER_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuicTransportKnobs {
+    enabled: bool,
+    send_window: u64,
+    stream_receive_window: u64,
+    receive_window: u64,
+    max_bidi_streams: u64,
+    max_uni_streams: u64,
+    datagram_send_buffer: usize,
+    datagram_receive_buffer: usize,
+    keep_alive_interval: Option<Duration>,
+    mtu_discovery_enabled: bool,
+}
+
+impl Default for QuicTransportKnobs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            send_window: DEFAULT_TRANSPORT_SEND_WINDOW,
+            stream_receive_window: DEFAULT_TRANSPORT_STREAM_RECEIVE_WINDOW,
+            receive_window: DEFAULT_TRANSPORT_RECEIVE_WINDOW,
+            max_bidi_streams: DEFAULT_TRANSPORT_MAX_BIDI_STREAMS,
+            max_uni_streams: DEFAULT_TRANSPORT_MAX_UNI_STREAMS,
+            datagram_send_buffer: DEFAULT_TRANSPORT_DATAGRAM_SEND_BUFFER,
+            datagram_receive_buffer: DEFAULT_TRANSPORT_DATAGRAM_RECEIVE_BUFFER,
+            keep_alive_interval: Some(Duration::from_millis(DEFAULT_TRANSPORT_KEEP_ALIVE_MS)),
+            mtu_discovery_enabled: true,
+        }
+    }
+}
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_opt_millis(name: &str, default: Option<Duration>) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|millis| {
+            if millis == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(millis))
+            }
+        })
+        .flatten()
+        .or(default)
+}
+
+fn load_transport_knobs() -> QuicTransportKnobs {
+    let defaults = QuicTransportKnobs::default();
+    QuicTransportKnobs {
+        enabled: parse_env_bool("SPARGIO_QUIC_TUNE", defaults.enabled),
+        send_window: parse_env_u64("SPARGIO_QUIC_SEND_WINDOW_BYTES", defaults.send_window),
+        stream_receive_window: parse_env_u64(
+            "SPARGIO_QUIC_STREAM_RECEIVE_WINDOW_BYTES",
+            defaults.stream_receive_window,
+        ),
+        receive_window: parse_env_u64("SPARGIO_QUIC_RECEIVE_WINDOW_BYTES", defaults.receive_window),
+        max_bidi_streams: parse_env_u64(
+            "SPARGIO_QUIC_MAX_CONCURRENT_BIDI_STREAMS",
+            defaults.max_bidi_streams,
+        ),
+        max_uni_streams: parse_env_u64(
+            "SPARGIO_QUIC_MAX_CONCURRENT_UNI_STREAMS",
+            defaults.max_uni_streams,
+        ),
+        datagram_send_buffer: parse_env_usize(
+            "SPARGIO_QUIC_DATAGRAM_SEND_BUFFER_BYTES",
+            defaults.datagram_send_buffer,
+        ),
+        datagram_receive_buffer: parse_env_usize(
+            "SPARGIO_QUIC_DATAGRAM_RECEIVE_BUFFER_BYTES",
+            defaults.datagram_receive_buffer,
+        ),
+        keep_alive_interval: parse_env_opt_millis(
+            "SPARGIO_QUIC_KEEP_ALIVE_MS",
+            defaults.keep_alive_interval,
+        ),
+        mtu_discovery_enabled: parse_env_bool(
+            "SPARGIO_QUIC_MTU_DISCOVERY",
+            defaults.mtu_discovery_enabled,
+        ),
+    }
+}
+
+fn transport_knobs() -> QuicTransportKnobs {
+    *TRANSPORT_KNOBS.get_or_init(load_transport_knobs)
+}
+
+fn maybe_varint(value: u64) -> Option<quinn::VarInt> {
+    quinn::VarInt::try_from(value).ok()
+}
+
+fn build_transport_config(knobs: QuicTransportKnobs) -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    if let Some(value) = maybe_varint(knobs.max_bidi_streams) {
+        transport.max_concurrent_bidi_streams(value);
+    }
+    if let Some(value) = maybe_varint(knobs.max_uni_streams) {
+        transport.max_concurrent_uni_streams(value);
+    }
+    if let Some(value) = maybe_varint(knobs.stream_receive_window) {
+        transport.stream_receive_window(value);
+    }
+    if let Some(value) = maybe_varint(knobs.receive_window) {
+        transport.receive_window(value);
+    }
+    transport.send_window(knobs.send_window);
+    transport.keep_alive_interval(knobs.keep_alive_interval);
+    transport.datagram_send_buffer_size(knobs.datagram_send_buffer);
+    transport.datagram_receive_buffer_size(Some(knobs.datagram_receive_buffer));
+    if knobs.mtu_discovery_enabled {
+        transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    } else {
+        transport.mtu_discovery_config(None);
+    }
+    Arc::new(transport)
+}
+
+fn apply_transport_tuning_to_client_config(mut config: quinn::ClientConfig) -> quinn::ClientConfig {
+    let knobs = transport_knobs();
+    if knobs.enabled {
+        config.transport_config(build_transport_config(knobs));
+    }
+    config
+}
+
+fn apply_transport_tuning_to_server_config(mut config: quinn::ServerConfig) -> quinn::ServerConfig {
+    let knobs = transport_knobs();
+    if knobs.enabled {
+        config.transport_config(build_transport_config(knobs));
+    }
+    config
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3594,6 +3762,7 @@ struct QuicMetricsInner {
 const NATIVE_PROTO_PUMP_READ_SIZE: usize = 64 * 1024;
 const NATIVE_PROTO_PUMP_BATCH: usize = 64;
 const NATIVE_PROTO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const NATIVE_PROTO_OPERATION_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 const NATIVE_PROTO_STREAM_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 struct NativeProtoEndpointRuntime {
@@ -3689,7 +3858,7 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
         }
     }
 
@@ -3719,7 +3888,7 @@ impl NativeProtoEndpointBackend {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_msg));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
         }
     }
 
@@ -3752,7 +3921,7 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
         }
     }
 
@@ -3796,7 +3965,7 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
         }
     }
 
@@ -4662,6 +4831,7 @@ impl QuicEndpoint {
         options: QuicEndpointOptions,
     ) -> io::Result<Self> {
         validate_endpoint_options(options)?;
+        let server_config = apply_transport_tuning_to_server_config(server_config);
         if options.backend() == QuicBackend::Native {
             let backend = NativeProtoEndpointBackend::start(
                 bind_addr,
@@ -4763,6 +4933,7 @@ impl QuicEndpoint {
 
     /// Sets default client config.
     pub fn set_default_client_config(&mut self, config: quinn::ClientConfig) {
+        let config = apply_transport_tuning_to_client_config(config);
         {
             let mut default_client_config = self
                 .default_client_config
@@ -4777,6 +4948,7 @@ impl QuicEndpoint {
 
     /// Sets server config.
     pub fn set_server_config(&mut self, config: Option<quinn::ServerConfig>) {
+        let config = config.map(apply_transport_tuning_to_server_config);
         if let Some(endpoint) = self.endpoint.as_mut() {
             endpoint.set_server_config(config);
         }
@@ -4883,6 +5055,7 @@ impl QuicEndpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> io::Result<QuicConnection> {
+        let config = apply_transport_tuning_to_client_config(config);
         let _permit = acquire_with_metrics(&self.limiter, &self.metrics)?;
         self.metrics.inc_connects_started();
         let server_name = server_name.to_owned();
@@ -5301,7 +5474,7 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5385,7 +5558,7 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5474,7 +5647,7 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5558,7 +5731,7 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5663,7 +5836,7 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                spargio::sleep(NATIVE_PROTO_OPERATION_RETRY_INTERVAL).await;
                             }
                             Err(err) => break Err(err),
                         }
