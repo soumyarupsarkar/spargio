@@ -8633,3 +8633,38 @@ Addressed two medium-severity review findings for unpushed `spargio-quic` change
 
 - `cargo test -p spargio-quic`
 - `cargo test --workspace`
+
+## Update: Review follow-up for adaptive QUIC retry backoff commit (2026-03-04)
+
+Addressed the remaining review gaps for unpushed commit
+`31a86b5` (`perf(quic): reduce native polling latency with adaptive retry backoff`).
+
+### 1) Added targeted tests for retry policy behavior
+
+`crates/spargio-quic/src/lib.rs` now includes dedicated unit tests for
+`native_retry_delay(...)`:
+
+- `native_retry_delay_uses_expected_bands`
+  - verifies threshold mapping:
+    - retries `< 4` -> `100us`
+    - retries `< 16` -> `250us`
+    - retries `>= 16` -> `1ms` (`NATIVE_PROTO_POLL_INTERVAL`)
+- `native_retry_delay_is_monotonic_and_capped`
+  - verifies delay does not decrease as retries grow
+  - verifies delay never exceeds the `1ms` cap
+
+This gives explicit coverage for the adaptive backoff policy that was previously
+untested.
+
+### 2) Added user-facing documentation for the behavior
+
+- `README.md`:
+  - added done-item bullet documenting adaptive QUIC retry backoff and intent.
+- `book/src/09_protocol_crates.md`:
+  - expanded QUIC backend mode section with concrete delay bands and practical
+    interpretation (lower latency on short stalls, bounded spin on long stalls).
+
+### Validation
+
+- `cargo test -p spargio-quic`
+- `cargo test --workspace`

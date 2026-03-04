@@ -3605,6 +3605,39 @@ fn native_retry_delay(retries: u32) -> Duration {
     }
 }
 
+#[cfg(test)]
+mod native_retry_delay_tests {
+    use super::{NATIVE_PROTO_POLL_INTERVAL, native_retry_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn native_retry_delay_uses_expected_bands() {
+        assert_eq!(native_retry_delay(0), Duration::from_micros(100));
+        assert_eq!(native_retry_delay(3), Duration::from_micros(100));
+        assert_eq!(native_retry_delay(4), Duration::from_micros(250));
+        assert_eq!(native_retry_delay(15), Duration::from_micros(250));
+        assert_eq!(native_retry_delay(16), NATIVE_PROTO_POLL_INTERVAL);
+        assert_eq!(native_retry_delay(10_000), NATIVE_PROTO_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn native_retry_delay_is_monotonic_and_capped() {
+        let mut prev = Duration::from_micros(0);
+        for retries in 0..128 {
+            let next = native_retry_delay(retries);
+            assert!(
+                next >= prev,
+                "retry delay should be monotonic (retries={retries}, prev={prev:?}, next={next:?})"
+            );
+            assert!(
+                next <= NATIVE_PROTO_POLL_INTERVAL,
+                "retry delay should never exceed poll interval (retries={retries}, next={next:?})"
+            );
+            prev = next;
+        }
+    }
+}
+
 struct NativeProtoEndpointRuntime {
     runtime: Mutex<Option<spargio::Runtime>>,
 }

@@ -180,6 +180,7 @@ paths.
 - Native-vs-bridge QUIC cutover guardrails: native data path is validated to avoid bridge task spawning, while bridge mode remains explicit compatibility fallback.
 - QUIC native default backend now runs on `quinn-proto` driver path (`NativeProtoDriver` + native UDP pump/timers) with stream/datagram operations routed through the driver; bridge mode remains explicit compatibility fallback.
 - QUIC stream APIs support incremental reads (`QuicRecvStream::read_chunk`) and owned-byte writes (`QuicSendStream::write_bytes`) for long-lived framed protocols.
+- QUIC native wait loops use adaptive retry backoff (`100us` -> `250us` -> `1ms`) to reduce low-latency polling overhead while avoiding sustained busy spinning under longer stalls.
 - Companion hardening lane: `scripts/companion_ci_smoke.sh` plus CI `companion-matrix` job.
 - QUIC qualification lanes: interop matrix (`scripts/quic_interop_matrix.sh`), soak/fault lane (`scripts/quic_soak_fault.sh`, nightly), and native-vs-bridge perf gate (`scripts/quic_perf_gate.sh`).
 - In-repo user-facing `book/` (`mdBook`) covering quick start, task placement (`!Send` + stealable locality-first defaults), I/O API selection, protocol crates, native extensions, performance tuning, operations, migration, and status.

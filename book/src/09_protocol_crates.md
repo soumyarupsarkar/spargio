@@ -205,6 +205,14 @@ What this does: runs a protocol operation on the explicit blocking bridge with t
 
 Current native path uses `quinn-proto` driver integration with Spargio-native pump/timer orchestration.
 
+For native stream/accept/read wait loops, Spargio uses adaptive retry delays:
+
+- first retries: `100us`
+- medium retries: `250us`
+- longer stalls: `1ms`
+
+What this means in practice: short-lived backpressure periods can recover with lower added latency than fixed `1ms` sleeps, while long stalls still back off to avoid hot-spin behavior.
+
 ## Direct Upstream vs Companion Adapter
 
 Use direct upstream crate when:
