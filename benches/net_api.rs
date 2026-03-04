@@ -1,12 +1,9 @@
 #[cfg(unix)]
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+#[cfg(unix)]
+use futures::future::{Either, select};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
-use futures::{
-    StreamExt,
-    channel::mpsc,
-    executor::block_on,
-    future::{Either, join_all, select},
-};
+use futures::{StreamExt, channel::mpsc, executor::block_on, future::join_all};
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
 use libc;
 #[cfg(all(feature = "uring-native", target_os = "linux"))]
