@@ -3594,7 +3594,16 @@ struct QuicMetricsInner {
 const NATIVE_PROTO_PUMP_READ_SIZE: usize = 64 * 1024;
 const NATIVE_PROTO_PUMP_BATCH: usize = 64;
 const NATIVE_PROTO_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const NATIVE_PROTO_STREAM_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+fn native_retry_delay(retries: u32) -> Duration {
+    if retries < 4 {
+        Duration::from_micros(100)
+    } else if retries < 16 {
+        Duration::from_micros(250)
+    } else {
+        NATIVE_PROTO_POLL_INTERVAL
+    }
+}
 
 struct NativeProtoEndpointRuntime {
     runtime: Mutex<Option<spargio::Runtime>>,
@@ -3673,6 +3682,7 @@ impl NativeProtoEndpointBackend {
 
     async fn wait_for_accept(&self, timeout: Option<Duration>) -> io::Result<u64> {
         let started = std::time::Instant::now();
+        let mut retries = 0u32;
         loop {
             self.refresh_events().await?;
             if let Ok(mut queue) = self.accept_queue.lock() {
@@ -3689,7 +3699,8 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            retries = retries.saturating_add(1);
+            spargio::sleep(native_retry_delay(retries)).await;
         }
     }
 
@@ -3700,6 +3711,7 @@ impl NativeProtoEndpointBackend {
         timeout_msg: &'static str,
     ) -> io::Result<()> {
         let started = std::time::Instant::now();
+        let mut retries = 0u32;
         loop {
             self.refresh_events().await?;
             let state = self.driver.connection_state(connection_id).await?;
@@ -3719,7 +3731,8 @@ impl NativeProtoEndpointBackend {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, timeout_msg));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            retries = retries.saturating_add(1);
+            spargio::sleep(native_retry_delay(retries)).await;
         }
     }
 
@@ -3729,6 +3742,7 @@ impl NativeProtoEndpointBackend {
         timeout: Option<Duration>,
     ) -> io::Result<()> {
         let started = std::time::Instant::now();
+        let mut retries = 0u32;
         loop {
             self.refresh_events().await?;
             match self.driver.connection_state(connection_id).await {
@@ -3752,12 +3766,14 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            retries = retries.saturating_add(1);
+            spargio::sleep(native_retry_delay(retries)).await;
         }
     }
 
     async fn wait_idle(&self, timeout: Option<Duration>) -> io::Result<()> {
         let started = std::time::Instant::now();
+        let mut retries = 0u32;
         loop {
             self.refresh_events().await?;
             let ids = if let Ok(known) = self.known_connections.lock() {
@@ -3796,7 +3812,8 @@ impl NativeProtoEndpointBackend {
                     ));
                 }
             }
-            spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+            retries = retries.saturating_add(1);
+            spargio::sleep(native_retry_delay(retries)).await;
         }
     }
 
@@ -3945,6 +3962,7 @@ impl QuicSendStream {
                 timeout,
             } => {
                 let started = std::time::Instant::now();
+                let mut retries = 0u32;
                 let driver = connection.backend.driver();
                 let payload = bytes::Bytes::copy_from_slice(data);
                 let mut offset = 0usize;
@@ -3976,7 +3994,8 @@ impl QuicSendStream {
                                     ));
                                 }
                             }
-                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
+                            retries = retries.saturating_add(1);
+                            spargio::sleep(native_retry_delay(retries)).await;
                         }
                         Err(err) => return Err(err),
                     }
@@ -3998,6 +4017,7 @@ impl QuicSendStream {
                 timeout,
             } => {
                 let started = std::time::Instant::now();
+                let mut retries = 0u32;
                 let driver = connection.backend.driver();
                 loop {
                     match driver
@@ -4018,7 +4038,8 @@ impl QuicSendStream {
                                     ));
                                 }
                             }
-                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
+                            retries = retries.saturating_add(1);
+                            spargio::sleep(native_retry_delay(retries)).await;
                         }
                         Err(err) => return Err(err),
                     }
@@ -4092,6 +4113,7 @@ impl QuicRecvStream {
                 timeout,
             } => {
                 let started = std::time::Instant::now();
+                let mut retries = 0u32;
                 let driver = connection.backend.driver();
                 loop {
                     match driver
@@ -4112,7 +4134,8 @@ impl QuicRecvStream {
                                     ));
                                 }
                             }
-                            spargio::sleep(NATIVE_PROTO_STREAM_RETRY_INTERVAL).await;
+                            retries = retries.saturating_add(1);
+                            spargio::sleep(native_retry_delay(retries)).await;
                         }
                         Err(err) => return Err(err),
                     }
@@ -5276,6 +5299,7 @@ impl QuicConnection {
                 self.metrics.inc_native_ops_dispatched();
                 if let Some(native) = &self.native_proto {
                     let started = std::time::Instant::now();
+                    let mut retries = 0u32;
                     loop {
                         match native
                             .backend
@@ -5301,7 +5325,8 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                retries = retries.saturating_add(1);
+                                spargio::sleep(native_retry_delay(retries)).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5351,6 +5376,7 @@ impl QuicConnection {
                 self.metrics.inc_native_ops_dispatched();
                 if let Some(native) = &self.native_proto {
                     let started = std::time::Instant::now();
+                    let mut retries = 0u32;
                     loop {
                         match native
                             .backend
@@ -5385,7 +5411,8 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                retries = retries.saturating_add(1);
+                                spargio::sleep(native_retry_delay(retries)).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5449,6 +5476,7 @@ impl QuicConnection {
                 self.metrics.inc_native_ops_dispatched();
                 if let Some(native) = &self.native_proto {
                     let started = std::time::Instant::now();
+                    let mut retries = 0u32;
                     loop {
                         match native
                             .backend
@@ -5474,7 +5502,8 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                retries = retries.saturating_add(1);
+                                spargio::sleep(native_retry_delay(retries)).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5524,6 +5553,7 @@ impl QuicConnection {
                 self.metrics.inc_native_ops_dispatched();
                 if let Some(native) = &self.native_proto {
                     let started = std::time::Instant::now();
+                    let mut retries = 0u32;
                     loop {
                         match native
                             .backend
@@ -5558,7 +5588,8 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                retries = retries.saturating_add(1);
+                                spargio::sleep(native_retry_delay(retries)).await;
                             }
                             Err(err) => break Err(err),
                         }
@@ -5646,6 +5677,7 @@ impl QuicConnection {
                 self.metrics.inc_native_ops_dispatched();
                 if let Some(native) = &self.native_proto {
                     let started = std::time::Instant::now();
+                    let mut retries = 0u32;
                     loop {
                         match native
                             .backend
@@ -5663,7 +5695,8 @@ impl QuicConnection {
                                         ));
                                     }
                                 }
-                                spargio::sleep(NATIVE_PROTO_POLL_INTERVAL).await;
+                                retries = retries.saturating_add(1);
+                                spargio::sleep(native_retry_delay(retries)).await;
                             }
                             Err(err) => break Err(err),
                         }
