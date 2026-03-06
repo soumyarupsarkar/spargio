@@ -856,6 +856,21 @@ impl NativeProtoDriver {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
     }
 
+    /// Performs `connection_peer_cert_chain_der`.
+    pub async fn connection_peer_cert_chain_der(
+        &self,
+        connection_id: u64,
+    ) -> io::Result<Option<Vec<Vec<u8>>>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_command(NativeProtoCommand::ConnectionPeerCertChainDer {
+            connection_id,
+            reply: reply_tx,
+        })?;
+        reply_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native proto driver closed"))?
+    }
+
     /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
@@ -1188,6 +1203,16 @@ impl NativeProtoDriverSend {
         self.inner.connection_state(connection_id).await
     }
 
+    /// Performs `connection_peer_cert_chain_der`.
+    pub async fn connection_peer_cert_chain_der(
+        &self,
+        connection_id: u64,
+    ) -> io::Result<Option<Vec<Vec<u8>>>> {
+        self.inner
+            .connection_peer_cert_chain_der(connection_id)
+            .await
+    }
+
     /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
@@ -1404,6 +1429,16 @@ impl NativeProtoDriverLocal {
         self.inner.connection_state(connection_id).await
     }
 
+    /// Performs `connection_peer_cert_chain_der`.
+    pub async fn connection_peer_cert_chain_der(
+        &self,
+        connection_id: u64,
+    ) -> io::Result<Option<Vec<Vec<u8>>>> {
+        self.inner
+            .connection_peer_cert_chain_der(connection_id)
+            .await
+    }
+
     /// Performs `send_datagram_on_connection_for_test`.
     pub async fn send_datagram_on_connection_for_test(
         &self,
@@ -1593,6 +1628,10 @@ enum NativeProtoCommand {
     ConnectionState {
         connection_id: u64,
         reply: tokio::sync::oneshot::Sender<io::Result<NativeProtoConnectionState>>,
+    },
+    ConnectionPeerCertChainDer {
+        connection_id: u64,
+        reply: tokio::sync::oneshot::Sender<io::Result<Option<Vec<Vec<u8>>>>>,
     },
     SendDatagramOnConnectionForTest {
         connection_id: u64,
@@ -2159,6 +2198,64 @@ async fn native_proto_driver_loop(
                 commands_processed = commands_processed.saturating_add(1);
                 let result = if let Some(conn) = connections.get(&connection_id) {
                     Ok(conn.state)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown native proto connection {connection_id}"),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            NativeProtoCommand::ConnectionPeerCertChainDer {
+                connection_id,
+                reply,
+            } => {
+                commands_processed = commands_processed.saturating_add(1);
+                let result = if let Some(conn) = connections.get(&connection_id) {
+                    if conn.state.closed {
+                        Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("native proto connection {connection_id} is closed"),
+                        ))
+                    } else if let Some(handle) =
+                        handle_by_connection_id.get(&connection_id).copied()
+                    {
+                        if let Some(proto_connection) = proto_connections.get_mut(&handle) {
+                            if let Some(identity) =
+                                proto_connection.crypto_session().peer_identity()
+                            {
+                                match identity.downcast::<
+                                    Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
+                                >() {
+                                    Ok(certs) => Ok(Some(
+                                        certs
+                                            .iter()
+                                            .map(
+                                                |cert: &quinn::rustls::pki_types::CertificateDer<
+                                                    'static,
+                                                >| { cert.as_ref().to_vec() },
+                                            )
+                                            .collect::<Vec<_>>(),
+                                    )),
+                                    Err(_) => Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "unexpected peer identity type for rustls certificate chain",
+                                    )),
+                                }
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "missing native proto handle for connection {connection_id}"
+                                ),
+                            ))
+                        }
+                    } else {
+                        Ok(None)
+                    }
                 } else {
                     Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -3646,6 +3743,7 @@ struct NativeProtoEndpointRuntime {
 struct NativeProtoConnectionHandle {
     backend: Arc<NativeProtoEndpointBackend>,
     connection_id: u64,
+    peer_cert_chain_der: Option<Vec<Vec<u8>>>,
 }
 
 struct NativeProtoEndpointBackend {
@@ -4880,7 +4978,17 @@ impl QuicEndpoint {
                             "quic connect timed out",
                         )
                         .await?;
-                    Ok(self.wrap_native_connection(native_backend.clone(), connection_id))
+                    let peer_cert_chain_der = native_backend
+                        .driver()
+                        .connection_peer_cert_chain_der(connection_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    Ok(self.wrap_native_connection(
+                        native_backend.clone(),
+                        connection_id,
+                        peer_cert_chain_der,
+                    ))
                 } else {
                     let default_config = self
                         .default_client_config
@@ -4958,7 +5066,17 @@ impl QuicEndpoint {
                             "quic connect timed out",
                         )
                         .await?;
-                    Ok(self.wrap_native_connection(native_backend.clone(), connection_id))
+                    let peer_cert_chain_der = native_backend
+                        .driver()
+                        .connection_peer_cert_chain_der(connection_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    Ok(self.wrap_native_connection(
+                        native_backend.clone(),
+                        connection_id,
+                        peer_cert_chain_der,
+                    ))
                 } else {
                     self.native_dispatch_ref()?
                         .connect_with(config, addr, server_name, self.options.connect_timeout())
@@ -5019,9 +5137,16 @@ impl QuicEndpoint {
                             "quic incoming handshake timed out",
                         )
                         .await?;
+                    let peer_cert_chain_der = native_backend
+                        .driver()
+                        .connection_peer_cert_chain_der(connection_id)
+                        .await
+                        .ok()
+                        .flatten();
                     Ok(Some(self.wrap_native_connection(
                         native_backend.clone(),
                         connection_id,
+                        peer_cert_chain_der,
                     )))
                 } else {
                     self.native_dispatch_ref()?
@@ -5161,6 +5286,7 @@ impl QuicEndpoint {
         &self,
         backend: Arc<NativeProtoEndpointBackend>,
         connection_id: u64,
+        peer_cert_chain_der: Option<Vec<Vec<u8>>>,
     ) -> QuicConnection {
         self.metrics.inc_connections_opened();
         QuicConnection {
@@ -5169,6 +5295,7 @@ impl QuicEndpoint {
             native_proto: Some(NativeProtoConnectionHandle {
                 backend,
                 connection_id,
+                peer_cert_chain_der,
             }),
             options: self.options,
             metrics: self.metrics.clone(),
@@ -5267,6 +5394,40 @@ impl QuicConnection {
             .as_ref()
             .map(quinn::Connection::datagram_send_buffer_space)
             .unwrap_or(0)
+    }
+
+    /// Returns peer certificate chain in DER form.
+    ///
+    /// For native-proto-only connections, certificate DER values are captured during handshake.
+    /// For quinn-backed sessions, this maps peer identity into certificate DER blobs.
+    pub fn peer_cert_chain_der(&self) -> io::Result<Vec<Vec<u8>>> {
+        if let Some(native) = &self.native_proto {
+            return native.peer_cert_chain_der.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "peer identity not available on this connection",
+                )
+            });
+        }
+        let identity = self.connection_ref()?.peer_identity().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "peer identity not available on this connection",
+            )
+        })?;
+
+        let certs = identity
+            .downcast::<Vec<quinn::rustls::pki_types::CertificateDer<'static>>>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected peer identity type for rustls certificate chain",
+                )
+            })?;
+        Ok(certs
+            .iter()
+            .map(|cert: &quinn::rustls::pki_types::CertificateDer<'static>| cert.as_ref().to_vec())
+            .collect::<Vec<_>>())
     }
 
     /// Closes.

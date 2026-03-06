@@ -110,6 +110,19 @@ async fn quic_client() -> std::io::Result<()> {
 
 What this does: creates a QUIC endpoint, applies connect/operation budgets, opens a bidirectional stream, writes a request, and reads the full reply.
 
+You can also inspect the peer certificate chain in DER form:
+
+```rust
+fn inspect_peer_cert_chain(conn: &spargio_quic::QuicConnection) -> std::io::Result<()> {
+    let certs = conn.peer_cert_chain_der()?;
+    println!("peer presented {} cert(s)", certs.len());
+    Ok(())
+}
+```
+
+What this does: reads the peer certificate chain for both native and bridge backends.
+If no peer cert chain is available (for example server-side without client auth), this returns `NotConnected`.
+
 For long-lived framed protocols, prefer incremental stream reads and owned-byte writes:
 
 ```rust

@@ -115,6 +115,28 @@ fn quic_send_stream_write_bytes_roundtrips_bridge() {
 }
 
 #[test]
+fn quic_connection_peer_cert_chain_der_available_native() {
+    run_peer_cert_chain_der_test(QuicEndpointOptions::default());
+}
+
+#[test]
+fn quic_connection_peer_cert_chain_der_available_bridge() {
+    run_peer_cert_chain_der_test(QuicEndpointOptions::default().with_backend(QuicBackend::Bridge));
+}
+
+#[test]
+fn quic_connection_peer_cert_chain_der_missing_without_client_auth_native() {
+    run_peer_cert_chain_der_missing_test(QuicEndpointOptions::default());
+}
+
+#[test]
+fn quic_connection_peer_cert_chain_der_missing_without_client_auth_bridge() {
+    run_peer_cert_chain_der_missing_test(
+        QuicEndpointOptions::default().with_backend(QuicBackend::Bridge),
+    );
+}
+
+#[test]
 fn quic_endpoint_datagram_roundtrip_updates_metrics() {
     let (server_config, client_config) = test_server_and_client_configs();
     let server = QuicEndpoint::server(server_config, localhost_addr(0)).expect("server endpoint");
@@ -1436,6 +1458,68 @@ fn native_proto_driver_post_handshake_datagram_roundtrip_tracks_state() {
 }
 
 #[test]
+fn native_proto_driver_connection_peer_cert_chain_der_matches_handshake_role() {
+    let rt = spargio::Runtime::builder()
+        .shards(1)
+        .build()
+        .expect("runtime");
+    let (server_config, client_config) = test_server_and_client_configs();
+    block_on(async {
+        let server = NativeProtoDriver::start(
+            &rt.handle(),
+            NativeProtoDriverOptions::default().with_server_config(server_config),
+        )
+        .await
+        .expect("start server native driver");
+        let client = NativeProtoDriver::start(&rt.handle(), NativeProtoDriverOptions::default())
+            .await
+            .expect("start client native driver");
+
+        let server_addr = localhost_addr(5702);
+        let client_addr = localhost_addr(5703);
+        let client_conn = client
+            .connect_for_test(client_config, server_addr, "localhost")
+            .await
+            .expect("connect for test");
+        exchange_driver_transmits(&client, client_addr, &server, server_addr, 64).await;
+
+        let server_conn = server
+            .drain_events(64)
+            .await
+            .expect("server events")
+            .into_iter()
+            .find_map(|event| match event {
+                NativeProtoEvent::ConnectionRegistered { connection_id } => Some(connection_id),
+                _ => None,
+            })
+            .expect("server connection id");
+
+        let client_certs = client
+            .connection_peer_cert_chain_der(client_conn)
+            .await
+            .expect("client peer cert chain query")
+            .expect("client should observe server cert chain");
+        assert!(
+            !client_certs.is_empty(),
+            "expected at least one cert in chain"
+        );
+        assert!(
+            client_certs.iter().all(|der| !der.is_empty()),
+            "all cert entries should be non-empty DER"
+        );
+
+        let server_certs = server
+            .connection_peer_cert_chain_der(server_conn)
+            .await
+            .expect("server peer cert chain query");
+        assert!(
+            server_certs.is_none(),
+            "server should not observe a client cert chain without client auth"
+        );
+    });
+}
+
+#[test]
 fn native_proto_driver_finish_and_reset_stream_are_observable() {
     let rt = spargio::Runtime::builder()
         .shards(1)
@@ -1834,6 +1918,72 @@ fn run_write_bytes_stream_test(options: QuicEndpointOptions) {
         };
 
         futures::join!(server_task, client_task);
+    });
+}
+
+fn run_peer_cert_chain_der_test(options: QuicEndpointOptions) {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server_with_options(server_config, localhost_addr(0), options)
+        .expect("server endpoint");
+    let mut client =
+        QuicEndpoint::client_with_options(localhost_addr(0), options).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let server_task = async {
+            server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection")
+        };
+        let client_task = async {
+            client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect")
+        };
+        let (_server_conn, client_conn) = futures::join!(server_task, client_task);
+        let cert_chain = client_conn
+            .peer_cert_chain_der()
+            .expect("peer cert chain should be available");
+        assert!(!cert_chain.is_empty(), "expected at least leaf certificate");
+        assert!(
+            cert_chain.iter().all(|der| !der.is_empty()),
+            "all DER entries should be non-empty"
+        );
+    });
+}
+
+fn run_peer_cert_chain_der_missing_test(options: QuicEndpointOptions) {
+    let (server_config, client_config) = test_server_and_client_configs();
+    let server = QuicEndpoint::server_with_options(server_config, localhost_addr(0), options)
+        .expect("server endpoint");
+    let mut client =
+        QuicEndpoint::client_with_options(localhost_addr(0), options).expect("client endpoint");
+    client.set_default_client_config(client_config);
+
+    let server_addr = server.local_addr().expect("server addr");
+    block_on(async {
+        let server_task = async {
+            server
+                .accept()
+                .await
+                .expect("accept")
+                .expect("incoming connection")
+        };
+        let client_task = async {
+            client
+                .connect(server_addr, "localhost")
+                .await
+                .expect("connect")
+        };
+        let (server_conn, _client_conn) = futures::join!(server_task, client_task);
+        let err = server_conn
+            .peer_cert_chain_der()
+            .expect_err("client cert chain should not be available without client auth");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
     });
 }
 

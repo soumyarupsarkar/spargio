@@ -8668,3 +8668,49 @@ untested.
 
 - `cargo test -p spargio-quic`
 - `cargo test --workspace`
+
+## Update: Native-path peer cert chain support for `QuicConnection::peer_cert_chain_der` (2026-03-06)
+
+Implemented native-default parity for `QuicConnection::peer_cert_chain_der` while keeping the API synchronous.
+
+### Red
+
+- Added native + bridge tests that assert client-side cert chain availability:
+  - `quic_connection_peer_cert_chain_der_available_native`
+  - `quic_connection_peer_cert_chain_der_available_bridge`
+- Initial native test failed with:
+  - `NotConnected: "quic connection handle is not quinn-backed"`
+
+### Green
+
+1. Added native driver query for peer cert chain
+   - New command: `NativeProtoCommand::ConnectionPeerCertChainDer`.
+   - New driver APIs:
+     - `NativeProtoDriver::connection_peer_cert_chain_der(connection_id)`
+     - forwarded in `NativeProtoDriverSend` and `NativeProtoDriverLocal`.
+   - Driver loop now resolves connection handle and reads `crypto_session().peer_identity()` from `quinn-proto`.
+
+2. Cached native peer cert chain at handshake completion
+   - In native `connect`, `connect_with`, and `accept`, after `wait_for_established(...)`, the endpoint now fetches peer cert chain from the native driver.
+   - Capture is best-effort (`Ok(None)` on extraction/query failure) so handshake success is never downgraded into connect/accept failure.
+   - `NativeProtoConnectionHandle` now stores `peer_cert_chain_der: Option<Vec<Vec<u8>>>`.
+   - `wrap_native_connection(...)` now takes cached cert chain and attaches it to `QuicConnection`.
+
+3. Updated `QuicConnection::peer_cert_chain_der`
+   - Native-proto path now returns the cached chain.
+   - Keeps existing rustls peer-identity decode path for quinn-backed connections.
+   - Returns `NotConnected` when peer identity/cert chain is unavailable (for example, server side without client auth), consistent with existing behavior.
+
+### Additional tests
+
+- Added missing failure-path coverage for both backends:
+  - `quic_connection_peer_cert_chain_der_missing_without_client_auth_native`
+  - `quic_connection_peer_cert_chain_der_missing_without_client_auth_bridge`
+- Added direct native-driver coverage for the new command path:
+  - `native_proto_driver_connection_peer_cert_chain_der_matches_handshake_role`
+
+### Validation
+
+- `cargo test -p spargio-quic --test quic_tdd peer_cert_chain_der`
+- `cargo fmt --all`
+- `cargo test -p spargio-quic`

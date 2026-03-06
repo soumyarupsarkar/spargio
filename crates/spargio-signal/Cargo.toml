@@ -1,6 +1,6 @@
 [package]
 name = "spargio-signal"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2024"
 license = "MIT"
 description = "Signal companion crate for spargio"
@@ -8,7 +8,7 @@ repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
 signal-hook = "0.3"
-spargio = { version = "0.5.8", path = "../.." }
+spargio = { version = "0.5.9", path = "../.." }
 
 [dev-dependencies]
 futures = "0.3"
