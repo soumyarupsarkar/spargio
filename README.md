@@ -2,7 +2,7 @@
 
 `spargio` is a **work-stealing `io_uring`-based async runtime** for Rust, using `msg_ring` for cross-thread coordination.
 
-Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses submission-time steering of stealable tasks across threads (a novel form of work-stealing).
+Instead of a strict thread-per-core/share-nothing execution model like other `io_uring` runtimes (`glommio`/`monoio`/`compio` and `tokio_uring`), `spargio` uses [hybrid scheduling](./book/src/04_runtime_internals.md#what-work-stealing-means-in-spargio): submission-time placement of stealable tasks, plus execution-time work stealing for imbalance recovery.
 
 In our benchmarks (detailed below), `spargio` outperforms `compio` (and likely all share-nothing runtimes) in imbalanced workloads by up to 70%, and outperforms `tokio` for cases involving high coordination or disk I/O by up to 320%. `compio` leads for sustained, balanced workloads by up to 70%.
 
@@ -10,7 +10,7 @@ Out-of-the-box, we support async disk I/O, network I/O (including TLS/WebSockets
 
 ## Disclaimer
 
-`spargio` began as an experimental proof-of-concept built with Codex. I have not manually reviewed all the code yet. Use for evaluation only.
+`spargio` is still experimental and subject to change. Use for evaluation only.
 
 ## Quick start
 
