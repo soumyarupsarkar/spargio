@@ -262,6 +262,25 @@ async fn main() {
 
 This takes two optional arguments. Without them, `#[spargio::main]` uses sensible defaults: `io_uring` backend and shard count from available CPU parallelism. Use macro arguments only when you need explicit overrides.
 
+Use `run_with(...)` for builder-only controls such as worker idle strategy:
+
+```rust
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), spargio::RuntimeError> {
+    let builder = spargio::Runtime::builder()
+        .shards(2)
+        .idle_strategy(spargio::IdleStrategy::Sleep(Duration::from_millis(1)));
+
+    spargio::run_with(builder, |handle| async move {
+        let job = handle.spawn_stealable(async { 7usize }).expect("spawn");
+        assert_eq!(job.await.expect("join"), 7);
+    })
+    .await
+}
+```
+
 ## Repository Map
 
 - `src/lib.rs`: runtime implementation.

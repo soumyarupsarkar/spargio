@@ -1053,6 +1053,23 @@ pub enum BackendKind {
     IoUring,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Worker idle strategy used when a shard has no immediately runnable work.
+pub enum IdleStrategy {
+    /// Use backend default behavior.
+    ///
+    /// On Linux `io_uring` backend this currently means `thread::yield_now()`
+    /// in idle scheduler passes.
+    #[default]
+    BackendDefault,
+    /// Yield the current worker timeslice on idle scheduler passes.
+    Yield,
+    /// Sleep for the provided duration on idle scheduler passes.
+    ///
+    /// If `duration` is zero, Spargio falls back to `thread::yield_now()`.
+    Sleep(Duration),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Task placement policy used when spawning.
 pub enum TaskPlacement {
@@ -1222,6 +1239,7 @@ pub struct RuntimeBuilder {
     thread_prefix: String,
     thread_affinity: Vec<usize>,
     backend: BackendKind,
+    idle_strategy: IdleStrategy,
     ring_entries: u32,
     msg_ring_queue_capacity: usize,
     hot_msg_tags: Vec<u16>,
@@ -1248,6 +1266,7 @@ impl Default for RuntimeBuilder {
             thread_prefix: "spargio-shard".to_owned(),
             thread_affinity: Vec::new(),
             backend: BackendKind::IoUring,
+            idle_strategy: IdleStrategy::BackendDefault,
             ring_entries: 256,
             msg_ring_queue_capacity: 4096,
             hot_msg_tags: Vec::new(),
@@ -1304,6 +1323,12 @@ impl RuntimeBuilder {
     /// Selects the runtime backend.
     pub fn backend(mut self, backend: BackendKind) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Selects how worker shards idle when no immediate work is available.
+    pub fn idle_strategy(mut self, strategy: IdleStrategy) -> Self {
+        self.idle_strategy = strategy;
         self
     }
 
@@ -1595,6 +1620,7 @@ impl RuntimeBuilder {
                                 self.hot_counter_wake_threshold,
                                 self.steal_budget,
                                 steal_policy,
+                                self.idle_strategy,
                                 backend,
                                 stats,
                             )
@@ -9925,6 +9951,7 @@ fn run_shard(
     hot_counter_wake_threshold: u64,
     steal_budget: usize,
     steal_policy: StealPolicyConfig,
+    idle_strategy: IdleStrategy,
     mut backend: ShardBackend,
     stats: Arc<RuntimeStatsInner>,
 ) {
@@ -10049,9 +10076,7 @@ fn run_shard(
                 &spawner,
                 &stats,
             );
-            if backend.prefers_busy_poll() {
-                thread::yield_now();
-            }
+            apply_idle_strategy(idle_strategy, &backend);
         }
 
         drain_local_commands(
@@ -10098,6 +10123,96 @@ fn run_shard(
     CURRENT_SHARD.with(|slot| {
         slot.borrow_mut().take();
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleAction {
+    Noop,
+    Yield,
+    Sleep(Duration),
+}
+
+fn resolve_idle_action(strategy: IdleStrategy, backend_prefers_busy_poll: bool) -> IdleAction {
+    match strategy {
+        IdleStrategy::BackendDefault => {
+            if backend_prefers_busy_poll {
+                IdleAction::Yield
+            } else {
+                IdleAction::Noop
+            }
+        }
+        IdleStrategy::Yield => IdleAction::Yield,
+        IdleStrategy::Sleep(duration) => {
+            if duration.is_zero() {
+                IdleAction::Yield
+            } else {
+                IdleAction::Sleep(duration)
+            }
+        }
+    }
+}
+
+fn apply_idle_strategy(strategy: IdleStrategy, backend: &ShardBackend) {
+    match resolve_idle_action(strategy, backend.prefers_busy_poll()) {
+        IdleAction::Noop => {}
+        IdleAction::Yield => thread::yield_now(),
+        IdleAction::Sleep(duration) => thread::sleep(duration),
+    }
+}
+
+#[cfg(test)]
+mod idle_strategy_tests {
+    use super::{IdleAction, IdleStrategy, resolve_idle_action};
+    use std::time::Duration;
+
+    #[test]
+    fn resolve_idle_action_backend_default_depends_on_backend_preference() {
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::BackendDefault, true),
+            IdleAction::Yield
+        );
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::BackendDefault, false),
+            IdleAction::Noop
+        );
+    }
+
+    #[test]
+    fn resolve_idle_action_yield_is_always_yield() {
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Yield, true),
+            IdleAction::Yield
+        );
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Yield, false),
+            IdleAction::Yield
+        );
+    }
+
+    #[test]
+    fn resolve_idle_action_sleep_zero_falls_back_to_yield() {
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Sleep(Duration::ZERO), true),
+            IdleAction::Yield
+        );
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Sleep(Duration::ZERO), false),
+            IdleAction::Yield
+        );
+    }
+
+    #[test]
+    fn resolve_idle_action_sleep_nonzero_preserves_duration() {
+        let duration = Duration::from_millis(2);
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Sleep(duration), true),
+            IdleAction::Sleep(duration)
+        );
+        assert_eq!(
+            resolve_idle_action(IdleStrategy::Sleep(duration), false),
+            IdleAction::Sleep(duration)
+        );
+    }
 }
 
 fn handle_command(

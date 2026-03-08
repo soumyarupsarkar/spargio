@@ -18,6 +18,7 @@ Common controls include:
 - queue capacity controls
 - steal controls (`steal_*` knobs)
 - thread affinity
+- worker idle strategy (`idle_strategy(...)`)
 
 For steal-control definitions and profiling workflow, see
 [Performance Guide](12_performance_guide.md#work-stealing-controls-and-profiling).
@@ -25,11 +26,14 @@ For steal-control definitions and profiling workflow, see
 Example:
 
 ```rust
+use std::time::Duration;
+
 let builder = spargio::Runtime::builder()
     .shards(4)
     .steal_budget(64)
     .steal_locality_margin(2)
-    .thread_affinity(Some(vec![0, 1, 2, 3]));
+    .thread_affinity(Some(vec![0, 1, 2, 3]))
+    .idle_strategy(spargio::IdleStrategy::Sleep(Duration::from_millis(1)));
 
 spargio::run_with(builder, |handle| async move {
     let task = handle.spawn_stealable(async { 7usize }).expect("spawn");
@@ -38,8 +42,9 @@ spargio::run_with(builder, |handle| async move {
 .await?;
 ```
 
-This snippet configures shard count, two steal controls, and CPU affinity, then
-runs a small stealable task to validate the runtime is wired correctly.
+This snippet configures shard count, two steal controls, CPU affinity, and
+idle behavior, then runs a small stealable task to validate the runtime is
+wired correctly.
 
 ## Handle Usage
 

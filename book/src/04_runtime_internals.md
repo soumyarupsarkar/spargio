@@ -99,6 +99,16 @@ Each worker shard repeatedly runs a drain loop:
 
 This is the second lever: dynamic rebalance by polling queue state at runtime.
 
+Idle behavior between drain passes is configurable through
+`Runtime::builder().idle_strategy(...)`:
+
+- `IdleStrategy::BackendDefault` (current Linux default): yield on idle passes
+- `IdleStrategy::Yield`: always yield on idle passes
+- `IdleStrategy::Sleep(duration)`: sleep for a fixed duration on idle passes
+
+Use `Sleep(...)` when you want to reduce idle CPU burn in exchange for added
+idle-to-work wake latency.
+
 For the default deque-backed stealable queue, local draining pops from the front
 and stealing pops from the back of the victim queue. This split helps the victim
 keep making forward progress on its local front, while thieves take tail work.

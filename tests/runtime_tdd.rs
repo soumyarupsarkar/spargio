@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use spargio::{
-    BackendKind, Event, RingMsg, Runtime, RuntimeError, ShardCtx, StealableQueueBackend, run,
-    run_local_on, run_with, sleep,
+    BackendKind, Event, IdleStrategy, RingMsg, Runtime, RuntimeError, ShardCtx,
+    StealableQueueBackend, run, run_local_on, run_with, sleep,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -573,6 +573,17 @@ fn runtime_builder_thread_affinity_option_builds_runtime() {
         .build()
         .expect("runtime");
     drop(rt);
+}
+
+#[test]
+fn runtime_builder_idle_strategy_override_builds_runtime() {
+    let rt = Runtime::builder()
+        .shards(1)
+        .idle_strategy(IdleStrategy::Sleep(Duration::from_millis(1)))
+        .build()
+        .expect("runtime");
+    let out = block_on(rt.spawn_on(0, async { 9usize }).expect("spawn")).expect("join");
+    assert_eq!(out, 9);
 }
 
 #[test]
