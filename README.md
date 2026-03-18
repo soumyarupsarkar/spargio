@@ -73,7 +73,7 @@ In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a
 | Runtime | Work stealing | Post-start task migration | Per-thread io_uring ownership | Spawned tasks always pinned | Explicit task placement (Pinned/Sticky/Stealable/RoundRobin) |
 | --- | --- | --- | --- | --- | --- |
 | [Tokio](https://github.com/tokio-rs/tokio) | Yes | Yes | No* | No | No** |
-| [Ringolo](https://github.com/DataDog/ringolo) | Yes | Yes | Yes | No | No |
+| [Ringolo](https://github.com/sugarraysam/ringolo) | Yes | Yes | Yes | No | No |
 | [Spargio](https://github.com/soumyarupsarkar/spargio) | Yes | No | Yes | No | Yes |
 | [Compio](https://github.com/compio-rs/compio) / [Monoio](https://github.com/bytedance/monoio) / [Glommio](https://github.com/DataDog/glommio) / [Tokio-uring](https://github.com/tokio-rs/tokio-uring) | No | No | Yes | Yes | No |
 

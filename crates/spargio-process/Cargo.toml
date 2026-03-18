@@ -1,13 +1,13 @@
 [package]
 name = "spargio-process"
-version = "0.5.12"
+version = "0.5.13"
 edition = "2024"
 license = "MIT"
 description = "Process companion crate for spargio"
 repository = "https://github.com/soumyarupsarkar/spargio"
 
 [dependencies]
-spargio = { version = "0.5.12", path = "../.." }
+spargio = { version = "0.5.13", path = "../.." }
 
 [dev-dependencies]
 futures = "0.3"
