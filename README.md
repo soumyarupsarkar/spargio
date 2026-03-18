@@ -68,6 +68,23 @@ Wondering whether to build a work-stealing pool using `io_uring` at all was insp
 
 In Spargio, a shard is one worker thread + its `io_uring` ring (`SQ` + `CQ`) + a local run/command queue. Internally within Spargio, we pass work from one shard to another by enqueueing work and injecting CQEs across shards, waking up a recipient worker thread to drain pending work from its queue.
 
+## How Does Spargio Compare to Tokio / Ringolo / Compio / Monoio / Glommio / Tokio-uring?
+
+| Runtime | Work stealing | Post-start task migration | Per-thread io_uring ownership | Spawned tasks always pinned | Explicit task placement (Pinned/Sticky/Stealable/RoundRobin) |
+| --- | --- | --- | --- | --- | --- |
+| [Tokio](https://github.com/tokio-rs/tokio) | Yes | Yes | No* | No | No** |
+| [Ringolo](https://github.com/DataDog/ringolo) | Yes | Yes | Yes | No | No |
+| [Spargio](https://github.com/soumyarupsarkar/spargio) | Yes | No | Yes | No | Yes |
+| [Compio](https://github.com/compio-rs/compio) / [Monoio](https://github.com/bytedance/monoio) / [Glommio](https://github.com/DataDog/glommio) / [Tokio-uring](https://github.com/tokio-rs/tokio-uring) | No | No | Yes | Yes | No |
+
+Spectrum, from most migratable to most thread-local: Tokio -> Ringolo -> Spargio -> Compio / Monoio / Glommio / Tokio-uring. Tokio freely migrates `Send` tasks; Ringolo allows post-start migration while respecting thread-local `io_uring` constraints (at yield points); Spargio only steals queued work before execution starts (tasks that yield are resumed on the same thread); the share-nothing runtimes keep tasks and `io_uring` ownership on one thread.
+
+Benchmark results (sans Ringolo which is an interesting but newer, alpha runtime) are below to highlight types of load each point of the spectrum handles well.
+
+`*` Tokio has active work toward `io_uring`-backed support in the main crate, including an incremental `tokio::fs` effort and broader `io_uring` design notes. See Tokio issues [`#7266`](https://github.com/tokio-rs/tokio/issues/7266) and [`#2411`](https://github.com/tokio-rs/tokio/issues/2411).
+
+`**` Tokio exposes locality tools such as LocalSet, but unlike Spargio it cannot route spawned tasks to a chosen worker thread. Crates such as [tokio-sticky-channel](https://crates.io/crates/tokio-sticky-channel) can help preserve same-worker routing at the application layer, but this is not runtime-level sticky spawn/submission.
+
 ## Benchmark Results
 
 All benchmark tables below report Criterion `mean` wall-clock iteration latency
